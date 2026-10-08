@@ -25,6 +25,7 @@ from spatiato.core.spatialdata import (
 from spatiato.viewer._styling import MISSING_CONTINUOUS_COLOR
 from spatiato.viewer.adapter import ViewerAdapter
 from spatiato.viewer.labels_colormap import (
+    _TRANSPARENT_RGBA,
     CompactLabelColormap,
     compact_categorical_label_colormap_from_values,
     compact_continuous_label_colormap_from_values,
@@ -137,12 +138,13 @@ class ViewerStylingController:
         if feature_rows is None:
             feature_rows = self._get_region_feature_rows()
 
+        default_color = self._get_not_in_table_color()
         if self._color_by == COLOR_BY_PRED_CONFIDENCE:
             self._labels_layer.colormap = compact_continuous_label_colormap_from_values(
                 feature_rows[PRED_CONFIDENCE_COLUMN],
                 colormap_name=PRED_CONFIDENCE_COLORMAP,
                 missing_color=MISSING_CONTINUOUS_COLOR,
-                default_color=MISSING_CONTINUOUS_COLOR,
+                default_color=default_color,
                 value_range=(0.0, 1.0),
             )
         else:
@@ -172,7 +174,8 @@ class ViewerStylingController:
                 class_values,
                 categories=categories,
                 palette=[class_color_lookup[class_id] for class_id in categories],
-                default_color=DEFAULT_NEUTRAL_COLOR,
+                default_color=default_color,
+                missing_color=DEFAULT_NEUTRAL_COLOR,
                 background_value=0,
             )
         self._viewer_adapter.sync_labels_display_after_colormap_change(self._labels_layer)
@@ -226,7 +229,10 @@ class ViewerStylingController:
         instance_id = int(change.instance_id)
         class_id = change.class_id
         if class_id is None:
-            result = colormap.remove_label(instance_id)
+            # Clearing the class does not remove the object from the table: its row
+            # stays, with an empty `user_class`. Color it as unlabeled (neutral), not
+            # as an object without a table row (transparent).
+            result = colormap.set_label_missing(instance_id, missing_color=DEFAULT_NEUTRAL_COLOR)
         else:
             class_id = int(class_id)
             class_color_lookup = self._get_valid_user_class_color_lookup()
@@ -301,6 +307,17 @@ class ViewerStylingController:
             return None
 
         return get_table(self._selected_spatialdata, self._selected_table_name)
+
+    def _get_not_in_table_color(self) -> Any:
+        """Return the color for labels without a row in the bound table.
+
+        Those labels are transparent, matching generic styled-labels coloring.
+        Without a bound table there are no rows to contrast with, so every
+        foreground label stays neutral instead of disappearing.
+        """
+        if self._selected_table_metadata is None or self._get_bound_table() is None:
+            return DEFAULT_NEUTRAL_COLOR
+        return _TRANSPARENT_RGBA
 
     def _get_region_rows_by_instance(self) -> pd.DataFrame:
         table = self._get_bound_table()
