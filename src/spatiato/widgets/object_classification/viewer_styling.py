@@ -232,7 +232,7 @@ class ViewerStylingController:
             # Clearing the class does not remove the object from the table: its row
             # stays, with an empty `user_class`. Color it as unlabeled (neutral), not
             # as an object without a table row (transparent).
-            result = colormap.set_label_missing(instance_id, missing_color=DEFAULT_NEUTRAL_COLOR)
+            result = colormap.set_label_missing(instance_id)
         else:
             class_id = int(class_id)
             class_color_lookup = self._get_valid_user_class_color_lookup()

@@ -32,6 +32,7 @@ from spatiato.widgets.object_classification.controller import (
 from spatiato.widgets.object_classification.viewer_styling import (
     COLOR_BY_PRED_CLASS,
     COLOR_BY_PRED_CONFIDENCE,
+    COLOR_BY_USER_CLASS,
     ViewerStylingController,
 )
 
@@ -212,6 +213,7 @@ def test_refresh_reuses_one_region_feature_snapshot(monkeypatch: pytest.MonkeyPa
     np.testing.assert_allclose(layer.colormap.map(0), np.zeros(4, dtype=np.float32))
     np.testing.assert_allclose(layer.colormap.map(5), _expected_class_rgba(4))
     np.testing.assert_allclose(layer.colormap.map(6), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
+    np.testing.assert_allclose(layer.colormap.map(99), np.zeros(4, dtype=np.float32))
     assert layer.refresh_count == 0
     assert USER_CLASS_COLUMN in layer.features.columns
 
@@ -408,6 +410,7 @@ def test_pred_class_coloring_uses_neutral_fallback_for_missing_predictions(sdata
     np.testing.assert_allclose(layer.colormap.map(0), np.zeros(4, dtype=np.float32))
     np.testing.assert_allclose(layer.colormap.map(1), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
     np.testing.assert_allclose(layer.colormap.map(5), layer.colormap.map(6))
+    np.testing.assert_allclose(layer.colormap.map(99), np.zeros(4, dtype=np.float32))
     assert layer.refresh_count == 0
     assert not np.allclose(layer.colormap.map(1), layer.colormap.map(0))
 
@@ -435,9 +438,24 @@ def test_pred_confidence_coloring_uses_compact_continuous_colormap_without_expli
     np.testing.assert_allclose(layer.colormap.map(5), expected_colors[1])
     np.testing.assert_allclose(layer.colormap.map(6), _expected_rgba(viewer_styling_module.MISSING_CONTINUOUS_COLOR))
     np.testing.assert_allclose(layer.colormap.map(0), np.zeros(4, dtype=np.float32))
-    np.testing.assert_allclose(layer.colormap.map(99), _expected_rgba(viewer_styling_module.MISSING_CONTINUOUS_COLOR))
+    np.testing.assert_allclose(layer.colormap.map(99), np.zeros(4, dtype=np.float32))
     assert layer.refresh_count == 0
     assert adapter.sync_display_layers == [layer]
+
+
+@pytest.mark.parametrize("color_by", [COLOR_BY_USER_CLASS, COLOR_BY_PRED_CLASS, COLOR_BY_PRED_CONFIDENCE])
+def test_coloring_without_bound_table_keeps_all_labels_neutral(sdata_blobs: SpatialData, color_by: str) -> None:
+    layer = _FakeLabelsLayer()
+    controller = ViewerStylingController(_FakeViewerAdapter(layer))
+    controller.bind(sdata_blobs, "blobs_labels", None)
+    controller.set_color_by(color_by)
+
+    controller.refresh()
+
+    assert isinstance(layer.colormap, CompactLabelColormap)
+    np.testing.assert_allclose(layer.colormap.map(0), np.zeros(4, dtype=np.float32))
+    np.testing.assert_allclose(layer.colormap.map(1), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
+    np.testing.assert_allclose(layer.colormap.map(99), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
 
 
 def test_row_scoped_user_class_annotation_inserts_compact_label_and_refreshes_layer(
@@ -476,7 +494,7 @@ def test_row_scoped_user_class_annotation_inserts_compact_label_and_refreshes_la
     assert bool(np.all(mapping.label_ids[1:] > mapping.label_ids[:-1]))
 
 
-def test_row_scoped_user_class_annotation_clear_removes_compact_label_and_refreshes_layer(
+def test_row_scoped_user_class_annotation_clear_uses_missing_color_and_refreshes_layer(
     monkeypatch: pytest.MonkeyPatch,
     sdata_blobs: SpatialData,
 ) -> None:
@@ -504,8 +522,40 @@ def test_row_scoped_user_class_annotation_clear_removes_compact_label_and_refres
     assert layer.events.colormap.call_count == 0
     assert pd.isna(layer.features.set_index("index").loc[5, USER_CLASS_COLUMN])
     assert isinstance(layer.colormap, CompactLabelColormap)
-    assert 5 not in layer.colormap._compact_mapping.label_ids
+    mapping = layer.colormap._compact_mapping
+    position = int(np.searchsorted(mapping.label_ids, 5))
+    assert int(mapping.label_ids[position]) == 5
+    assert int(mapping.texture_codes[position]) == mapping.missing_texture_code
     np.testing.assert_allclose(layer.colormap.map(5), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
+    np.testing.assert_allclose(layer.colormap.map(99), np.zeros(4, dtype=np.float32))
+
+
+def test_row_scoped_user_class_annotation_clear_uses_reserved_missing_color_when_all_rows_were_labeled(
+    sdata_blobs: SpatialData,
+) -> None:
+    _set_user_classes(sdata_blobs, {5: 4, 6: 4}, categories=[4])
+    layer = _FakeLabelsLayer()
+    controller = _make_controller(sdata_blobs, layer)
+    feature_rows = _feature_rows({5: 4, 6: 4})
+    controller.refresh_layer_colors(feature_rows=feature_rows)
+    controller.refresh_layer_features(feature_rows=feature_rows)
+    original_colormap = layer.colormap
+    assert isinstance(original_colormap, CompactLabelColormap)
+    original_texture_count = len(original_colormap._compact_mapping.texture_rgba)
+    assert original_colormap._compact_mapping.missing_texture_code is not None
+
+    handled = controller.refresh_user_class_colormap_and_feature(
+        _user_class_annotation_change(instance_id=5, class_id=None)
+    )
+
+    assert handled is True
+    assert layer.colormap is original_colormap
+    assert layer.events.colormap.call_count == 0
+    assert layer.refresh_kwargs == [{"extent": False}]
+    assert len(layer.colormap._compact_mapping.texture_rgba) == original_texture_count
+    np.testing.assert_allclose(layer.colormap.map(5), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
+    np.testing.assert_allclose(layer.colormap.map(6), _expected_class_rgba(4))
+    np.testing.assert_allclose(layer.colormap.map(99), np.zeros(4, dtype=np.float32))
 
 
 def test_row_scoped_user_class_annotation_updates_existing_compact_label(

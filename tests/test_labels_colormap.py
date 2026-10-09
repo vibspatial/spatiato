@@ -246,7 +246,7 @@ def test_compact_categorical_labels_mapping_reuses_repeated_rgba_texture_codes()
     code_by_label = dict(zip(mapping.label_ids.tolist(), mapping.texture_codes.tolist(), strict=True))
     assert code_by_label[1] == code_by_label[3]
     assert code_by_label[2] != code_by_label[1]
-    assert len(mapping.texture_rgba) == 4  # default, background, red, green
+    assert len(mapping.texture_rgba) == 5  # default, background, red, green, reserved missing
     assert set(mapping.texture_codes.tolist()) == {2, 3}
 
 
@@ -266,8 +266,22 @@ def test_compact_categorical_labels_mapping_accepts_unused_categories() -> None:
     code_by_label = dict(zip(mapping.label_ids.tolist(), mapping.texture_codes.tolist(), strict=True))
     assert code_by_label[10] == code_by_label[30]
     assert code_by_label[20] != code_by_label[10]
-    assert mapping.missing_texture_code is None
     assert set(mapping.texture_codes.tolist()) == {2, 3}
+
+
+def test_compact_categorical_labels_mapping_reserves_missing_texture_without_missing_values() -> None:
+    values = pd.Series(["a", "b"], index=pd.Index([1, 2], name="index"), dtype="object")
+
+    mapping = compact_categorical_labels_mapping_from_values(
+        values,
+        categories=["a", "b"],
+        palette=["#ff0000", "#00ff00"],
+        missing_color="#0000ff",
+    )
+
+    assert mapping.missing_texture_code == 4
+    assert mapping.missing_texture_code not in mapping.texture_codes.tolist()
+    np.testing.assert_allclose(mapping.texture_rgba[mapping.missing_texture_code], to_rgba("#0000ff"))
 
 
 def test_compact_categorical_labels_mapping_uses_array_backed_texture_codes() -> None:
@@ -401,23 +415,66 @@ def test_compact_categorical_label_colormap_sparse_category_updates_existing_tex
     np.testing.assert_allclose(colormap.map(6), to_rgba("#0000ff"))
 
 
-def test_compact_categorical_label_colormap_sparse_remove_uses_default_texture(
+def test_compact_categorical_label_colormap_sparse_missing_reuses_missing_texture(
+    restore_colormap_backend: None,
+) -> None:
+    values = pd.Series([1, pd.NA], index=pd.Index([5, 6], name="index"), dtype="Int64")
+    colormap = compact_categorical_label_colormap_from_values(
+        values,
+        categories=[1, 2],
+        palette=["#ff0000", "#0000ff"],
+        missing_color="#00ff00",
+    )
+    original_texture_count = len(colormap._compact_mapping.texture_rgba)
+    missing_texture_code = colormap._compact_mapping.missing_texture_code
+    assert missing_texture_code is not None
+
+    result = colormap.set_label_missing(5)
+
+    assert len(colormap._compact_mapping.texture_rgba) == original_texture_count
+    assert result.texture_code == missing_texture_code
+    assert result.texture_table_changed is False
+    assert 5 in colormap._compact_mapping.label_ids
+    np.testing.assert_allclose(colormap.map(5), to_rgba("#00ff00"))
+    np.testing.assert_allclose(colormap.map(99), np.zeros(4, dtype=np.float32))
+
+
+def test_compact_categorical_label_colormap_sparse_missing_uses_reserved_texture_when_all_rows_have_values(
     restore_colormap_backend: None,
 ) -> None:
     values = pd.Series([1, 2], index=pd.Index([5, 6], name="index"), dtype="int64")
     colormap = compact_categorical_label_colormap_from_values(
         values,
-        categories=[0, 1, 2],
-        palette=[DEFAULT_NEUTRAL_COLOR, "#ff0000", "#0000ff"],
-        default_color=DEFAULT_NEUTRAL_COLOR,
+        categories=[1, 2],
+        palette=["#ff0000", "#0000ff"],
+        missing_color=DEFAULT_NEUTRAL_COLOR,
     )
+    original_texture_count = len(colormap._compact_mapping.texture_rgba)
+    missing_texture_code = colormap._compact_mapping.missing_texture_code
+    assert missing_texture_code is not None
 
-    result = colormap.remove_label(5)
+    result = colormap.set_label_missing(5)
 
-    assert result.texture_code == colormap._compact_mapping.default_texture_code
+    assert len(colormap._compact_mapping.texture_rgba) == original_texture_count
+    assert result.texture_code == missing_texture_code
     assert result.texture_table_changed is False
-    assert 5 not in colormap._compact_mapping.label_ids
+    assert 5 in colormap._compact_mapping.label_ids
     np.testing.assert_allclose(colormap.map(5), to_rgba(DEFAULT_NEUTRAL_COLOR))
+    np.testing.assert_allclose(colormap.map(6), to_rgba("#0000ff"))
+    np.testing.assert_allclose(colormap.map(99), np.zeros(4, dtype=np.float32))
+
+
+def test_compact_labels_mapping_rejects_out_of_range_missing_texture_code() -> None:
+    with pytest.raises(ValueError, match="missing texture code is out of range"):
+        CompactLabelsMapping(
+            label_ids=np.asarray([5], dtype=np.int64),
+            texture_codes=np.asarray([2], dtype=np.uint8),
+            texture_rgba=np.asarray(
+                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0]],
+                dtype=np.float32,
+            ),
+            missing_texture_code=3,
+        )
 
 
 def test_compact_categorical_label_colormap_sparse_new_category_appends_texture(
@@ -441,6 +498,21 @@ def test_compact_categorical_label_colormap_sparse_new_category_appends_texture(
     assert 9 in colormap._compact_mapping.label_ids
     assert bool(np.all(colormap._compact_mapping.label_ids[1:] > colormap._compact_mapping.label_ids[:-1]))
     np.testing.assert_allclose(colormap.map(9), to_rgba("#0000ff"))
+
+
+def test_compact_continuous_label_colormap_rejects_sparse_value_update(
+    restore_colormap_backend: None,
+) -> None:
+    values = pd.Series([0.0, 1.0], index=pd.Index([5, 6], name="index"), dtype="float64")
+    colormap = CompactLabelColormap(compact_continuous_labels_mapping_from_values(values))
+    original_mapping = colormap._compact_mapping
+    original_rgba = colormap.map(5).copy()
+
+    with pytest.raises(ValueError, match="require a categorical compact labels mapping"):
+        colormap.set_label_value(5, 7, value_color="#0000ff")
+
+    assert colormap._compact_mapping is original_mapping
+    np.testing.assert_allclose(colormap.map(5), original_rgba)
 
 
 def test_compact_categorical_label_colormap_sparse_update_widens_texture_code_dtype(
