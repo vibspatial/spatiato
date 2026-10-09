@@ -57,10 +57,17 @@ class CompactLabelsMapping:
         Texture code for each entry in `label_ids`.
     texture_rgba
         RGBA lookup table where the row index is the texture code.
+    missing_texture_code
+        Texture code used for known table rows whose source value is missing or
+        palette-unknown. The compact builders always reserve this row, also when
+        no row is missing yet, so sparse updates can mark a label missing
+        without growing `texture_rgba`.
     value_texture_codes
-        Optional source value to texture-code lookup. This is used by
-        sparse updates that need to change one label's value without
-        rebuilding the full compact mapping.
+        Source value to texture-code lookup for categorical mappings. This is
+        used by sparse updates that need to change one label's value without
+        rebuilding the full compact mapping. `None` for continuous mappings,
+        which have no categorical values and do not support
+        `CompactLabelColormap.set_label_value(...)`.
     default_texture_code
         Texture code used for labels that are not present in `label_ids`.
         This corresponds to the current `DirectLabelColormap` `None` default
@@ -70,10 +77,6 @@ class CompactLabelsMapping:
         Texture code used for the background label.
     background_value
         Background label id.
-    missing_texture_code
-        Texture code used for known table rows whose source value is missing or
-        palette-unknown. This is `None` when all known table rows map to
-        explicit values and no missing-value color row is needed.
 
     Examples
     --------
@@ -83,24 +86,27 @@ class CompactLabelsMapping:
     label_ids:     [101, 102, 103, 104, 105, 106, 107, 108]
     texture_codes: [2,   2,   2,   2,   3,   3,   3,   3]
 
-    texture_rgba: [transparent default, transparent background, red, green]
+    texture_rgba: [transparent default, transparent background, red, green, neutral]
 
     texture_rgba:
       0 -> transparent default for unmapped labels
       1 -> transparent background label
       2 -> red
       3 -> green
+      4 -> neutral missing-value color (reserved, currently unused)
 
     value_texture_codes:
       "tumor"  -> 2
       "stroma" -> 3
+
+    missing_texture_code: 4
     ```
 
     If a later sparse edit annotates label `109` as `"tumor"`, Spatiato can add
     `109 -> 2` to `label_ids` / `texture_codes` without rebuilding the full
     colormap. If the edit introduces a brand-new value such as `"immune"`,
-    Spatiato appends one new RGBA row, adds `"immune" -> 4` to
-    `value_texture_codes`, and maps the edited label to texture code `4`.
+    Spatiato appends one new RGBA row, adds `"immune" -> 5` to
+    `value_texture_codes`, and maps the edited label to texture code `5`.
     This is why value ownership of texture codes is stored explicitly
     instead of rediscovering it from repeated RGBA values.
     """
@@ -108,11 +114,11 @@ class CompactLabelsMapping:
     label_ids: np.ndarray
     texture_codes: np.ndarray
     texture_rgba: np.ndarray
+    missing_texture_code: int
     value_texture_codes: dict[object, int] | None = None
     default_texture_code: int = 0
     background_texture_code: int = 1
     background_value: int = 0
-    missing_texture_code: int | None = None
 
     def __post_init__(self) -> None:
         if self.label_ids.ndim != 1:
@@ -129,7 +135,7 @@ class CompactLabelsMapping:
             raise ValueError("Compact labels mapping default texture code must be 0.")
         if not 0 <= self.background_texture_code < len(self.texture_rgba):
             raise ValueError("Compact labels mapping background texture code is out of range.")
-        if self.missing_texture_code is not None and not 0 <= self.missing_texture_code < len(self.texture_rgba):
+        if not 0 <= self.missing_texture_code < len(self.texture_rgba):
             raise ValueError("Compact labels mapping missing texture code is out of range.")
         if len(self.texture_codes) and int(np.max(self.texture_codes)) >= len(self.texture_rgba):
             raise ValueError("Compact labels mapping contains a texture code without an RGBA row.")
@@ -247,7 +253,8 @@ class CompactLabelColormap(DirectLabelColormap):
         """Spatiato helper for sparse annotation: set one label's value.
 
         If the value was not present when the compact colormap was built,
-        `value_color` is required and is appended as a new texture row.
+        `value_color` is required and is appended as a new texture row. Only
+        categorical mappings support this; continuous mappings raise.
         """
         label_id = self._validate_sparse_label_id(label_id)
         original_texture_count = len(self._compact_mapping.texture_rgba)
@@ -264,22 +271,27 @@ class CompactLabelColormap(DirectLabelColormap):
             texture_table_changed=texture_table_changed,
         )
 
-    def remove_label(self, label_id: int) -> _CompactSparseLabelUpdateResult:
-        """Spatiato helper for sparse annotation: remove one explicit label.
+    def set_label_missing(self, label_id: int) -> _CompactSparseLabelUpdateResult:
+        """Spatiato helper for sparse annotation: mark one label's value missing.
 
-        Removed labels fall through to the default/unmapped texture code, which
-        is how compact user-class coloring represents unlabeled class `0`.
+        The label stays explicitly mapped, to the missing-value texture code, so
+        it keeps the color of known table rows without a value instead of
+        falling through to the default texture code used for labels without a
+        table row. The compact builders always reserve the missing-value row,
+        so this never grows the texture table.
         """
         label_id = self._validate_sparse_label_id(label_id)
-        compact_mapping = _compact_mapping_without_label(
+        # Missing values are not categorical values, so their texture code lives
+        # in `missing_texture_code` instead of `value_texture_codes`.
+        texture_code = int(self._compact_mapping.missing_texture_code)
+        compact_mapping = _compact_mapping_with_label_texture_code(
             self._compact_mapping,
             label_id=label_id,
+            texture_code=texture_code,
         )
         self._install_compact_mapping(compact_mapping)
         return _CompactSparseLabelUpdateResult(
-            texture_code=self._compact_mapping.default_texture_code,
-            # Removing a label does not shrink `texture_rgba`; unused value
-            # rows are kept so future sparse annotations can reuse them.
+            texture_code=texture_code,
             texture_table_changed=False,
         )
 
@@ -299,8 +311,10 @@ class CompactLabelColormap(DirectLabelColormap):
         remember the new value-to-texture-code mapping for future edits.
         """
         compact = self._compact_mapping
+        if compact.value_texture_codes is None:
+            raise ValueError("Sparse value updates require a categorical compact labels mapping.")
         normalized_value = normalize_category_value(value)
-        value_texture_codes = dict(compact.value_texture_codes or {})
+        value_texture_codes = dict(compact.value_texture_codes)
         texture_code = value_texture_codes.get(normalized_value)
         if texture_code is not None:
             return int(texture_code)
@@ -537,24 +551,6 @@ def _compact_mapping_with_label_texture_code(
     )
 
 
-def _compact_mapping_without_label(
-    compact: CompactLabelsMapping,
-    *,
-    label_id: int,
-) -> CompactLabelsMapping:
-    """Spatiato helper for sparse annotation: remove one explicit label mapping."""
-    label_ids = compact.label_ids
-    position = int(np.searchsorted(label_ids, label_id))
-    if position >= len(label_ids) or int(label_ids[position]) != label_id:
-        return compact
-
-    return replace(
-        compact,
-        label_ids=np.delete(label_ids, position).astype(np.int64, copy=False),
-        texture_codes=_minimum_texture_code_dtype(np.delete(compact.texture_codes, position)),
-    )
-
-
 def _minimum_texture_code_dtype(texture_codes: np.ndarray) -> np.ndarray:
     max_value = int(np.max(texture_codes, initial=0))
     return texture_codes.astype(_minimum_unsigned_dtype(max_value), copy=False)
@@ -583,10 +579,10 @@ def compact_categorical_labels_mapping_from_values(
     palette
         Color values for `categories`.
     default_color
-        Color for labels that are not present in `values`. The default is
-        transparent, matching styled-labels behavior. Object-classification
-        callers can pass the unlabeled class color while keeping the
-        background label transparent.
+        Color for labels that are not present in `values`, i.e. labels without
+        a table row. The default is transparent, matching styled-labels
+        behavior. Callers without a bound table can pass a neutral color while
+        keeping the background label transparent.
     missing_color
         Color for known table rows with missing or palette-unknown categorical
         values.
@@ -624,15 +620,16 @@ def compact_categorical_labels_mapping_from_values(
         category: texture_code_for_rgba(color) for category, color in zip(normalized_categories, palette, strict=False)
     }
 
+    # Reserve the missing-value row even when no row is missing yet, so a
+    # sparse edit that clears a value never needs to grow the texture table.
+    # It comes after the category rows to keep category texture codes stable.
+    missing_texture_code = texture_code_for_rgba(missing_color)
+
     texture_codes = _categorical_texture_codes(
         values,
         category_texture_code_by_value=category_texture_code_by_value,
     )
-    missing_texture_code: int | None = None
-    missing_values = texture_codes < 0
-    if np.any(missing_values):
-        missing_texture_code = texture_code_for_rgba(missing_color)
-        texture_codes[missing_values] = missing_texture_code
+    texture_codes[texture_codes < 0] = missing_texture_code
     if not label_ids_sorted:
         order = np.argsort(label_ids)
         label_ids = label_ids[order]

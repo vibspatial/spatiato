@@ -1041,6 +1041,11 @@ def test_widget_warns_when_loaded_segmentation_has_no_annotation_table(qtbot, sd
     assert "This labels layer is loaded, but no annotation table is linked to it." in widget.selection_status.text()
     assert not widget.class_spinbox.isEnabled()
     assert not widget.apply_class_button.isEnabled()
+    assert isinstance(multiscale_layer.colormap, CompactLabelColormap)
+    np.testing.assert_allclose(multiscale_layer.colormap.map(0), np.zeros(4, dtype=np.float32))
+    np.testing.assert_allclose(
+        multiscale_layer.colormap.map(1), np.asarray(to_rgba(DEFAULT_NEUTRAL_COLOR), dtype=np.float32)
+    )
 
 
 def test_widget_updates_selected_feature_key_when_feature_matrix_changes(qtbot, sdata_blobs: SpatialData) -> None:
@@ -2469,20 +2474,65 @@ def test_widget_warns_when_selected_label_is_missing_from_annotation_table(
     qtbot.addWidget(widget)
     select_segmentation(widget)
 
+    assert isinstance(layer.colormap, CompactLabelColormap)
+    np.testing.assert_allclose(layer.colormap.map(5), np.zeros(4, dtype=np.float32))
+    np.testing.assert_allclose(layer.colormap.map(6), np.asarray(to_rgba(DEFAULT_NEUTRAL_COLOR), dtype=np.float32))
+
     layer.selected_label = 5
 
     assert not widget.apply_class_button.isEnabled()
     assert "Selected cell_id 5 is not present in annotation table" in widget.selection_status.text()
     assert "cannot receive a user class" in widget.selection_status.text()
+    assert "It is not shown in the viewer." in widget.selection_status.text()
 
     widget.class_spinbox.setValue(3)
     widget._apply_current_class()
 
     assert "Selected cell_id 5 is not present in annotation table" in widget.annotation_feedback.text()
+    assert "It is not shown in the viewer." in widget.annotation_feedback.text()
     assert STATUS_CARD_PALETTE["warning"]["text"] in widget.annotation_feedback.styleSheet()
     assert USER_CLASS_COLUMN not in table.obs
     assert warnings == [widget._annotation_controller.missing_table_row_message]
     assert warnings[0] in widget.annotation_feedback.text()
+
+
+def test_widget_cleared_annotation_stays_neutral_while_labels_missing_from_table_stay_hidden(
+    qtbot, sdata_blobs: SpatialData
+) -> None:
+    """Removing a class must not hide the object.
+
+    The table covers every blobs instance except `5`. After adding and then
+    removing a class on `6`, its row stays with an empty `user_class`, so it
+    returns to the neutral unlabeled color, not the transparent color used for
+    instances without a table row. Instance `5` stays transparent throughout.
+
+    This checks the resulting colors only; that Remove uses the single-object
+    update is pinned in
+    `test_widget_user_class_annotation_uses_sparse_refresh_for_compact_user_class`.
+    """
+    table = sdata_blobs["table"]
+    keep_mask = ~((table.obs["region"] == "blobs_labels") & (table.obs["instance_id"] == 5))
+    table._inplace_subset_obs(keep_mask.to_numpy())
+    neutral_rgba = np.asarray(to_rgba(DEFAULT_NEUTRAL_COLOR), dtype=np.float32)
+
+    layer = make_blobs_labels_layer(sdata_blobs)
+    viewer = DummyViewer(layers=[layer])
+    widget = ObjectClassificationWidget(viewer)
+    qtbot.addWidget(widget)
+    select_segmentation(widget)
+
+    layer.selected_label = 6
+    widget.class_spinbox.setValue(4)
+    widget.apply_class_button.click()
+
+    assert layer.colormap.map(6)[3] > 0
+    assert not np.allclose(layer.colormap.map(6), neutral_rgba)
+
+    widget.clear_class_button.click()
+
+    assert pd.isna(layer.features.set_index("index").loc[6, USER_CLASS_COLUMN])
+    np.testing.assert_allclose(layer.colormap.map(6), neutral_rgba)
+    np.testing.assert_allclose(layer.colormap.map(5), np.zeros(4, dtype=np.float32))
 
 
 def test_widget_recolors_layer_from_user_class_annotations(qtbot, sdata_blobs: SpatialData) -> None:
@@ -2534,6 +2584,7 @@ def test_widget_user_class_annotation_uses_sparse_refresh_for_compact_user_class
     monkeypatch.setattr(widget._viewer_styling_controller, "refresh", record_full_refresh)
     monkeypatch.setattr(layer, "refresh", record_layer_refresh)
 
+    # Add (A): assigning a class updates one colormap entry, no full refresh.
     layer.selected_label = 5
     widget.class_spinbox.setValue(4)
     widget.apply_class_button.click()
@@ -2545,6 +2596,16 @@ def test_widget_user_class_annotation_uses_sparse_refresh_for_compact_user_class
     assert len(layer.colormap.color_dict) <= 3
     assert layer.colormap.map(5)[3] > 0
     assert layer.features.set_index("index").loc[5, USER_CLASS_COLUMN] == 4
+
+    # Remove (R): clearing the class also stays on the single-object update.
+    layer_refresh_calls.clear()
+    widget.clear_class_button.click()
+
+    assert full_refresh_calls == []
+    assert layer_refresh_calls == [{"extent": False}]
+    assert layer.colormap is original_colormap
+    np.testing.assert_allclose(layer.colormap.map(5), np.asarray(to_rgba(DEFAULT_NEUTRAL_COLOR), dtype=np.float32))
+    assert pd.isna(layer.features.set_index("index").loc[5, USER_CLASS_COLUMN])
 
 
 def test_widget_user_class_annotation_falls_back_to_full_refresh_when_row_scoped_refresh_fails(
