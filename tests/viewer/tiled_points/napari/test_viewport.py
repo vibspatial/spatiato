@@ -56,7 +56,7 @@ def _draw(
 
 
 def test_identity_draw_emits_float_intrinsic_viewport_and_effective_budget() -> None:
-    layer = _layer()
+    layer = _layer(hard_render_point_budget=100_000, target_pixels_per_point=9.0)
     observed = _record_viewports(layer)
 
     _draw(layer)
@@ -126,7 +126,7 @@ def test_rotation_requires_off_diagonal_world_corners_for_conservative_bounds() 
 
 
 def test_identical_draw_is_deduplicated_but_canvas_resize_emits() -> None:
-    layer = _layer()
+    layer = _layer(hard_render_point_budget=100_000, target_pixels_per_point=9.0)
     observed = _record_viewports(layer)
 
     _draw(layer)
