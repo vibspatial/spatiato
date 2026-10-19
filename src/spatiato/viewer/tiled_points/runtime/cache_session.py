@@ -6,12 +6,13 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 from loguru import logger
-from qtpy.QtCore import QObject, QThread, Signal, Slot
+from qtpy.QtCore import QObject, QThread, QTimer, Signal, Slot
 
 from spatiato.core.multi_scale_cache_points_zarr.models import _expected_level_kind
 from spatiato.core.multi_scale_cache_points_zarr.reader import (
@@ -724,12 +725,27 @@ class _TiledPointsCacheWorker(QObject):
             self.finished.emit()
 
 
+# Sessions whose worker QThread may still be running. A started session keeps
+# itself alive here until that thread has fully stopped, so owners may drop
+# their references at any time (e.g. right after `close()` on layer removal).
+# Otherwise garbage collection could destroy the session, and with it its child
+# QThread, while the worker is still running: Qt aborts the process
+# ("QThread: Destroyed while thread is still running"), or deadlocks on the GIL
+# while the thread finishes its teardown.
+# Nothing reads this set; holding the reference is its purpose. napari's
+# `thread_worker` uses the same keep-alive pattern (superqt `WorkerBase._worker_set`).
+_SESSIONS_WITH_RUNNING_THREADS: set[_TiledPointsCacheSession] = set()
+
+
 class _TiledPointsCacheSession(QObject):
     """Expose one worker-owned cache reader to the GUI thread.
 
     Construction is passive. :meth:`start` creates the dedicated reader thread;
     :meth:`close` is terminal and idempotent. The reader and selected-value
     index never cross this facade.
+
+    A started session stays alive until its worker thread has fully stopped,
+    even if its owner drops it earlier (see `_SESSIONS_WITH_RUNNING_THREADS`).
     """
 
     state_changed = Signal(object)
@@ -823,6 +839,8 @@ class _TiledPointsCacheSession(QObject):
         self._thread = thread
         self._worker = worker
         self._set_state(_CacheSessionState.STARTING)
+        # Released in `_on_thread_finished()` once the thread has fully stopped.
+        _SESSIONS_WITH_RUNNING_THREADS.add(self)
         thread.start()
 
     def set_selected_value_ids(self, requested_value_ids: tuple[int, ...] | None) -> bool:
@@ -935,9 +953,17 @@ class _TiledPointsCacheSession(QObject):
         self._thread = None
         self._worker = None
         if thread is not None:
+            # `finished` fires before the thread runs its pending deleteLater()s,
+            # such as the worker's. Wait (PyQt releases the GIL) so the thread has
+            # fully exited before this session may be destroyed.
+            thread.wait()
             thread.deleteLater()
         self._set_state(_CacheSessionState.CLOSED)
         self.closed.emit()
+        # Release the keep-alive from `start()` only after this slot returns:
+        # dropping the last reference here would delete this QObject while Qt
+        # is still delivering the queued `finished` call to it.
+        QTimer.singleShot(0, partial(_SESSIONS_WITH_RUNNING_THREADS.discard, self))
 
     def _set_state(self, state: _CacheSessionState) -> None:
         if state is self._state:
