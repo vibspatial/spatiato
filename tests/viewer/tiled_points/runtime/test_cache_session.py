@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -780,6 +781,44 @@ def test_close_during_reader_construction_prevents_reader_entry(qtbot) -> None:
     qtbot.waitUntil(lambda: session.state is _CacheSessionState.CLOSED, timeout=5_000)
 
     assert [operation for operation, _ in probe.operations] == ["construct"]
+
+
+def test_started_session_outlives_dropped_owner_until_its_thread_stops(qtbot) -> None:
+    """Guard the session keep-alive (`_SESSIONS_WITH_RUNNING_THREADS`).
+
+    `start()` adds the session to that set; `_on_thread_finished()` removes it
+    (deferred with `QTimer.singleShot`) once the worker thread has fully stopped.
+    Owners may therefore drop a closed session while its worker is still busy,
+    as layer removal does. Without the keep-alive, garbage collection would
+    destroy the session and its still-running QThread, and Qt aborts the process.
+    """
+    probe = _ReaderProbe(pause_entry=True)
+    session = _session(probe)
+    destroyed: list[bool] = []
+    session.destroyed.connect(lambda *_: destroyed.append(True))
+
+    # 1. A started session is kept alive. Checked first: if the keep-alive
+    #    regressed, dropping the session below would abort the whole test
+    #    process instead of failing this test.
+    session.start()
+    qtbot.waitUntil(probe.entry_paused.is_set, timeout=5_000)
+    assert session in cache_session_module._SESSIONS_WITH_RUNNING_THREADS
+
+    # 2. The owner closes and drops the session while the worker is busy:
+    #    the keep-alive is now the only reference, so the session survives.
+    session.close()
+    del session
+    gc.collect()
+    assert destroyed == []
+
+    # 3. Once the worker thread stops, the keep-alive is released and the
+    #    session is freed, so nothing leaks.
+    def session_released() -> bool:
+        gc.collect()  # the keep-alive was the last reference
+        return bool(destroyed)
+
+    probe.resume_entry.set()
+    qtbot.waitUntil(session_released, timeout=5_000)
 
 
 def test_passive_session_closes_idempotently_without_starting_reader(qtbot) -> None:

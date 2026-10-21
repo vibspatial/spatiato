@@ -734,6 +734,8 @@ class _TiledPointsCacheWorker(QObject):
 # while the thread finishes its teardown.
 # Nothing reads this set; holding the reference is its purpose. napari's
 # `thread_worker` uses the same keep-alive pattern (superqt `WorkerBase._worker_set`).
+# Covered by
+# tests/viewer/tiled_points/runtime/test_cache_session.py::test_started_session_outlives_dropped_owner_until_its_thread_stops
 _SESSIONS_WITH_RUNNING_THREADS: set[_TiledPointsCacheSession] = set()
 
 
