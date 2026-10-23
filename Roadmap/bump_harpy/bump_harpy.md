@@ -119,6 +119,41 @@ scanpy wrappers (`kmeans`, `leiden`, `preprocess_*`, ...). Spatiato uses none of
 them; it calls `hp.tb.add_feature_matrix`, and `datasets.py` uses
 `hp.im.add_image` / `hp.im.add_labels`.
 
+## Next harpy: `feature/qc_metrics` Branch
+
+Checked on 2026-10-22 at commit `e9b9bb1`, 171 commits ahead of `v0.5.0` (not
+released yet).
+
+Unchanged for P7:
+
+- `table/_add_feature_matrix.py` and `table/io/_components_by_region.py` are
+  identical to `v0.5.0`: regional merge and its compatibility checks are the
+  same.
+- `_SOURCE_KIND = "harpy_add_feature_matrix"`; `_FEATURE_MATRIX_SCHEMA_VERSION`
+  is still `1`, now defined in `harpy/table/_metadata.py`.
+- `hp.tb.io.remove_table_components(sdata, *, table_name, components)` is
+  unchanged and still exported.
+
+Relevant elsewhere:
+
+- **anndata floor `>=0.12.10` -> `>=0.13`** (Spatiato's `.venv` has 0.12.16).
+  In anndata 0.13 `X` lives in memory as `layers[None]`; harpy adapts
+  internally. Spatiato only uses `table.X`, never `layers`, so the risk is low,
+  but run the suite on anndata 0.13 when this lands.
+- **zarr v3 sharding**: per harpy's updated docstrings, anndata 0.13 enables
+  sharding by default (`auto_shard_zarr_v3`). harpy writes dense matrices with
+  `shards=None` because of https://github.com/saeyslab/harpy/issues/270.
+  Spatiato's own `ad.io.write_elem` writes in `core/persistence.py` do not opt
+  out; see P5.
+- harpy removed its workaround for lazily reading empty sparse matrices,
+  relying on anndata 0.13 (background for P2/P3).
+- New public `hp.tb.validate_table(sdata, table_name, feature_matrices_key=...)`
+  validates feature-matrix records against `obsm`. It does not replace P7's
+  merge-compatibility check.
+- The `numba<0.67` pin in harpy's working-tree `pyproject.toml` is a uv override
+  for harpy's own environment, not a runtime requirement; it does not reach
+  Spatiato.
+
 ## Spatiato Today
 
 ### Matrix consumption
@@ -160,7 +195,7 @@ Observed with anndata 0.12.16 (scratch scripts, not in the test suite):
 | dense Dask `obsm` | works, but each `normalize_feature_matrix` call materializes the full matrix |
 | lazy sparse `obsm` (Dask of CSR blocks) | `normalize_feature_matrix` raises `ValueError: setting an array element with a sequence.` |
 | lazy sparse `X`, coloring by var | `X[positions, col]` is a Dask array without `.toarray()`; `np.asarray` yields an object array of shape `(1,)` |
-| backed `zarr.Array` / `CSRDataset` | not tested |
+| backed `zarr.Array` / `CSRDataset` | `X`-var coloring works (see P2); other consumers not tested |
 
 ### Table component persistence
 
@@ -220,8 +255,18 @@ First run on harpy 0.5.0 (`-n auto`):
   passing the budgets explicitly;
 - a hang in a parallel worker, unrelated to harpy: a deadlock when a tiled-points
   cache session is garbage-collected while its `QThread` is still finishing.
-  Fixed in `_TiledPointsCacheSession._on_thread_finished()` by waiting for the
-  thread before emitting `closed`.
+  Investigating it also showed a crash in real use: removing a tiled-points
+  layer while its cache worker is busy lets garbage collection destroy the
+  session and its still-running `QThread`, and Qt aborts the process
+  ("QThread: Destroyed while thread is still running"). Both fixed in
+  `viewer/tiled_points/runtime/cache_session.py`:
+  - `start()` adds the session to the module-level keep-alive set
+    `_SESSIONS_WITH_RUNNING_THREADS`, so owners may drop it at any time;
+  - `_on_thread_finished()` waits for the thread (`thread.wait()`) before
+    emitting `closed`, then releases the keep-alive on the next event-loop
+    iteration (`QTimer.singleShot(0, ...)`);
+  - covered by
+    `tests/viewer/tiled_points/runtime/test_cache_session.py::test_started_session_outlives_dropped_owner_until_its_thread_stops`.
 
 ### P1. Dense Dask feature matrices are fully materialized on every use
 
@@ -245,16 +290,67 @@ Dask arrays of CSR blocks (e.g. `X` from `hp.io.read_zarr`, or sparse `obsm`)
 fail in `normalize_feature_matrix(...)`, `_get_finite_feature_row_mask(...)`,
 and `X`-var coloring.
 
+Seen in real use (2026-10-23): coloring a labels layer by an `X` var fails with
+"ValueError: setting an array element with a sequence."
+
+How a table gets a lazy sparse `X`: Spatiato's reader still loads tables
+eagerly (`spatialdata.read_zarr`), but harpy functions that write a table to
+backed SpatialData go through `hp.tb.io.add_table`, which reopens the written
+table with `mode="lazy"` (e.g. allocation, `allocation_intensity`,
+preprocessing, clustering). A sparse `X` (e.g. transcript counts) then comes
+back as a Dask array of CSR blocks. `hp.io.read_zarr` gives the same result,
+because its default table mode is lazy.
+
+Failure path in `_build_x_var_colormap(...)` (`viewer/labels_styling.py`):
+
+1. `table.X[obs_positions, var_index]` returns a lazy Dask array whose metadata
+   claims a 1-D NumPy array of shape `(n,)`; computing it actually gives a
+   `csr_matrix` of shape `(n, 1)`;
+2. the Dask array has no `.toarray()`, so the code takes the `np.asarray(...)`
+   branch;
+3. `np.asarray` computes the Dask array and wraps the resulting `csr_matrix` in
+   a 0-d object array; `.reshape(-1)` gives one element holding the whole
+   matrix;
+4. `pd.to_numeric(..., errors="coerce")` leaves that element unchanged, and
+   `.astype("float64")` calls `float(csr_matrix)`, which raises the error above.
+
+Coloring shapes by an `X` var (`_get_table_color_values_by_instance(...)` in
+`viewer/shapes_styling.py`) uses the same code; there the one-element array
+reaches `pd.Series(..., index=region_rows.index)` and fails with a length
+mismatch instead.
+
+`X` types checked for `X`-var coloring (scratch scripts, anndata 0.12.16):
+
+| `X` | Result |
+|---|---|
+| SciPy CSR | works |
+| dense Dask | works (`np.asarray` computes it) |
+| Dask array of CSR blocks | fails as above |
+| backed `CSRDataset` | works (indexing returns a `csr_matrix`) |
+| backed dense `zarr.Array` | works |
+
 Direction: one shared helper that turns any supported matrix type into an
 in-memory NumPy or SciPy array (NumPy, SciPy, dense Dask, sparse Dask, backed
 `zarr.Array`, `CSRDataset` / `CSCDataset`), and one helper that extracts a single
-column for `X`-var coloring without materializing the full matrix.
+column for `X`-var coloring without materializing the full matrix. Labels and
+shapes styling both use the column helper:
+
+- select the column first (`X[:, var_index]`), and `.compute()` it if it is a
+  Dask array;
+- if the result is sparse, call `.toarray()`; then
+  `np.asarray(..., dtype=np.float64).reshape(-1)`;
+- then select the rows with `[obs_positions]` in memory.
+
+Selecting the column first avoids having Dask reorder all rows by a long
+position array on large tables. For Dask arrays of CSR blocks split by rows this
+still reads every block, but never builds the dense matrix.
 
 ### P3. Backed handles are untested
 
 `zarr.Array` and `CSRDataset` / `CSCDataset` (from `aggregate_points`,
-`add_canonical_centers`, or `read_table(mode="backed")`) have not been tried in
-any Spatiato path, including spatial query's `obsm["spatial_canonical"]`.
+`add_canonical_centers`, or `read_table(mode="backed")`) have only been tried in
+`X`-var coloring (works, see P2). Every other Spatiato path is untested,
+including spatial query's `obsm["spatial_canonical"]`.
 
 Direction: cover them with the P2 helper and add tests per consumer.
 
@@ -286,6 +382,11 @@ Direction:
   `("obsm", key)` -> `("obsm", key)`, `("uns", *keys)` -> `("uns", *keys)`;
 - pass `obs_identity` for obs-aligned writes; keep including `_colors` palette
   paths explicitly, as widgets already do.
+
+Additional reason (next harpy, anndata 0.13): anndata 0.13 shards zarr v3
+arrays by default, and harpy deliberately writes dense matrices without shards
+(https://github.com/saeyslab/harpy/issues/270). Writing through harpy keeps
+Spatiato's writes consistent with harpy's storage choices.
 
 ### P6. Feature-matrix metadata `backend` label
 
@@ -364,10 +465,26 @@ Decisions:
 
 Implementation notes:
 
-- Decide compatibility before starting, without knowing harpy's column names:
-  existing metadata has the expected `source_kind` and `schema_version`, its
-  `features` and `source_channels` equal the request, and the matrix is dense
-  with `n_obs` rows. If harpy still raises, surface its error.
+- Classify the existing entry into one of three outcomes before starting:
+  - **none**: no `obsm[key]` and no metadata record; plain extraction, the
+    overwrite flag is not needed;
+  - **compatible**: harpy's regional merge will succeed; replace the selected
+    regions;
+  - **incompatible**: anything else, including custom matrices; remove and
+    replace the whole matrix.
+- Decide compatibility without knowing harpy's column names: existing metadata
+  has the expected `source_kind` and `schema_version`, its `features` and
+  `source_channels` equal the request, and the matrix is dense with `n_obs`
+  rows. If harpy still raises, surface its error.
+- **Check the same state harpy checks.** For backed SpatialData, harpy reads the
+  existing matrix and metadata from the **store** (`_existing_feature_matrix`
+  in `harpy/table/_add_feature_matrix.py`), not from memory; only unbacked
+  SpatialData is checked in memory. harpy's `overwrite_feature_key` "only
+  concerns the store": an entry present only in memory is replaced without it.
+  A memory-only pre-check could therefore pick a different dialog than harpy's
+  actual behavior whenever memory and store differ.
+- The labels elements named in the full-replacement warning and dialog are the
+  table's regions that are not selected for extraction.
 - Shared core function (e.g. in `core/feature_extraction.py`) used by the
   widget's `_run_feature_extraction_job(...)`
   (`widgets/feature_extraction/controller.py`) and by
@@ -382,6 +499,14 @@ Implementation notes:
   both cases.
 - Fix `test_compute_features_for_classifier_returns_normalized_target` by
   dropping the pre-seeded matrix; the test is about target normalization.
+
+Implementation order:
+
+1. Shared core function (classification, regional or full replacement,
+   warning), headless wiring and docstrings, and the core tests. This makes the
+   suite green.
+2. Widget: use the classification to pick the confirmation ("Replace selected
+   regions" or "Replace entire feature matrix"), and the widget tests.
 
 ## Tests to Add
 
