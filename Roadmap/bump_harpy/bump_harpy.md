@@ -1,11 +1,12 @@
-# Bump Harpy to 0.5.0: Lazy Matrices and Table Component I/O
+# Bump Harpy to 0.5.2: Lazy Matrices and Table Component I/O
 
 Status: investigation done. Problems are listed below and will be tackled one by
-one; each section's direction is a proposal to settle when we pick it up.
+one; each section's direction is a proposal to settle when we pick it up. Target
+moved from harpy 0.5.0 to 0.5.2 on 2026-10-25.
 
 ## Goal
 
-Move Spatiato to `harpy-analysis>=0.5.0` and handle the two harpy 0.5.0 changes
+Move Spatiato to `harpy-analysis>=0.5.2` and handle the two harpy 0.5.0 changes
 that affect Spatiato:
 
 - **lazy matrices**: harpy now attaches table matrices as Dask arrays or backed
@@ -13,17 +14,44 @@ that affect Spatiato:
 - **table component I/O**: harpy now has its own API to read, write, and delete
   individual table components, overlapping with Spatiato's own reader/writer.
 
+harpy 0.5.1 also raises the `anndata` floor to `>=0.13`, so the move to anndata
+0.13 is part of this bump.
+
+Development policy: develop against harpy releases from PyPI, not against
+harpy's `main` branch. When Spatiato needs an unreleased harpy change, pin it
+temporarily with a uv source on a commit, which only uv reads (the published
+requirement stays `harpy-analysis>=...`):
+
+```toml
+[tool.uv.sources]
+harpy-analysis = { git = "https://github.com/saeyslab/harpy", rev = "<sha>" }
+```
+
+Remove it once harpy releases the change, and before any Spatiato release.
+
 ## Environment
 
-- `pyproject.toml` raises `harpy-analysis>=0.4.4` to `>=0.5.0` (and
-  `napari[all]>=0.4.18` to `>=0.7.1`); this change is not committed yet.
-- `.venv` now has **harpy 0.5.0** (with `spatialdata 0.7.3`, `anndata 0.12.16`);
-  see P0 for the first test run.
-- harpy 0.5.0 requires `anndata>=0.12.10`, `spatialdata>=0.7.3`, and
-  `zarr>=3.2.1`. Spatiato still declares `spatialdata>=0.7.2`.
-- harpy 0.5.0 source reviewed at tag `v0.5.0` (`6299266`). Most of the new code
-  landed in "Feature/table qc (#264)"; the storage design is documented in
-  harpy's `docs/development/storage.md`.
+- `pyproject.toml`: `harpy-analysis>=0.5.2` (raised from `>=0.4.4` to `>=0.5.0`
+  in `d895ea5`, then to `>=0.5.2`), `spatialdata>=0.8.0` (needed with anndata
+  0.13, see P0), `napari[all]>=0.7.1`. Spatiato does not declare `anndata`;
+  harpy's floor applies.
+- `.venv` has **harpy 0.5.2**, `anndata 0.13.4`, `spatialdata 0.8.0`,
+  `dask 2026.8.0`, `zarr 3.2.1`, `numpy 2.3.5`; `uv.lock` is refreshed. See P0
+  for the test runs on 0.5.0 and 0.5.2.
+- harpy 0.5.2 requires `anndata>=0.13`, `spatialdata>=0.7.3`, and `zarr>=3.2.1`.
+  spatialdata 0.7.3 does not work with anndata 0.13, so in practice it needs
+  `spatialdata>=0.8.0` (see P0).
+- harpy releases:
+
+  | Version | Tag commit | Content |
+  |---|---|---|
+  | 0.5.0 | `6299266` | lazy matrices and table component I/O ("Feature/table qc (#264)") |
+  | 0.5.1 | `a65e793` | "Feature/qc metrics (#271)", the `feature/qc_metrics` branch; anndata `>=0.13` |
+  | 0.5.2 | `5ff8c3e` | "Fix/cosmx reader fov coordinates (#275)", including the fix for https://github.com/saeyslab/harpy/issues/274 |
+
+- Source reviewed at tag `v0.5.0`, on the `feature/qc_metrics` branch (before it
+  became 0.5.1), and in #275. The storage design is documented in harpy's
+  `docs/development/storage.md`.
 
 ## Harpy 0.5.0: What Changed
 
@@ -60,9 +88,11 @@ Functions Spatiato is exposed to:
     writes the component and reattaches it with `mode="lazy"` (verified in
     source);
   - so after feature extraction on backed SpatialData, `table.obsm[feature_key]`
-    is a **Dask array**. For unbacked SpatialData the same adapter installs a
-    "lazy merge" of the existing and new rows (per its docstring); not yet
-    verified at runtime.
+    is a **Dask array**. For unbacked SpatialData, harpy 0.5.0 installs a "lazy
+    merge" of the existing and new rows, also a Dask array (verified at runtime,
+    see P0). From 0.5.2 it computes the merge when the existing matrix is
+    absent or in memory, and attaches NumPy or SciPy (see "Harpy 0.5.1 and
+    0.5.2: What Changed").
 - `aggregate_points` / `allocate` and `add_canonical_centers` attach **backed**
   handles (`CSRDataset`, `zarr.Array`), not Dask arrays.
 
@@ -119,30 +149,44 @@ scanpy wrappers (`kmeans`, `leiden`, `preprocess_*`, ...). Spatiato uses none of
 them; it calls `hp.tb.add_feature_matrix`, and `datasets.py` uses
 `hp.im.add_image` / `hp.im.add_labels`.
 
-## Next harpy: `feature/qc_metrics` Branch
+## Harpy 0.5.1 and 0.5.2: What Changed
 
-Checked on 2026-10-22 at commit `e9b9bb1`, 171 commits ahead of `v0.5.0` (not
-released yet).
+0.5.1 is the `feature/qc_metrics` branch (first checked on 2026-10-22 at commit
+`e9b9bb1`), merged as #271. 0.5.2 adds #275. Rechecked against `v0.5.2` on
+2026-10-25.
 
 Unchanged for P7:
 
-- `table/_add_feature_matrix.py` and `table/io/_components_by_region.py` are
-  identical to `v0.5.0`: regional merge and its compatibility checks are the
-  same.
+- `table/io/_write_by_region.py` is identical to `v0.5.0`;
+  `table/_add_feature_matrix.py` differs only in a docstring (0.5.2). The
+  regional merge and its compatibility checks are the same.
 - `_SOURCE_KIND = "harpy_add_feature_matrix"`; `_FEATURE_MATRIX_SCHEMA_VERSION`
   is still `1`, now defined in `harpy/table/_metadata.py`.
 - `hp.tb.io.remove_table_components(sdata, *, table_name, components)` is
   unchanged and still exported.
 
+Unbacked regional updates (0.5.2, #275, closes
+https://github.com/saeyslab/harpy/issues/274):
+
+- for unbacked SpatialData, `add_table_components_by_region(...)` now computes
+  the merge when the supplied and the attached matrix are both in memory (NumPy,
+  or SciPy CSR/CSC; no existing matrix also counts), and attaches the result in
+  the same form. This also applies to `add_feature_matrix(...)` on an existing
+  table, whose computed features are NumPy;
+- Dask arrays, Zarr-backed and memory-mapped matrices keep the lazy merge, and
+  the docstrings advise computing between repeated updates in that case. Once
+  an unbacked table holds a Dask matrix, repeated updates still chain merges;
+- backed SpatialData is unchanged.
+
 Relevant elsewhere:
 
-- **anndata floor `>=0.12.10` -> `>=0.13`** (Spatiato's `.venv` has 0.12.16).
+- **anndata floor `>=0.12.10` -> `>=0.13`** (0.5.1; `.venv` now has 0.13.4).
   In anndata 0.13 `X` lives in memory as `layers[None]`; harpy adapts
-  internally. Spatiato only uses `table.X`, never `layers`, so the risk is low,
-  but run the suite on anndata 0.13 when this lands.
-- **zarr v3 sharding**: per harpy's updated docstrings, anndata 0.13 enables
-  sharding by default (`auto_shard_zarr_v3`). harpy writes dense matrices with
-  `shards=None` because of https://github.com/saeyslab/harpy/issues/270.
+  internally. Spatiato only uses `table.X`, never `layers`, so the risk is low;
+  the P0 rerun covers it.
+- **zarr v3 sharding**: per harpy's docstrings, anndata 0.13 enables sharding by
+  default (`auto_shard_zarr_v3`). harpy still writes dense matrices with
+  `shards=None` because of https://github.com/saeyslab/harpy/issues/270 (open).
   Spatiato's own `ad.io.write_elem` writes in `core/persistence.py` do not opt
   out; see P5.
 - harpy removed its workaround for lazily reading empty sparse matrices,
@@ -150,9 +194,9 @@ Relevant elsewhere:
 - New public `hp.tb.validate_table(sdata, table_name, feature_matrices_key=...)`
   validates feature-matrix records against `obsm`. It does not replace P7's
   merge-compatibility check.
-- The `numba<0.67` pin in harpy's working-tree `pyproject.toml` is a uv override
-  for harpy's own environment, not a runtime requirement; it does not reach
-  Spatiato.
+- harpy's `[tool.uv] override-dependencies` (`numpy>=2.4.6`, `numba>=0.64.0`)
+  apply to harpy's own environment only; neither is in harpy 0.5.2's published
+  requirements, so they do not reach Spatiato (`.venv` has numpy 2.3.5).
 
 ## Spatiato Today
 
@@ -236,17 +280,22 @@ on Dask-backed `X` / `obsm`), and
 
 ## Problems
 
-### P0. Run the suite on harpy 0.5.0
+### P0. Run the suite on harpy 0.5.2
 
-- Maintainer installs harpy 0.5.0 into `.venv` (the environment is managed
-  manually, per `CLAUDE.md`).
-- Raise Spatiato's `spatialdata` floor to `>=0.7.3` to match harpy 0.5.0.
+- Maintainer installs harpy into `.venv` (the environment is managed manually,
+  per `CLAUDE.md`): 0.5.0 first, then 0.5.2 with anndata 0.13.4 and
+  spatialdata 0.8.0 on 2026-10-25.
+- Raise Spatiato's `spatialdata` floor to match: `>=0.7.3` for harpy 0.5.0,
+  then `>=0.8.0` for anndata 0.13 (see the second run). Done.
 - Run the full suite and triage failures. Expect at least feature-extraction
-  tests to observe a lazy `obsm[feature_key]`.
+  tests to observe a lazy `obsm[feature_key]`. Done on 0.5.0 and on 0.5.2
+  (below).
+- Recheck the anndata 0.12.16 observations under "Matrix consumption" and in
+  P2 on anndata 0.13.4. Still to do; the suite does not cover them.
 - Verify the unbacked `add_feature_matrix` result type at runtime (the adapter
-  docstring describes a lazy merge).
+  docstring describes a lazy merge). Done (below).
 
-First run on harpy 0.5.0 (`-n auto`):
+First run on harpy 0.5.0 with anndata 0.12.16 (`-n auto`):
 
 - one harpy-related failure,
   `test_compute_features_for_classifier_returns_normalized_target`; see P7;
@@ -268,12 +317,122 @@ First run on harpy 0.5.0 (`-n auto`):
   - covered by
     `tests/viewer/tiled_points/runtime/test_cache_session.py::test_started_session_outlives_dropped_owner_until_its_thread_stops`.
 
+Second run on harpy 0.5.2 with anndata 0.13.4 (2026-10-25, `-n auto`):
+
+- with spatialdata 0.7.3: 699 errors and 20 failures, all with the same cause,
+  `AttributeError: 'NoneType' object has no attribute 'lower'` in
+  `spatialdata/_core/validation.py:153`:
+  - anndata 0.13 keeps `X` in memory as `layers[None]`;
+    `TableModel.parse(...)` checks every layer key with `key.lower()`, which
+    fails on `None`. Every table with an `X` is affected;
+  - most of them error at setup, because the shared fixtures build their data
+    with spatialdata's own `blobs()` dataset, which calls `TableModel.parse`
+    (`tests/conftest.py`). The 20 failures hit the same line inside the test
+    body. None of them fail in Spatiato code;
+  - fixed in spatialdata 0.8.0 (released 2026-07-02, "Fix adata layers None
+    after anndata X unification", scverse/spatialdata#1122 and #1123), which
+    skips `None` keys. Spatiato's lock was still on 0.7.3 only because
+    `uv lock` keeps versions it already pinned;
+- fix: Spatiato's floor raised to `spatialdata>=0.8.0`; `uv.lock` and `.venv`
+  moved to spatialdata 0.8.0, which also moves dask from 2026.1.1 to 2026.8.0
+  (spatialdata 0.8.0 requires `dask>=2026.3.0`). harpy's own `uv.lock` for
+  `v0.5.2` uses the same spatialdata, anndata, and dask versions;
+- other spatialdata 0.8.0 changes look low-risk: the main ones are a refactor of
+  relational queries and new table validation for them, and Spatiato calls none
+  of those APIs (`join_spatialelement_table`, `match_table_to_element`,
+  `get_values`, ...);
+- with spatialdata 0.8.0: 1 failed, 2384 passed, 1 skipped. The failure is the
+  known P7 test, `test_compute_features_for_classifier_returns_normalized_target`,
+  with the same harpy error as on 0.5.0. The warnings are zarr, napari and
+  spatialdata messages; none are anndata deprecations or come from Spatiato
+  code;
+- upstream gap, not reported: harpy 0.5.1 and 0.5.2 declare
+  `spatialdata>=0.7.3` together with `anndata>=0.13`, a combination that cannot
+  parse a table with `X`. harpy's own CI uses spatialdata 0.8.0, so it does not
+  hit this.
+
+A green suite does not cover the lazy and backed matrix paths (no tests use
+them, see "Matrix consumption"): P1-P5 are still open, and P2 was seen in real
+use.
+
+Remaining P0 items, checked on 2026-10-23:
+
+- **`spatialdata` floor**: raised from `>=0.7.2` to `>=0.7.3` (later to
+  `>=0.8.0`, see the second run above). The old floor
+  could never be installed, because harpy 0.5.0 requires `spatialdata>=0.7.3`;
+  `uv.lock` already resolved 0.7.3. `uv.lock` records Spatiato's own specifier,
+  so it needs a `uv lock` refresh (resolved versions do not change). Nothing
+  else in the repository pins `spatialdata`.
+- **Unbacked `add_feature_matrix` result type** (scratch script,
+  `blobs_multi_region()` with `sdata.path` `None`, feature `area`):
+
+  | Case | `obsm[feature_key]` |
+  |---|---|
+  | new key on an existing table | dense Dask array of NumPy blocks |
+  | overwrite of the same key | dense Dask array; same values |
+  | multi-region table, one region | dense Dask array (lazy merge); rows of the other region are NaN |
+  | then the other region into the same key | dense Dask array; no NaN left, first region's rows unchanged |
+  | new output table (`output_table_name`) | NumPy; `X` is `None` |
+
+  So on harpy 0.5.0, feature extraction into an existing table leaves a Dask
+  `obsm` for unbacked SpatialData as well, and repeated extractions grow the
+  lazy graph; see P1.
+
+  Rerun on 2026-10-24 against the #275 branch (the code released as 0.5.2,
+  with anndata 0.12.16): every case above, including 5 more overwrites, gives
+  NumPy.
+
 ### P1. Dense Dask feature matrices are fully materialized on every use
 
-After P0, feature extraction leaves `obsm[feature_key]` as a Dask array. It
-works, but `normalize_feature_matrix(...)` reads the whole matrix from the store
+After P0, feature extraction on backed SpatialData leaves `obsm[feature_key]` as
+a Dask array (0.5.0 and 0.5.2). It works, but `normalize_feature_matrix(...)` reads the whole matrix from the store
 on every call, including on every Object Classification refresh. On large tables
 (e.g. ~407k cells) this makes widget refreshes slow.
+
+Unbacked SpatialData: fixed upstream in harpy 0.5.2 for in-memory matrices (see
+"Resolution" below). Findings on harpy 0.5.0 (2026-10-23, see P0): feature
+extraction into an existing table also leaves `obsm[feature_key]` as a dense
+Dask array. Computing it combines arrays already in memory, so each use is
+cheaper than a store read, but the graph grows:
+
+- every extraction builds a new lazy merge on top of the previous lazy matrix,
+  in the unbacked branch of harpy's `add_table_components_by_region(...)`
+  (`harpy/table/io/_components_by_region.py`);
+- the task count grows by about 2 per extraction (3 after one, 26 after 12),
+  whether the same region or alternating regions are replaced;
+- values stay correct, but every compute replays the whole chain;
+- the chain keeps the regional values of every earlier update in memory, even
+  when later updates replaced those rows. Confirmed on 2026-10-24 with a
+  harpy-only reproducer (two regions of 100k rows, 20 features, one region
+  updated 10 times through `hp.tb.io.add_table_components_by_region(...)`):
+  memory held grows by 16.0 MiB per update, one regional matrix, from 54.6 to
+  198.9 MiB; one `.compute()` and reinstall brings it back to 49.1 MiB.
+
+harpy 0.5.0's docstring describes the lazy merge as deliberate: it attaches the
+result "without executing the merge", to avoid materializing the complete matrix
+just to attach it. That makes sense when the existing matrix is backed by some
+store, but not when every input is already in memory.
+
+Resolution:
+
+- **Upstream (harpy)**: reported as https://github.com/saeyslab/harpy/issues/274
+  and fixed in 0.5.2 (#275). The unbacked branch now computes the merge when
+  both matrices are in memory. Checked on 2026-10-24 against the #275 branch
+  with the issue's reproducer (10 updates):
+
+  | Attached matrix at the start | harpy 0.5.0 | harpy 0.5.2 |
+  |---|---|---|
+  | NumPy | Dask, 31 tasks, 198.9 MiB held | NumPy, flat at 48.4 MiB |
+  | SciPy CSR | not measured | CSR, flat at 41.6 MiB |
+  | Dask array | not measured | still chains: 104 tasks, 168 MiB held |
+
+  Values are correct in every case.
+- **Spatiato**: only a safeguard is left. After extraction on unbacked
+  SpatialData, if `obsm[feature_key]` is still a Dask array (the attached matrix
+  was a Dask array before extraction, e.g. a table read lazily and attached to
+  in-memory SpatialData, or a custom Dask matrix), compute it once and
+  reinstall it. This stops the chain and gives interactive use an in-memory
+  matrix; it is a no-op for in-memory matrices.
 
 Direction:
 
@@ -383,7 +542,7 @@ Direction:
 - pass `obs_identity` for obs-aligned writes; keep including `_colors` palette
   paths explicitly, as widgets already do.
 
-Additional reason (next harpy, anndata 0.13): anndata 0.13 shards zarr v3
+Additional reason (harpy 0.5.1+, anndata 0.13): anndata 0.13 shards zarr v3
 arrays by default, and harpy deliberately writes dense matrices without shards
 (https://github.com/saeyslab/harpy/issues/270). Writing through harpy keeps
 Spatiato's writes consistent with harpy's storage choices.
@@ -540,7 +699,9 @@ Implementation order:
   `spatialdata.read_zarr`, eager tables) switch to `hp.io.read_zarr` with lazy
   tables?
 - Should feature extraction keep the lazy `obsm` that harpy attaches, or
-  materialize it once after extraction for interactive use?
+  materialize it once after extraction for interactive use? Since harpy 0.5.2,
+  unbacked SpatialData with in-memory matrices already gets NumPy, so the
+  question is mainly about backed SpatialData (see P1).
 - For P5: use harpy's store-only functions (Spatiato installs results in memory
   itself) or the SpatialData adapters (`add_table_components`, which also
   reattach lazily)?
