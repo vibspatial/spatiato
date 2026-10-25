@@ -176,7 +176,7 @@ wheels = [
 
 [[package]]
 name = "anndata"
-version = "0.12.16"
+version = "0.13.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "array-api-compat" },
@@ -187,12 +187,13 @@ dependencies = [
     { name = "packaging" },
     { name = "pandas" },
     { name = "scipy" },
-    { name = "scverse-misc" },
+    { name = "scverse-misc", extra = ["settings"] },
+    { name = "typing-extensions" },
     { name = "zarr" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6c/0f/4c6b3a4c5dc57bd02f0656666aefae7e83b8158b839f60cfb1c5f2fbecab/anndata-0.12.16.tar.gz", hash = "sha256:26d557fd147728993aac99c2eef676e1e316a84bbeee3c176ca6c5d66e5fc443", size = 2255740, upload-time = "2026-05-18T15:59:40.346Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/27/94/ded0e45490ad65d1232d3bc3bc618fb24d33d8e87653baca1553074261be/anndata-0.13.4.tar.gz", hash = "sha256:fadee3955b4b826dd23d9c0aa296147d8624f8222210b6c8abc3c115a111dce4", size = 2376085, upload-time = "2026-09-18T12:58:50.131Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/31/bb8da9d45d2b54b7d7ba31945b7024374028274d089828dfd15035411828/anndata-0.12.16-py3-none-any.whl", hash = "sha256:2661332ed8e757886aafddc2f76103846ae17a16e1c003d76c3001ad067d8bc6", size = 175291, upload-time = "2026-05-18T15:59:38.72Z" },
+    { url = "https://files.pythonhosted.org/packages/54/23/f1b1af76bc5a1845d5fcad297e4c460223a7670f1ca15e167d7dcf32aaab/anndata-0.13.4-py3-none-any.whl", hash = "sha256:028c4e4f968a68965d3d0fc465c947890fa8e5aa6d2506104590f46080c7736d", size = 190231, upload-time = "2026-09-18T12:58:48.639Z" },
 ]
 
 [[package]]
@@ -1470,7 +1471,7 @@ wheels = [
 
 [[package]]
 name = "harpy-analysis"
-version = "0.5.0"
+version = "0.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anndata" },
@@ -1495,9 +1496,9 @@ dependencies = [
     { name = "voronoi-diagram-for-polygons" },
     { name = "zarr" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/70/c80df90cc54005507a26908d9180245ee103aef68209958b62abdc296267/harpy_analysis-0.5.0.tar.gz", hash = "sha256:6e662b2070d7fd666f0e25ae2831e004e269b2930d00f699dc15e4143c3cf0e9", size = 21735495, upload-time = "2026-10-09T11:38:02.214Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/b4/4cec7b93b16e009bb7c36e93659a6d4b28a1ae63c8ff9da0e03a7651f5e0/harpy_analysis-0.5.2.tar.gz", hash = "sha256:4478be80462c4057514373d7102ab4906638b5316ea6784daa669609b05d943f", size = 21747857, upload-time = "2026-10-25T05:54:54.424Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c5/7d/48ac0aaac45885b0e84fe64cf17cd9e96f5b6f07a995ed8ebe5e44b72200/harpy_analysis-0.5.0-py3-none-any.whl", hash = "sha256:25d6d9cd175425b2726add9efc28edee15841b2a4a300f83275b3dd26bc51b1e", size = 885294, upload-time = "2026-10-09T11:38:00.212Z" },
+    { url = "https://files.pythonhosted.org/packages/11/ba/da47674c5e18d34b46b08b3ba1f7a49762a2fad772c9e815e855cbe840d5/harpy_analysis-0.5.2-py3-none-any.whl", hash = "sha256:95552de5ff20049272bb277161f02c301560e1e9be0f0a11566c98269e7ca790", size = 961008, upload-time = "2026-10-25T05:54:51.94Z" },
 ]
 
 [[package]]
@@ -4696,15 +4697,21 @@ wheels = [
 
 [[package]]
 name = "scverse-misc"
-version = "0.0.7"
+version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "session-info2" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/6f/991549a8fc56c0e18e53b41819be8115eb767f0354e82bcba10d0eab9a0c/scverse_misc-0.0.7.tar.gz", hash = "sha256:d01467d806b4f783b52675451eccd913945d08d73609ea66470088b5446cca6a", size = 31565, upload-time = "2026-05-18T13:04:22.47Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/3f/beabd0ed59483d1f65dc9e23db74449c7f4cd998f6cfaafb32c8e93364f7/scverse_misc-0.1.7.tar.gz", hash = "sha256:c39413f53debc6c0dc2ba0d7fb5bceeff75a5a89eb7f64fcb8a172b80d0ce12b", size = 49862, upload-time = "2026-10-14T08:12:14.853Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/62/a5/a276bcdece26e2de16daa8de9e88979c40399f4ea6bdc352581c0a3f8b0f/scverse_misc-0.0.7-py3-none-any.whl", hash = "sha256:11c00be7b04fe903b6834df58159ae4910d4faae21356802a99303a18546f109", size = 13933, upload-time = "2026-05-18T13:04:21.071Z" },
+    { url = "https://files.pythonhosted.org/packages/17/d0/e4479b1916f81b3be32d2edc73e7ddf26958af894dc04cbeccfd1ea0af49/scverse_misc-0.1.7-py3-none-any.whl", hash = "sha256:92fc7f46053979512d6d2b1a6449a8bddb6ffcea8fb4a03cc1fafc58e42b4bd1", size = 26863, upload-time = "2026-10-14T08:12:13.595Z" },
+]
+
+[package.optional-dependencies]
+settings = [
+    { name = "pydantic-settings" },
+    { name = "python-dotenv" },
 ]
 
 [[package]]
@@ -5015,7 +5022,7 @@ torch = [
 requires-dist = [
     { name = "dask", extras = ["dataframe"] },
     { name = "filelock", specifier = ">=3.20.1" },
-    { name = "harpy-analysis", specifier = ">=0.5.0" },
+    { name = "harpy-analysis", specifier = ">=0.5.2" },
     { name = "joblib" },
     { name = "lazy-loader", specifier = ">=0.4" },
     { name = "loguru" },
@@ -5030,7 +5037,7 @@ requires-dist = [
     { name = "pytest-qt", marker = "extra == 'test'" },
     { name = "pytest-xdist", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "spatialdata", specifier = ">=0.7.2" },
+    { name = "spatialdata", specifier = ">=0.7.3" },
     { name = "spatiato", extras = ["test", "docs", "torch"], marker = "extra == 'dev'" },
     { name = "sphinx", marker = "extra == 'docs'", specifier = ">=4.5" },
     { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'" },
@@ -5581,11 +5588,11 @@ wheels = [
 
 [[package]]
 name = "typing-extensions"
-version = "4.15.0"
+version = "4.16.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f6/cc/6253133b5bb138fc3306cebfbda2c520f545d36b5be2c7255cc528bb45d6/typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5", size = 113555, upload-time = "2026-07-02T08:40:05.92Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+    { url = "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8", size = 45571, upload-time = "2026-07-02T08:40:04.659Z" },
 ]
 
 [[package]]
