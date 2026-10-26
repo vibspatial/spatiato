@@ -555,7 +555,8 @@ drop the field from Spatiato's interpretation. Cosmetic; lowest priority.
 
 ### P7. `overwrite_feature_key` changed meaning in harpy 0.5.0
 
-Status: decisions agreed; not implemented yet.
+Status: decisions 1-8 agreed (4-8 added on 2026-10-26 after checking the spec
+against the code); not implemented yet.
 
 Found by the P0 run:
 `tests/test_headless.py::test_compute_features_for_classifier_returns_normalized_target`
@@ -620,28 +621,110 @@ Decisions:
      compatible, otherwise remove and replace the whole matrix.
    - In the full-replacement case, log a warning naming the labels elements
      whose values are dropped.
-   - The widget's two dialogs both lead to `overwrite_feature_key=True`.
+   - The widget's two dialogs both lead to `overwrite_feature_key=True`, and
+     pass the confirmed outcome along (decision 4).
+   - The flag means the same in both storage modes: when an entry exists
+     (compatible or incompatible) and `overwrite_feature_key=False`, Spatiato
+     raises, also for unbacked SpatialData. harpy itself only requires the flag
+     for the store, so without this, headless would merge silently when
+     unbacked and raise when backed.
+4. **The confirmed outcome travels with the job.** The widget checks the
+   existing entry on the main thread, shows the matching dialog, and the
+   request carries what the user confirmed:
+   `confirmed_existing_entry: Literal["none", "compatible", "incompatible"] | None`
+   on `FeatureExtractionRequest`. The shared core function checks again in the
+   worker before it removes or computes anything. If the result differs, it
+   raises "Feature matrix "X" changed since you confirmed; calculate again", and
+   nothing has been removed or written. Without this, a table change between
+   dialog and worker could turn a confirmed regional replacement into an
+   unconfirmed full replacement. Headless passes `None`: whatever the check
+   finds is acted on.
+5. **The compatibility check mirrors harpy's checks** (`add_feature_matrix`
+   existing-matrix checks and `_merge_feature_matrix_metadata`). The entry is
+   compatible only when all of these hold; anything else is incompatible, with
+   a reason:
+   - metadata is a mapping with `source_kind ==
+     HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND` and `schema_version ==
+     FEATURE_MATRIX_METADATA_SCHEMA_VERSION` (Spatiato's constants in
+     `core/feature_matrix_metadata.py`; a test pins them to harpy's values);
+   - features are equal in harpy's column order: intensity features first, then
+     morphology features, keeping the order within each group. harpy derives
+     `feature_columns` from the features and channels, so equal groups and
+     channels give equal columns. The widget already sends one fixed order
+     (`selected_feature_names`), so this only matters for headless input;
+   - channels: a small function resolves the request against the first
+     triplet's image the way harpy's `_resolve_channels` does (`None` is all
+     channels, an integer is an index, a string is a name, duplicates removed,
+     an unnamed channel becomes `channel_{i}`). The result must equal
+     `source_channels`, which is `None` for morphology-only features;
+   - the matrix is dense (NumPy, Dask with NumPy blocks, or `zarr.Array`), with
+     shape `(n_obs, len(feature_columns))`, and its dtype can hold float64
+     safely.
+
+   The check reads memory for unbacked SpatialData. For backed SpatialData it
+   reads the store, without loading matrix values:
+   `hp.tb.io.read_table_components(sdata.path, table_name=..., components=[("obsm", key), ("uns", "feature_matrices", key)], mode="backed", missing="omit")`.
+   If harpy still raises, its error is shown; the check runs before extraction,
+   so nothing has been removed by then.
+6. **Events.** All events use the `obsm` and `uns` metadata paths of the key:
+   - regional replacement: `change_kind="updated"`, `regions` = the selected
+     labels elements, as today;
+   - full replacement: `change_kind="updated"` (not `"rebuilt"`: Object
+     Classification only invalidates its classifier on `"updated"`), `regions`
+     = every region the table declares (`get_table_metadata(...).regions`), as
+     the `TableStateChangedEvent` contract requires;
+   - new key: `"created"` with the selected regions, as today;
+   - the controller sets `change_kind` from the check result, not from what is
+     in memory (today `_prepare_feature_extraction_job(...)` looks at
+     `table.obsm`);
+   - failure after the removal: the core function raises a dedicated error that
+     wraps the original and records that the removal happened. The controller
+     then publishes a `"removed"` event with every region, through
+     `record_persisted_table_change(...)` for backed SpatialData (the removal
+     is already on disk) and `record_table_mutation(...)` for unbacked. The
+     status reads "Feature extraction failed; the previous feature matrix "X"
+     was removed."
+7. **Memory and store disagree (backed SpatialData).**
+   - The entry is only in memory, not in the store (never saved): incompatible,
+     with the reason "not saved; its values will be replaced". The
+     full-replacement dialog is shown; then `remove_table_components(...)`
+     removes it from memory and a fresh matrix is extracted. Without this,
+     harpy replaces it silently.
+   - The entry is in the store, and memory holds unsaved changes to it (its
+     `obsm` or metadata path is dirty in `SpatiatoAppState`, see
+     `snapshot_table_dirty_state(...)`): blocked with "Feature matrix "X" has
+     unsaved changes; write or reload the table first". harpy would merge with
+     the stored version and drop those changes.
+   - Otherwise the store is checked, as in decision 5.
+   - Headless has no dirty tracking: it follows the store, like harpy, and its
+     docstring says so.
+8. **Partial entries.**
+   - Metadata without a matrix: none. There are no values to lose, so no dialog.
+     `overwrite_feature_key=True` is still passed to harpy (backed SpatialData
+     needs it for the stored metadata); harpy writes fresh metadata, and other
+     regions' rows are NaN. The event is `"created"`; an info log notes that
+     the orphaned metadata was replaced.
+   - A matrix without metadata (custom or unregistered): incompatible, with the
+     reason "no harpy feature metadata". The full-replacement dialog names the
+     labels elements whose values are lost.
 
 Implementation notes:
 
-- Classify the existing entry into one of three outcomes before starting:
-  - **none**: no `obsm[key]` and no metadata record; plain extraction, the
-    overwrite flag is not needed;
-  - **compatible**: harpy's regional merge will succeed; replace the selected
-    regions;
-  - **incompatible**: anything else, including custom matrices; remove and
-    replace the whole matrix.
-- Decide compatibility without knowing harpy's column names: existing metadata
-  has the expected `source_kind` and `schema_version`, its `features` and
-  `source_channels` equal the request, and the matrix is dense with `n_obs`
-  rows. If harpy still raises, surface its error.
+- Classify the existing entry into one of three outcomes before starting, each
+  with a short reason for dialogs and warnings:
+  - **none**: no `obsm[key]` (metadata alone counts as none, decision 8);
+    plain extraction;
+  - **compatible**: decision 5 holds; replace the selected regions;
+  - **incompatible**: anything else, including custom matrices and backed
+    memory-only entries (decision 7); remove and replace the whole matrix.
 - **Check the same state harpy checks.** For backed SpatialData, harpy reads the
   existing matrix and metadata from the **store** (`_existing_feature_matrix`
   in `harpy/table/_add_feature_matrix.py`), not from memory; only unbacked
   SpatialData is checked in memory. harpy's `overwrite_feature_key` "only
   concerns the store": an entry present only in memory is replaced without it.
   A memory-only pre-check could therefore pick a different dialog than harpy's
-  actual behavior whenever memory and store differ.
+  actual behavior whenever memory and store differ; decision 7 covers where
+  they differ.
 - The labels elements named in the full-replacement warning and dialog are the
   table's regions that are not selected for extraction.
 - Shared core function (e.g. in `core/feature_extraction.py`) used by the
@@ -650,10 +733,11 @@ Implementation notes:
   `headless.compute_features_for_classifier(...)`. The removal runs in the same
   worker as the extraction.
 - The widget uses the same compatibility check to choose which confirmation to
-  show before launching the job.
+  show before launching the job, and passes the outcome as
+  `confirmed_existing_entry` (decision 4).
 - Backed SpatialData: keep calling `record_persisted_table_change(...)` for
   `("obsm", key)` and `("uns", ("feature_matrices", key))` after extraction,
-  as today.
+  as today, with the regions and change kind of decision 6.
 - Update the `overwrite_feature_key` docstrings in `headless.py` to describe
   both cases.
 - Fix `test_compute_features_for_classifier_returns_normalized_target` by
@@ -661,11 +745,14 @@ Implementation notes:
 
 Implementation order:
 
-1. Shared core function (classification, regional or full replacement,
-   warning), headless wiring and docstrings, and the core tests. This makes the
-   suite green.
-2. Widget: use the classification to pick the confirmation ("Replace selected
-   regions" or "Replace entire feature matrix"), and the widget tests.
+1. Shared core function (classification with channel resolution, the
+   confirmed-outcome check, regional or full replacement, the error after a
+   removal, warning), headless wiring and docstrings, and the core tests. This
+   makes the suite green.
+2. Widget and controller: use the classification to pick the confirmation
+   ("Replace selected regions" or "Replace entire feature matrix"), pass the
+   confirmed outcome, block on unsaved changes (decision 7), publish the events
+   of decision 6, and the widget tests.
 
 ## Tests to Add
 
@@ -680,9 +767,21 @@ Implementation order:
 - feature-key overwrite (P7), on a multi-region dataset (e.g. the
   `sdata_blobs_multi_region` fixture), in memory and backed:
   - compatible entry: only the selected labels elements' rows change;
+  - compatible with channels given as indices, names, or `None`, and with
+    features in a different order across the intensity and morphology groups;
   - different features or channels: full replacement, other rows become NaN,
     warning logged;
   - custom matrix without harpy metadata: full replacement;
+  - metadata without a matrix: no dialog, `"created"` event;
+  - `overwrite_feature_key=False` with an existing entry raises, in memory and
+    backed;
+  - the check result changes between dialog and worker: the job aborts and the
+    table is unchanged;
+  - backed, entry only in memory: full-replacement dialog; entry with unsaved
+    changes: blocked;
+  - full replacement publishes `"updated"` with every table region; a failure
+    after the removal publishes `"removed"`, and Object Classification drops
+    the key;
   - widget shows the matching confirmation, and Cancel leaves the table
     unchanged.
 
