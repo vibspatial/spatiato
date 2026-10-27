@@ -1,8 +1,9 @@
 # Bump Harpy to 0.5.2: Lazy Matrices and Table Component I/O
 
 Status: investigation done. Problems are listed below and will be tackled one by
-one; each section's direction is a proposal to settle when we pick it up. Target
-moved from harpy 0.5.0 to 0.5.2 on 2026-10-25.
+one, in the order of "Migration Plan"; each section's direction is a proposal to
+settle when we pick it up. Target moved from harpy 0.5.0 to 0.5.2 on
+2026-10-25.
 
 ## Goal
 
@@ -184,8 +185,8 @@ Relevant elsewhere:
   In anndata 0.13 `X` lives in memory as `layers[None]`; harpy adapts
   internally. Spatiato only uses `table.X`, never `layers`, so the risk is low;
   the P0 rerun covers it.
-- **zarr v3 sharding**: per harpy's docstrings, anndata 0.13 enables sharding by
-  default (`auto_shard_zarr_v3`). harpy still writes dense matrices with
+- **zarr v3 sharding**: anndata 0.13 enables sharding by default
+  (`ad.settings.auto_shard_zarr_v3` is `True` in 0.13.4). harpy still writes dense matrices with
   `shards=None` because of https://github.com/saeyslab/harpy/issues/270 (open).
   Spatiato's own `ad.io.write_elem` writes in `core/persistence.py` do not opt
   out; see P5.
@@ -277,6 +278,57 @@ and spatial query widget tests.
 Existing notes: `Roadmap/dask_backed_tables.md` (anndata 0.12.10 observations
 on Dask-backed `X` / `obsm`), and
 `Roadmap/feature_extraction_roadmap/feature_extraction.md`.
+
+## Migration Plan
+
+Agreed on 2026-10-27. Moving Spatiato's table I/O to harpy's API, and dropping
+Spatiato's own table I/O code, is the core of this bump. Order:
+
+1. **P7.** Its spec is complete. It lives in feature extraction, not
+   persistence, and already goes through harpy's API. It makes the suite green,
+   so the persistence refactor starts from a clean baseline.
+2. **D1: decide how tables live in memory** (open). Today every table is fully
+   loaded when a store is opened (`spatialdata.read_zarr`, which reads tables
+   with `anndata.read_zarr`); harpy's `hp.io.read_zarr` defaults to lazy. P1-P5
+   and the reader switch all follow from this choice. Starting proposal:
+
+   | Component | In memory | Why |
+   |---|---|---|
+   | `obs`, `var`, `uns` | loaded | harpy always loads them; small, and edited by widgets |
+   | `X` | lazy | can be huge (transcript counts); Spatiato only reads one column, for coloring by var |
+   | `obsm` feature matrices | loaded, or loaded once (after extraction or at first use) | the classifier needs the whole matrix; small next to `X` |
+
+   Other components follow from their consumers (P3). harpy's readers take one
+   `mode` for all matrices, so a split means reading lazily and loading the
+   chosen components afterwards.
+3. **Make consumers representation-agnostic** (P2, P1, P3): shared helpers
+   that turn any supported matrix into NumPy or SciPy, and that read one column
+   without loading the whole matrix; no full read on every refresh; tests with
+   backed handles. Needed whatever D1 decides: harpy already attaches lazy
+   matrices after a backed extraction, and P2 was hit in real use. This step
+   comes before the reader switch, which would otherwise spread the P2 bug to
+   every table.
+4. **Swap the table I/O** (P5 writes, P4 reload):
+   - writes through harpy's store-only `hp.tb.io.write_table_components(...)`
+     and `delete_table_components(...)`. Spatiato's dirty tracking already
+     knows which paths changed, which maps onto explicit components and
+     deletes. The store-only functions leave the in-memory values alone; the
+     SpatialData adapters (`add_table_components(...)` and the like) would
+     replace them with lazy views of the store on every save;
+   - not `write_table_updates(...)`: it compares the whole table with the store
+     and never deletes, so it does not fit explicit dirty paths (non-goal);
+   - reload through `hp.tb.io.read_table_components(...)`, in the
+     representation chosen in D1;
+   - removed from `core/persistence.py` (416 lines): the direct zarr and
+     anndata reads and writes, zarr group-structure handling
+     (`_resolve_backed_table_group(...)` and the parent-chain helpers), and
+     metadata consolidation. Kept: `TableComponentPath`, dirty tracking in
+     `SpatiatoAppState`, the reload checks (`_validate_reload_binding(...)`),
+     and restoring the in-memory state when a reload fails.
+5. **Switch the reader** (`_reader.py`) to `hp.io.read_zarr`, last: it changes
+   every table at once.
+
+P6 (cosmetic) can be picked up along the way.
 
 ## Problems
 
@@ -518,9 +570,10 @@ Direction: cover them with the P2 helper and add tests per consumer.
 `reload_table_components(...)` uses `ad.io.read_elem`, so "Reload Table State"
 replaces a lazy feature matrix with an in-memory copy.
 
-Direction: read with `hp.tb.io.read_table_components(..., mode="lazy")` and keep
-Spatiato's reload-binding validation, `TableModel.validate`, and in-memory
-rollback around it.
+Direction: read with `hp.tb.io.read_table_components(...)`, in the
+representation chosen in D1 (see "Migration Plan", step 4), and keep Spatiato's
+reload-binding validation, `TableModel.validate`, and in-memory rollback around
+it.
 
 ### P5. Replace Spatiato's on-disk writes with harpy's component API
 
@@ -536,14 +589,18 @@ Direction:
   write snapshots/acknowledgement, and reload validation;
 - replace only the store I/O in `core/persistence.py`
   (`write_table_components`, `write_table_prediction_state`,
-  `reload_table_components`) with `hp.tb.io` calls;
+  `reload_table_components`) with `hp.tb.io` calls, using harpy's store-only
+  functions rather than the SpatialData adapters (see "Migration Plan",
+  step 4);
 - map paths: `("obs", col)` -> `("obs",)` (whole dataframe, as today),
   `("obsm", key)` -> `("obsm", key)`, `("uns", *keys)` -> `("uns", *keys)`;
 - pass `obs_identity` for obs-aligned writes; keep including `_colors` palette
   paths explicitly, as widgets already do.
 
 Additional reason (harpy 0.5.1+, anndata 0.13): anndata 0.13 shards zarr v3
-arrays by default, and harpy deliberately writes dense matrices without shards
+arrays by default (`ad.settings.auto_shard_zarr_v3` is `True` in anndata 0.13.4,
+checked on 2026-10-27), so Spatiato's own `ad.io.write_elem` calls now write
+sharded arrays. harpy deliberately writes dense matrices without shards
 (https://github.com/saeyslab/harpy/issues/270). Writing through harpy keeps
 Spatiato's writes consistent with harpy's storage choices.
 
@@ -555,8 +612,8 @@ drop the field from Spatiato's interpretation. Cosmetic; lowest priority.
 
 ### P7. `overwrite_feature_key` changed meaning in harpy 0.5.0
 
-Status: decisions 1-8 agreed (4-8 added on 2026-10-26 after checking the spec
-against the code); not implemented yet.
+Status: decisions 1-9 agreed (4-8 added on 2026-10-26 and 9 on 2026-10-27,
+after checking the spec against the code); not implemented yet.
 
 Found by the P0 run:
 `tests/test_headless.py::test_compute_features_for_classifier_returns_normalized_target`
@@ -638,7 +695,9 @@ Decisions:
    nothing has been removed or written. Without this, a table change between
    dialog and worker could turn a confirmed regional replacement into an
    unconfirmed full replacement. Headless passes `None`: whatever the check
-   finds is acted on.
+   finds is acted on. The re-check covers what is in memory and in the store,
+   not dirty state: that lives in `SpatiatoAppState` on the main thread, so the
+   unsaved-changes block of decision 7 runs only in the widget, at launch.
 5. **The compatibility check mirrors harpy's checks** (`add_feature_matrix`
    existing-matrix checks and `_merge_feature_matrix_metadata`). The entry is
    compatible only when all of these hold; anything else is incompatible, with
@@ -694,7 +753,19 @@ Decisions:
      `obsm` or metadata path is dirty in `SpatiatoAppState`, see
      `snapshot_table_dirty_state(...)`): blocked with "Feature matrix "X" has
      unsaved changes; write or reload the table first". harpy would merge with
-     the stored version and drop those changes.
+     the stored version and drop those changes. This is a real Spatiato flow:
+     Object Classification's "register feature metadata" for a custom matrix
+     changes the metadata in memory and marks it dirty until the table is
+     written. The widget checks this on the main thread before launching; the
+     worker's re-check (decision 4) does not repeat it, so a change made
+     between launch and the worker's check is not caught. Accepted.
+   - The entry is only in the store, not in memory (only possible through code
+     outside Spatiato's widgets): the check follows the store, and the dialog
+     describes the stored entry. A regional merge brings the stored values for
+     other regions back into memory.
+   - Changes outside Spatiato's dirty tracking (notebook edits, another process
+     writing the store) cannot be detected: the store wins silently. Accepted
+     limitation, the same as harpy's own behavior.
    - Otherwise the store is checked, as in decision 5.
    - Headless has no dirty tracking: it follows the store, like harpy, and its
      docstring says so.
@@ -707,6 +778,76 @@ Decisions:
    - A matrix without metadata (custom or unregistered): incompatible, with the
      reason "no harpy feature metadata". The full-replacement dialog names the
      labels elements whose values are lost.
+9. **Jobs that are no longer active still publish their table changes.** Any
+   change to the widget's inputs (a feature checkbox, the key, the table)
+   cancels the running job (`_bind_batch_state(...)` in
+   `widgets/feature_extraction/controller.py`), but `quit()` cannot interrupt
+   a running harpy call, so the job still writes. Its result is lost today:
+   superqt's worker never emits `returned` after `quit()` (`WorkerBase.run()`
+   in `superqt/utils/_qthreading.py`; `errored` and `finished` still fire), and
+   `_on_worker_returned(...)` and `_on_worker_errored(...)` also ignore any job
+   that is not the active one. No event is published, and Object
+   Classification keeps a classifier trained on the old values. This already
+   happens for regional writes; P7 adds full replacement and the removal after
+   a failure, which lose more.
+
+   What happens when a job finishes:
+
+   | Job when it finishes | Table event | Status and table-choice refresh |
+   |---|---|---|
+   | Active | yes | yes, as today |
+   | Cancelled, same SpatialData still selected | yes (new) | no |
+   | Cancelled, other SpatialData selected, or widget closed | no | no |
+
+   A table event is decision 6's event for a success, or the `"removed"` event
+   after a failure that follows the removal.
+
+   Implementation:
+
+   1. **Cancelling no longer calls `quit()`.** For a function worker, `quit()`
+      only sets the abort flag that suppresses `returned`; the work is a plain
+      function call (`FunctionWorker.work()`). Cancelling becomes detaching:
+      `_cancel_active_worker(...)` clears `_active_worker` and
+      `_active_worker_job_id` as today, and the job stays in `_in_flight_jobs`,
+      so reloads of its table stay blocked until `finished`.
+   2. **`_on_worker_returned(...)` branches on the job.** `returned` fires
+      before `finished`, so the job is still in `_in_flight_jobs`:
+
+      ```python
+      job = self._in_flight_jobs.get(job_id)
+      if job is None or job.sdata is not self._selected_spatialdata:
+          return
+      if job_id == self._active_worker_job_id:
+          ...  # as today: table-choice refresh, event, status
+      else:
+          self._notify_feature_matrix_changed(result)  # event only
+      ```
+   3. **`_on_worker_errored(...)` branches the same way.** On the dedicated
+      failure-after-removal error of decision 6 it publishes the `"removed"`
+      event, active job or not; the status message is shown for the active job
+      only.
+   4. **The widget is unchanged.** `_on_controller_feature_matrix_changed(...)`
+      (`widgets/feature_extraction/widget.py`) builds the event from
+      `selected_spatialdata`, which is the job's SpatialData under the
+      condition of point 2, and already uses an empty dirty snapshot for a job
+      that is not the active one.
+   5. **Shutdown is unchanged.** `shutdown(...)` detaches the callbacks and
+      keeps calling `quit()`, so a job still running when the widget closes
+      loses its event. Accepted for now.
+   6. **Tests.**
+      - `_DeferredWorker` in `tests/test_feature_extraction.py` behaves like
+        superqt: no `returned` after `quit()`. Today it emits it, which hides
+        the lost result.
+      - The two rebinding tests that assert `quit_called is True`
+        (`test_feature_extraction_controller_drops_stale_results_after_rebinding`
+        and
+        `test_feature_extraction_controller_blocks_matching_reload_until_every_superseded_worker_finishes`)
+        change to: `quit()` is not called. The first also asserts that the
+        event for the old key is published, with no table-choice refresh or
+        status change. The shutdown test keeps its assertion.
+      - New: start an extraction, change the feature key while it runs, and
+        assert that the event for the old key is still published; the same for
+        a failure after the removal (`"removed"` event).
 
 Implementation notes:
 
@@ -752,7 +893,8 @@ Implementation order:
 2. Widget and controller: use the classification to pick the confirmation
    ("Replace selected regions" or "Replace entire feature matrix"), pass the
    confirmed outcome, block on unsaved changes (decision 7), publish the events
-   of decision 6, and the widget tests.
+   of decision 6, also for jobs that are no longer active (decision 9), and the
+   widget tests.
 
 ## Tests to Add
 
@@ -788,19 +930,24 @@ Implementation order:
 ## Non-Goals
 
 - Changing Spatiato's dirty-tracking model to harpy's value-diff
-  `write_table_updates(...)`.
+  `write_table_updates(...)`: it compares the whole table with the store and
+  never deletes, while Spatiato already knows which paths changed.
 - Writing `X`, `var`, `layers`, or `raw` from Spatiato.
 - Locking or crash-atomic writes (neither Spatiato nor harpy provides them).
 
 ## Open Questions
 
-- Should Spatiato's napari reader (`_reader.py`, currently
-  `spatialdata.read_zarr`, eager tables) switch to `hp.io.read_zarr` with lazy
-  tables?
-- Should feature extraction keep the lazy `obsm` that harpy attaches, or
-  materialize it once after extraction for interactive use? Since harpy 0.5.2,
-  unbacked SpatialData with in-memory matrices already gets NumPy, so the
-  question is mainly about backed SpatialData (see P1).
-- For P5: use harpy's store-only functions (Spatiato installs results in memory
-  itself) or the SpatialData adapters (`add_table_components`, which also
-  reattach lazily)?
+- D1 (see "Migration Plan", step 2): how do tables live in memory, per
+  component? This also settles:
+  - whether feature extraction keeps the lazy `obsm` that harpy attaches, or
+    loads it once after extraction for interactive use. Since harpy 0.5.2,
+    unbacked SpatialData with in-memory matrices already gets NumPy, so this is
+    mainly about backed SpatialData (see P1);
+  - which `mode` the switched reader and the reload use.
+
+Settled on 2026-10-27 (see "Migration Plan"):
+
+- Spatiato's napari reader (`_reader.py`, currently `spatialdata.read_zarr`,
+  eager tables) switches to `hp.io.read_zarr`, as the last migration step.
+- P5 uses harpy's store-only functions (Spatiato installs results in memory
+  itself), not the SpatialData adapters, which would reattach lazily.
