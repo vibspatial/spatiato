@@ -1,7 +1,7 @@
 Shared agent instructions (Python environment, test scope, pre-commit checks and code
-explanation references) live in `agents.md`, imported here:
+explanation references) live in `AGENTS.md`, imported here:
 
-@agents.md
+@AGENTS.md
 
 ## Claude config
 
