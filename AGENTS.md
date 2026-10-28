@@ -1,20 +1,29 @@
 ## Python environment
-Canonical environment: `.venv`
+
+Canonical environment: `.venv`. Use it as-is — do NOT sync, update, or install
+into it (e.g. no `uv sync`/`uv run`); the maintainer manages env updates manually.
 
 Run Python, tests, lint, and tooling by calling the environment's binaries directly via
-their `.venv/bin/` path.
+their `.venv/bin/` path rather than sourcing `activate`:
 
 ```bash
 .venv/bin/pytest
 .venv/bin/python -m pytest
-.venv/bin/pre-commit run ruff --all-files
+.venv/bin/pre-commit run --files path/to/changed_file.py
 ```
+
+## Editing files
+
+Edit files with the agent's file-editing tool (Claude Code: `Edit`; Codex:
+`apply_patch`), not with `sed -i` or other in-place shell edits. Use
+`sed -n` only to read.
 
 ## Test scope
 
 Run only the focused unit tests directly affected by a change.
 
 Do not run the full test suite by default. Run it only when:
+
 - the user explicitly requests it; or
 - the change is sufficiently broad that focused tests cannot provide reasonable coverage, in which case ask the user first.
 
@@ -25,7 +34,32 @@ Prefer focused commands such as:
 .venv/bin/pytest -q path/to/test_module.py::test_specific_behavior
 ```
 
+For broader runs, such as several test modules, a test directory, or the full
+suite when it is warranted, run the tests in parallel with pytest-xdist (part of
+the `test` extra):
+
+```bash
+.venv/bin/pytest -q -n auto path/to/test_directory
+```
+
+Run a single module or test sequentially: starting the workers costs more than
+it saves.
+
 Run linting only on the changed or directly affected files where possible.
+
+## Pre-commit checks
+
+Before finishing changes, run pre-commit on the files you changed:
+
+```bash
+.venv/bin/pre-commit run --files <changed-file-paths>
+```
+
+Review any automatic fixes and rerun until checks pass. Report any unresolved
+failures. Do not install or update packages in `.venv`.
+
+Run across all tracked files only when changing hook versions or investigating a
+repository-wide CI failure.
 
 ## Code explanation references
 
@@ -38,6 +72,7 @@ When explaining or reviewing repository code:
 - Do not overload explanations with links to incidental symbols.
 
 ## Codex config
+
 Repository-local Codex settings for this project live in `.codex/config.toml`.
 
 When checking or updating Codex sandbox, cache, approval, or environment settings for this repo,
