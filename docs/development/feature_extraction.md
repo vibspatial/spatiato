@@ -233,6 +233,9 @@ Two parts copy or call harpy internals until harpy offers a public check
 
 - `_incompatibility_reason(...)` and its helpers copy harpy's existing-matrix
   checks, because harpy runs them only after computing features, and raises.
+- `_resolve_source_channels(...)` calls harpy's private channel resolution
+  (`_resolve_channels`, on the image from `_get_spatial_element`), so the
+  expected `source_channels` match harpy's exactly.
 - `_validate_table_rows(...)` calls harpy's private row validation
   (`_validated_observation_pairs`, `_check_in_memory_versus_storage_axes`).
 
