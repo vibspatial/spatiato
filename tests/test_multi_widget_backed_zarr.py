@@ -392,11 +392,8 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
         "_create_feature_extraction_worker",
         lambda _job: worker,
     )
-    monkeypatch.setattr(
-        feature_extraction,
-        "_prompt_overwrite_feature_key_confirmation",
-        lambda _feature_key, _table_name: True,
-    )
+    monkeypatch.setattr(feature_extraction, "_confirm_regional_update", lambda *_args: True)
+    monkeypatch.setattr(feature_extraction, "_confirm_full_replacement", lambda *_args: True)
     feature_extraction.calculate_button.click()
     assert worker.started
 
@@ -599,14 +596,20 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
 
     _configure_feature_extraction(feature_extraction, feature_key="late_features")
     worker = _DeferredWorker()
+    feature_jobs: list[object] = []
+
+    def create_feature_worker(job: object) -> _DeferredWorker:
+        feature_jobs.append(job)
+        return worker
+
     monkeypatch.setattr(
         feature_extraction._feature_extraction_controller,
         "_create_feature_extraction_worker",
-        lambda _job: worker,
+        create_feature_worker,
     )
     feature_extraction.calculate_button.click()
-    job_id = feature_extraction._feature_extraction_controller.active_job_id
-    assert job_id is not None
+    assert len(feature_jobs) == 1
+    job_id = feature_jobs[0].job_id
 
     app_state.set_sdata(replacement, discard_current=True)
     table_events: list[TableStateChangedEvent] = []
@@ -624,6 +627,7 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
             labels_names=("blobs_labels",),
             table_name="table",
             feature_key="late_features",
+            regions=("blobs_labels",),
             change_kind="created",
         )
     )
