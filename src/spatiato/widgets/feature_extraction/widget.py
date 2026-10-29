@@ -2509,7 +2509,7 @@ class FeatureExtractionWidget(QWidget):
         self._set_tooltip(self.calculate_button, blocking_reason)
 
     def _on_controller_state_changed(self) -> None:
-        if not self._feature_extraction_controller.is_running:
+        if self._feature_extraction_controller.active_job_id is None:
             self._active_feature_extraction_snapshot = None
         self._update_feature_extraction_feedback()
         self._update_calculate_controls()
@@ -2532,7 +2532,7 @@ class FeatureExtractionWidget(QWidget):
                     TableComponentPath("uns", ("feature_matrices", result.feature_key)),
                 }
             ),
-            regions=result.labels_names,
+            regions=result.regions,
             change_kind=result.change_kind,
             source="feature_extraction",
         )
@@ -2545,10 +2545,12 @@ class FeatureExtractionWidget(QWidget):
             )
             if active_snapshot is not None and active_snapshot.job_id == result.job_id:
                 self._active_feature_extraction_snapshot = None
-            # Contract: for backed SpatialData, `hp.tb.add_feature_matrix()`
-            # has already persisted both the feature-matrix obsm entry and its
-            # companion uns metadata before this success callback runs. This
-            # call only reconciles shared dirty state and publishes the event.
+            # Contract: for backed SpatialData, the change is in the store before
+            # this callback runs: `hp.tb.add_feature_matrix()` persisted the
+            # feature-matrix obsm entry and its companion uns metadata, or, for
+            # a "removed" result, `hp.tb.io.remove_table_components()` removed
+            # them. This call only reconciles shared dirty state and publishes
+            # the event.
             self._app_state.record_persisted_table_change(event, snapshot)
         else:
             active_snapshot = self._active_feature_extraction_snapshot
