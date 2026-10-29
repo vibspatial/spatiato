@@ -928,6 +928,65 @@ Implementation order:
    of decision 6, also for jobs that are no longer active (decision 9), and the
    widget tests.
 
+Step 2 design (agreed on 2026-10-29, after checking the code):
+
+1. **The check lives in the controller.** A new
+   `FeatureExtractionController.check_existing_feature_matrix()` runs the core
+   check on the controller's bound SpatialData, triplets, table, features and
+   key: the inputs the job will use. The widget calls it in
+   `_calculate_feature_matrix(...)` on the main thread, shows the error in its
+   status if it raises (decision 4), picks the dialog, and passes the kind to
+   `controller.calculate(..., confirmed_existing_entry=...)`. Calculate is only
+   enabled when the controller can calculate and is bound to the staged
+   selection (`_get_calculate_button_blocking_reason(...)`), so the check
+   always sees inputs the controller accepts. Table creation skips the check.
+2. **Results carry the change kind and regions.**
+   - `FeatureExtractionRequest` gets `confirmed_existing_entry`.
+   - `_run_feature_extraction_job(...)` calls `calculate_feature_matrix(...)`
+     and copies the change kind and regions of its `FeatureMatrixCalculation`
+     into `FeatureExtractionResult`, which gets a `regions` field.
+     `FeatureMatrixWriteChangeKind` also allows `"removed"`.
+   - `FeatureExtractionJob.change_kind` and the `table.obsm` lookup in
+     `_prepare_feature_extraction_job(...)` go.
+   - On `FeatureMatrixRemovedError`, the controller builds a result with
+     `"removed"` and the error's regions, and calls the same
+     `on_feature_matrix_changed` callback. The widget's
+     `_on_controller_feature_matrix_changed(...)` uses `result.regions` instead
+     of `result.labels_names`, so recording stays where it is:
+     `record_persisted_table_change(...)` when backed,
+     `record_table_mutation(...)` when unbacked.
+3. **Unsaved changes are an overlap test.** For backed SpatialData, the widget
+   blocks when a path in `snapshot_table_dirty_state(...).paths` overlaps
+   `obsm/<key>` or `uns/feature_matrices/<key>`: equal, or one a prefix of the
+   other. Today's flows mark the exact paths (Object Classification's metadata
+   registration marks `uns/feature_matrices/<key>`); the overlap test also
+   covers a dirty parent such as `uns/feature_matrices`.
+4. **The main-thread cost is accepted.** The check reads the stored row
+   identities (the index and the two identity columns) and the entry's
+   metadata, and the worker reads them again. Not measured; revisit if it lags
+   on tables with millions of rows.
+5. **Dialog wording.**
+   - Compatible: the text of decision 1, button "Replace selected regions".
+   - Incompatible: "Feature matrix "X" exists but cannot be updated by region,
+     because {reason}. Replacing it removes the values for labels element(s)
+     "…"." The last sentence is left out when the table has no other labels
+     elements. Button "Replace entire feature matrix".
+   - Both replace `_prompt_overwrite_feature_key_confirmation(...)`.
+6. **Cancelling and shutdown split.** `_cancel_active_worker(...)` serves both
+   rebinding and `shutdown(...)` today. Rebinding detaches without `quit()`
+   (decision 9); shutdown keeps calling `quit()`.
+
+Tests that change: `_DeferredWorker` in `tests/test_feature_extraction.py`
+stops emitting `returned` after `quit()`; the two rebinding tests of decision
+9; the `job.change_kind` assertion in `tests/test_feature_extraction.py`; the
+monkeypatched `_prompt_overwrite_feature_key_confirmation` in
+`tests/test_multi_widget_backed_zarr.py`; results built in tests need
+`regions`.
+
+Order within step 2: the controller first (request, result, the worker calling
+the core, decision 9, controller tests), then the widget (check,
+unsaved-changes block, dialogs, widget tests).
+
 ## Tests to Add
 
 - dense Dask `obsm` feature matrix through metadata inspection, classifier
