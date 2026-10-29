@@ -688,16 +688,23 @@ Decisions:
 4. **The confirmed outcome travels with the job.** The widget checks the
    existing entry on the main thread, shows the matching dialog, and the
    request carries what the user confirmed:
-   `confirmed_existing_entry: Literal["none", "compatible", "incompatible"] | None`
+   `confirmed_existing_entry: Literal["absent", "compatible", "incompatible"] | None`
    on `FeatureExtractionRequest`. The shared core function checks again in the
    worker before it removes or computes anything. If the result differs, it
    raises "Feature matrix "X" changed since you confirmed; calculate again", and
    nothing has been removed or written. Without this, a table change between
    dialog and worker could turn a confirmed regional replacement into an
-   unconfirmed full replacement. Headless passes `None`: whatever the check
-   finds is acted on. The re-check covers what is in memory and in the store,
+   unconfirmed full replacement. The widget always passes the kind it found,
+   also `"absent"` (no dialog): a matrix that appears between the click and the
+   worker then stops the job with this message rather than the generic "already
+   exists". Headless and table creation pass `None`: whatever the check finds
+   is acted on. The re-check covers what is in memory and in the store,
    not dirty state: that lives in `SpatiatoAppState` on the main thread, so the
    unsaved-changes block of decision 7 runs only in the widget, at launch.
+   If the check raises (rows harpy would reject, unknown channels, a backed
+   table missing from the store), the widget shows the error in its status and
+   launches nothing; the worker's re-check reports the same errors through
+   `_on_worker_errored`.
 5. **The compatibility check mirrors harpy's checks** (`add_feature_matrix`
    existing-matrix checks and `_merge_feature_matrix_metadata`). The entry is
    compatible only when all of these hold; anything else is incompatible, with
@@ -725,6 +732,15 @@ Decisions:
    `hp.tb.io.read_table_components(sdata.path, table_name=..., components=[("obsm", key), ("uns", "feature_matrices", key)], mode="backed", missing="omit")`.
    If harpy still raises, its error is shown; the check runs before extraction,
    so nothing has been removed by then.
+
+   Spatiato keeps its own copy of these checks (`_incompatibility_reason(...)`
+   and its helpers in `core/feature_extraction.py`) instead of reusing harpy's.
+   harpy has no function that classifies an entry without computing features:
+   its matrix checks run after the computation and raise, and the helpers
+   (`_resolve_channels`, `_matrix_format`, `_merge_feature_matrix_metadata`) are
+   private. A public check is requested in
+   https://github.com/saeyslab/harpy/issues/281 (2026-10-28); once it is
+   released, replace the copy with it.
 6. **Events.** All events use the `obsm` and `uns` metadata paths of the key:
    - regional replacement: `change_kind="updated"`, `regions` = the selected
      labels elements, as today;
@@ -733,9 +749,11 @@ Decisions:
      = every region the table declares (`get_table_metadata(...).regions`), as
      the `TableStateChangedEvent` contract requires;
    - new key: `"created"` with the selected regions, as today;
-   - the controller sets `change_kind` from the check result, not from what is
-     in memory (today `_prepare_feature_extraction_job(...)` looks at
-     `table.obsm`);
+   - the change kind and regions come from the `FeatureMatrixCalculation` that
+     `calculate_feature_matrix(...)` returns, which the worker passes on in its
+     result; not from what is in memory (today
+     `_prepare_feature_extraction_job(...)` looks at `table.obsm`).
+     `FeatureExtractionJob.change_kind` goes;
    - failure after the removal: the core function raises a dedicated error that
      wraps the original and records that the removal happened. The controller
      then publishes a `"removed"` event with every region, through
@@ -745,7 +763,7 @@ Decisions:
      was removed."
 7. **Memory and store disagree (backed SpatialData).**
    - The entry is only in memory, not in the store (never saved): incompatible,
-     with the reason "not saved; its values will be replaced". The
+     with the reason "it is not saved". The
      full-replacement dialog is shown; then `remove_table_components(...)`
      removes it from memory and a fresh matrix is extracted. Without this,
      harpy replaces it silently.
@@ -766,11 +784,22 @@ Decisions:
    - Changes outside Spatiato's dirty tracking (notebook edits, another process
      writing the store) cannot be detected: the store wins silently. Accepted
      limitation, the same as harpy's own behavior.
+   - Rows that differ between memory and store (also only through changes
+     outside Spatiato): harpy rejects every feature update of such a table,
+     and `remove_table_components(...)` does not check rows. Without a check,
+     an incompatible entry would be removed before harpy's rejection. The
+     check therefore runs harpy's row validation first, for every kind, and
+     raises harpy's error (also for unbacked SpatialData with invalid
+     region/instance pairs). It calls harpy's private helpers
+     (`_check_in_memory_versus_storage_axes`, `_validated_observation_pairs`):
+     copying them would mean reading the stored row identities ourselves.
+     Remove once the public check requested in
+     https://github.com/saeyslab/harpy/issues/281 is released.
    - Otherwise the store is checked, as in decision 5.
    - Headless has no dirty tracking: it follows the store, like harpy, and its
      docstring says so.
 8. **Partial entries.**
-   - Metadata without a matrix: none. There are no values to lose, so no dialog.
+   - Metadata without a matrix: absent. There are no values to lose, so no dialog.
      `overwrite_feature_key=True` is still passed to harpy (backed SpatialData
      needs it for the stored metadata); harpy writes fresh metadata, and other
      regions' rows are NaN. The event is `"created"`; an info log notes that
@@ -853,7 +882,7 @@ Implementation notes:
 
 - Classify the existing entry into one of three outcomes before starting, each
   with a short reason for dialogs and warnings:
-  - **none**: no `obsm[key]` (metadata alone counts as none, decision 8);
+  - **absent**: no `obsm[key]` (metadata alone counts as absent, decision 8);
     plain extraction;
   - **compatible**: decision 5 holds; replace the selected regions;
   - **incompatible**: anything else, including custom matrices and backed
