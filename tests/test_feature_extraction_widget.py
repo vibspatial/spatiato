@@ -10,8 +10,10 @@ from qtpy.QtCore import QObject, Signal
 from qtpy.QtWidgets import QCheckBox, QComboBox, QLabel, QLineEdit, QScrollArea
 from spatialdata import SpatialData
 
+import spatiato.widgets.feature_extraction.controller as feature_extraction_controller_module
 import spatiato.widgets.feature_extraction.widget as feature_extraction_widget_module
-from spatiato._app_state import TableStateChangedEvent, get_or_create_app_state
+from spatiato._app_state import TableDirtySnapshot, TableStateChangedEvent, get_or_create_app_state
+from spatiato.core.feature_extraction import calculate_feature_matrix
 from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatialdata import (
     SpatialDataFeatureExtractionImageDiscovery,
@@ -1920,24 +1922,12 @@ def test_feature_extraction_widget_does_not_prompt_before_overwriting_while_calc
     widget.output_key_line_edit.setText("existing_features")
     sdata_blobs.tables["table"].obsm["existing_features"] = np.zeros((sdata_blobs.tables["table"].n_obs, 1))
 
-    prompt_calls: list[tuple[str, str | None]] = []
-    overwrite_calls: list[bool | None] = []
-
-    def fake_prompt(feature_key: str, table_name: str | None) -> bool | None:
-        prompt_calls.append((feature_key, table_name))
-        return True
-
-    def fake_calculate(*, overwrite_feature_key: bool | None = None) -> bool:
-        overwrite_calls.append(overwrite_feature_key)
-        return True
-
-    widget._prompt_overwrite_feature_key_confirmation = fake_prompt  # type: ignore[method-assign]
-    widget._feature_extraction_controller.calculate = fake_calculate  # type: ignore[method-assign]
+    recorder = _record_launches(widget)
 
     widget.calculate_button.click()
 
-    assert prompt_calls == []
-    assert overwrite_calls == []
+    assert recorder.dialogs == []
+    assert recorder.launches == []
 
 
 def test_feature_extraction_widget_does_not_prompt_for_existing_feature_key_in_create_table_mode(
@@ -1954,57 +1944,159 @@ def test_feature_extraction_widget_does_not_prompt_for_existing_feature_key_in_c
     widget.output_key_line_edit.setText("existing_features")
     sdata_blobs.tables["table"].obsm["existing_features"] = np.zeros((sdata_blobs.tables["table"].n_obs, 1))
 
-    prompt_calls: list[tuple[str, str | None]] = []
-    overwrite_calls: list[bool | None] = []
-
-    def fake_prompt(feature_key: str, table_name: str | None) -> bool | None:
-        prompt_calls.append((feature_key, table_name))
-        return True
-
-    def fake_calculate(*, overwrite_feature_key: bool | None = None) -> bool:
-        overwrite_calls.append(overwrite_feature_key)
-        return True
-
-    widget._prompt_overwrite_feature_key_confirmation = fake_prompt  # type: ignore[method-assign]
-    widget._feature_extraction_controller.calculate = fake_calculate  # type: ignore[method-assign]
+    recorder = _record_launches(widget)
 
     assert widget.selected_table_mode == "create"
     assert widget.calculate_button.isEnabled() is True
 
     widget.calculate_button.click()
 
-    assert prompt_calls == []
-    assert overwrite_calls == [False]
+    # A new table has no existing entry to check: no dialog, no confirmed kind.
+    assert recorder.dialogs == []
+    assert recorder.launches == [{}]
 
 
-def test_feature_extraction_widget_cancelled_overwrite_does_not_launch_calculation(
-    qtbot,
-    sdata_blobs: SpatialData,
-) -> None:
-    viewer = make_viewer_with_shared_sdata(sdata_blobs)
-    widget = FeatureExtractionWidget(viewer)
+class _LaunchRecorder:
+    """Record the dialogs a Calculate click shows and the launches it requests."""
 
-    qtbot.addWidget(widget)
-    widget.findChild(QCheckBox, "feature_checkbox_area").setChecked(True)
-    widget.output_key_line_edit.setText("existing_features")
-    sdata_blobs.tables["table"].obsm["existing_features"] = np.zeros((sdata_blobs.tables["table"].n_obs, 1))
+    def __init__(self, widget: FeatureExtractionWidget, *, confirm: bool) -> None:
+        self.dialogs: list[tuple[str, tuple[object, ...]]] = []
+        self.launches: list[dict[str, object]] = []
+        self.dirty_snapshots: list[object] = []
+        self._confirm = confirm
+        widget._confirm_regional_update = self._regional  # type: ignore[method-assign]
+        widget._confirm_full_replacement = self._full  # type: ignore[method-assign]
+        widget._feature_extraction_controller.calculate = self._calculate  # type: ignore[method-assign]
 
-    calculate_calls: list[bool | None] = []
+    def _regional(self, *args: object) -> bool:
+        self.dialogs.append(("regional", args))
+        return self._confirm
 
-    def fake_calculate(*, overwrite_feature_key: bool | None = None) -> bool:
-        calculate_calls.append(overwrite_feature_key)
+    def _full(self, *args: object) -> bool:
+        self.dialogs.append(("full", args))
+        return self._confirm
+
+    def _calculate(self, **kwargs: object) -> bool:
+        self.dirty_snapshots.append(kwargs.pop("dirty_snapshot", None))
+        self.launches.append(kwargs)
         return True
 
-    def fake_prompt(feature_key: str, table_name: str | None) -> bool | None:
-        del feature_key, table_name
-        return None
 
-    widget._prompt_overwrite_feature_key_confirmation = fake_prompt  # type: ignore[method-assign]
-    widget._feature_extraction_controller.calculate = fake_calculate  # type: ignore[method-assign]
+def _record_launches(widget: FeatureExtractionWidget, *, confirm: bool = True) -> _LaunchRecorder:
+    return _LaunchRecorder(widget, confirm=confirm)
+
+
+def _ready_widget(qtbot, sdata: SpatialData, feature_key: str) -> FeatureExtractionWidget:
+    widget = FeatureExtractionWidget(make_viewer_with_shared_sdata(sdata))
+    qtbot.addWidget(widget)
+    check_coordinate_system(widget, "global")
+    select_segmentation(widget, "global", 0)
+    widget.findChild(QCheckBox, "feature_checkbox_area").setChecked(True)
+    widget.output_key_line_edit.setText(feature_key)
+    assert widget.selected_table_name == "table"
+    assert widget.calculate_button.isEnabled() is True
+    return widget
+
+
+def test_feature_extraction_widget_launches_new_key_without_dialog(qtbot, sdata_blobs: SpatialData) -> None:
+    widget = _ready_widget(qtbot, sdata_blobs, "features_new")
+    recorder = _record_launches(widget)
 
     widget.calculate_button.click()
 
-    assert calculate_calls == []
+    assert recorder.dialogs == []
+    assert recorder.launches == [{"overwrite_feature_key": False, "confirmed_existing_entry": "absent"}]
+    # The launch carries the table's dirty state, for recording the job's result.
+    (dirty_snapshot,) = recorder.dirty_snapshots
+    assert isinstance(dirty_snapshot, TableDirtySnapshot)
+    assert dirty_snapshot.sdata is sdata_blobs
+    assert dirty_snapshot.table_name == "table"
+
+
+def test_feature_extraction_widget_confirms_regional_update_of_compatible_matrix(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    calculate_feature_matrix(
+        sdata_blobs,
+        table_name="table",
+        feature_key="features_new",
+        triplets=(FeatureExtractionTriplet("global", "blobs_labels", None),),
+        feature_names=("area",),
+    )
+    widget = _ready_widget(qtbot, sdata_blobs, "features_new")
+    recorder = _record_launches(widget)
+
+    widget.calculate_button.click()
+
+    assert recorder.dialogs == [("regional", ("features_new", "table", ("blobs_labels",)))]
+    assert recorder.launches == [{"overwrite_feature_key": True, "confirmed_existing_entry": "compatible"}]
+
+
+@pytest.mark.parametrize("confirm", [True, False])
+def test_feature_extraction_widget_confirms_full_replacement_of_incompatible_matrix(
+    qtbot,
+    sdata_blobs: SpatialData,
+    confirm: bool,
+) -> None:
+    table = sdata_blobs.tables["table"]
+    table.obsm["existing_features"] = np.zeros((table.n_obs, 1))
+    widget = _ready_widget(qtbot, sdata_blobs, "existing_features")
+    recorder = _record_launches(widget, confirm=confirm)
+
+    widget.calculate_button.click()
+
+    assert recorder.dialogs == [("full", ("existing_features", "it has no harpy feature metadata", ()))]
+    expected_launches = [{"overwrite_feature_key": True, "confirmed_existing_entry": "incompatible"}]
+    assert recorder.launches == (expected_launches if confirm else [])
+
+
+def test_feature_extraction_widget_shows_check_errors_without_dialog(
+    qtbot,
+    monkeypatch,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget = _ready_widget(qtbot, sdata_blobs, "features_new")
+    recorder = _record_launches(widget)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise ValueError("rows differ")
+
+    monkeypatch.setattr(feature_extraction_controller_module, "check_existing_feature_matrix", fail)
+
+    widget.calculate_button.click()
+
+    assert recorder.dialogs == []
+    assert recorder.launches == []
+    assert widget._feature_extraction_controller.status_kind == "error"
+    assert widget._feature_extraction_controller.status_message == "Feature extraction: rows differ"
+
+
+def test_feature_extraction_widget_blocks_launch_on_unsaved_feature_metadata_when_backed(
+    qtbot,
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    widget = _ready_widget(qtbot, backed_sdata_blobs, "features_new")
+    # As Object Classification's "register feature metadata" does for a custom matrix.
+    widget._app_state.record_table_mutation(
+        TableStateChangedEvent(
+            sdata=backed_sdata_blobs,
+            table_name="table",
+            paths=frozenset({TableComponentPath("uns", ("feature_matrices", "features_new"))}),
+            regions=(),
+            change_kind="updated",
+            source="test",
+        )
+    )
+    recorder = _record_launches(widget)
+
+    widget.calculate_button.click()
+
+    assert recorder.dialogs == []
+    assert recorder.launches == []
+    assert widget._feature_extraction_controller.status_message == (
+        'Feature extraction: feature matrix "features_new" has unsaved changes; write or reload the table first.'
+    )
 
 
 def test_feature_extraction_widget_refreshes_table_selection_after_controller_success(
@@ -2123,27 +2215,15 @@ def test_feature_extraction_widget_uses_existing_overwrite_prompt_after_created_
         )
     )
 
-    prompt_calls: list[tuple[str, str | None]] = []
-    overwrite_calls: list[bool | None] = []
-
-    def fake_prompt(feature_key: str, table_name: str | None) -> bool | None:
-        prompt_calls.append((feature_key, table_name))
-        return True
-
-    def fake_calculate(*, overwrite_feature_key: bool | None = None) -> bool:
-        overwrite_calls.append(overwrite_feature_key)
-        return True
-
-    widget._prompt_overwrite_feature_key_confirmation = fake_prompt  # type: ignore[method-assign]
-    widget._feature_extraction_controller.calculate = fake_calculate  # type: ignore[method-assign]
+    recorder = _record_launches(widget)
 
     assert widget.selected_table_mode == "existing"
     assert widget._feature_extraction_controller.binding_state.create_table is False
 
     widget.calculate_button.click()
 
-    assert prompt_calls == [("features", "new_table")]
-    assert overwrite_calls == [True]
+    assert recorder.dialogs == [("full", ("features", "it has no harpy feature metadata", ()))]
+    assert recorder.launches == [{"overwrite_feature_key": True, "confirmed_existing_entry": "incompatible"}]
 
 
 def test_feature_extraction_widget_records_feature_matrix_change_in_shared_app_state(
@@ -2180,14 +2260,28 @@ def test_feature_extraction_widget_records_feature_matrix_change_in_shared_app_s
     assert app_state.is_table_dirty(sdata_blobs, "table") is True
 
 
-def test_feature_extraction_widget_keeps_backed_harpy_write_clean(
+def test_feature_extraction_widget_records_backed_result_as_persisted_with_its_launch_snapshot(
     qtbot,
+    monkeypatch,
     backed_sdata_blobs: SpatialData,
 ) -> None:
     viewer = make_viewer_with_shared_sdata(backed_sdata_blobs)
     app_state = get_or_create_app_state(viewer)
     widget = FeatureExtractionWidget(viewer)
     qtbot.addWidget(widget)
+    unrelated_path = TableComponentPath("obs", ("user_class",))
+    # Unsaved changes elsewhere in the table do not block a launch.
+    app_state.record_table_mutation(
+        TableStateChangedEvent(
+            sdata=backed_sdata_blobs,
+            table_name="table",
+            paths=frozenset({unrelated_path}),
+            regions=("blobs_labels",),
+            change_kind="updated",
+            source="test",
+        )
+    )
+    dirty_snapshot = app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table")
     result = FeatureExtractionResult(
         job_id=1,
         labels_names=("blobs_labels",),
@@ -2195,19 +2289,31 @@ def test_feature_extraction_widget_keeps_backed_harpy_write_clean(
         feature_key="features_new",
         regions=("blobs_labels",),
         change_kind="created",
+        dirty_snapshot=dirty_snapshot,
     )
-    widget._active_feature_extraction_snapshot = feature_extraction_widget_module._ActiveFeatureExtractionSnapshot(
-        job_id=result.job_id,
-        dirty_snapshot=app_state.snapshot_table_dirty_state(
-            backed_sdata_blobs,
-            "table",
-        ),
-    )
+    recorded_snapshots: list[TableDirtySnapshot | None] = []
+    record_persisted_table_change = app_state.record_persisted_table_change
 
-    with qtbot.waitSignal(app_state.table_state_changed):
+    def spy(event: TableStateChangedEvent, snapshot: TableDirtySnapshot | None = None) -> None:
+        recorded_snapshots.append(snapshot)
+        record_persisted_table_change(event, snapshot)
+
+    monkeypatch.setattr(app_state, "record_persisted_table_change", spy)
+
+    with qtbot.waitSignal(app_state.table_state_changed) as blocker:
         widget._on_controller_feature_matrix_changed(result)
 
-    assert app_state.is_table_dirty(backed_sdata_blobs, "table") is False
+    assert blocker.args[0].paths == {
+        TableComponentPath("obsm", ("features_new",)),
+        TableComponentPath("uns", ("feature_matrices", "features_new")),
+    }
+    # The widget records the result with the job's own launch snapshot.
+    assert len(recorded_snapshots) == 1
+    assert recorded_snapshots[0] is dirty_snapshot
+    # harpy already wrote the key's paths, so recording the result as persisted
+    # never marks them dirty (unlike `record_table_mutation`); other unsaved
+    # changes stay dirty.
+    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == {unrelated_path}
 
 
 def test_feature_extraction_widget_adopts_reloaded_feature_matrix_state_without_republishing(
