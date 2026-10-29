@@ -931,15 +931,28 @@ Implementation order:
 Step 2 design (agreed on 2026-10-29, after checking the code):
 
 1. **The check lives in the controller.** A new
-   `FeatureExtractionController.check_existing_feature_matrix()` runs the core
-   check on the controller's bound SpatialData, triplets, table, features and
-   key: the inputs the job will use. The widget calls it in
-   `_calculate_feature_matrix(...)` on the main thread, shows the error in its
-   status if it raises (decision 4), picks the dialog, and passes the kind to
-   `controller.calculate(..., confirmed_existing_entry=...)`. Calculate is only
-   enabled when the controller can calculate and is bound to the staged
-   selection (`_get_calculate_button_blocking_reason(...)`), so the check
-   always sees inputs the controller accepts. Table creation skips the check.
+   `FeatureExtractionController.check_existing_feature_matrix(*, dirty_paths)
+   -> ExistingFeatureMatrix | None` runs on the controller's bound SpatialData,
+   triplets, table, features and key: the inputs the job will use.
+   - For backed SpatialData it first applies the unsaved-changes block
+     (decision 7) to `dirty_paths`, then runs the core check.
+   - On a block or a check error (decision 4) it sets the error status itself
+     and returns `None`. The widget's feedback card only shows the controller's
+     status (`_update_feature_extraction_feedback(...)`), so the controller owns
+     every status message, and both rules are testable without the widget.
+   - The widget calls it in `_calculate_feature_matrix(...)` on the main thread
+     with `snapshot_table_dirty_state(...).paths` (plain `TableComponentPath`s,
+     so the controller needs no `SpatiatoAppState`), launches nothing on
+     `None`, otherwise picks the dialog and passes the kind to
+     `controller.calculate(..., confirmed_existing_entry=...)`.
+   - Calculate is only enabled when the controller can calculate and is bound
+     to the staged selection (`_get_calculate_button_blocking_reason(...)`), so
+     the check always sees inputs the controller accepts. Table creation skips
+     the check.
+   - On `FeatureMatrixRemovedError`, the status is the error's own message,
+     without the usual "Feature extraction: calculation failed: " prefix: the
+     message already says "Feature extraction failed; the previous feature
+     matrix "X" was removed: …".
 2. **Results carry the change kind and regions.**
    - `FeatureExtractionRequest` gets `confirmed_existing_entry`.
    - `_run_feature_extraction_job(...)` calls `calculate_feature_matrix(...)`
