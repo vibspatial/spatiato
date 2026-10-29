@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
 from spatiato.core.feature_extraction import (
     FeatureExtractionTriplet,
     _normalize_triplets,
     _requires_image,
-    _resolve_harpy_coordinate_system_parameter,
-    _resolve_harpy_image_name_parameter,
-    _resolve_harpy_labels_name_parameter,
+    calculate_feature_matrix,
 )
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND
 from spatiato.core.object_classification.annotation import USER_CLASS_COLORS_KEY
@@ -34,6 +30,7 @@ from spatiato.core.validation import normalize_spatialdata_name
 
 if TYPE_CHECKING:
     from spatialdata import SpatialData
+
 
 @dataclass(frozen=True)
 class HeadlessFeatureTarget:
@@ -61,6 +58,14 @@ def compute_features_for_classifier(
     Intensity-channel selection is read from the classifier's exported
     `source_channels` feature metadata so the computed matrix preserves the
     training schema.
+
+    An existing `table.obsm[target.feature_key]` raises unless
+    `target.overwrite_feature_key` is set. Then a matrix harpy calculated with
+    the same features and channels is updated for the target labels elements
+    only, keeping the values of other labels elements. Any other matrix is
+    removed with its metadata and calculated again, so the values of other
+    labels elements are lost, and a warning names them. If `sdata` is backed
+    by zarr, the stored matrix decides, not unsaved changes in memory.
     """
     if classifier.source_kind == CUSTOM_OBSM_SOURCE_KIND:
         raise ValueError(
@@ -74,19 +79,13 @@ def compute_features_for_classifier(
     feature_names = classifier.feature_names
     source_channels = _resolve_classifier_source_channels(classifier)
 
-    import harpy as hp
-
-    hp.tb.add_feature_matrix(
-        sdata=sdata,
-        labels_name=_resolve_harpy_labels_name_parameter(resolved_target.triplets),
-        image_name=_resolve_harpy_image_name_parameter(resolved_target.triplets, feature_names),
+    calculate_feature_matrix(
+        sdata,
         table_name=resolved_target.table_name,
         feature_key=resolved_target.feature_key,
-        features=list(feature_names),
-        channels=None if source_channels is None else list(source_channels),
-        feature_matrices_key=_FEATURE_MATRICES_KEY,
+        triplets=tuple(replace(triplet, channels=source_channels) for triplet in resolved_target.triplets),
+        feature_names=feature_names,
         overwrite_feature_key=resolved_target.overwrite_feature_key,
-        to_coordinate_system=_resolve_harpy_coordinate_system_parameter(resolved_target.triplets),
     )
 
     table = get_table(sdata, resolved_target.table_name)
@@ -237,7 +236,13 @@ def apply_classifier_with_feature_extraction(
         required when the classifier was trained on intensity features
         and ignored for morphology-only classifiers.
     overwrite_feature_key
-        Whether to replace an existing `table.obsm[feature_key]`.
+        Whether an existing `table.obsm[feature_key]` may be replaced. A matrix
+        harpy calculated with the same features and channels is updated for
+        `labels_name` only, keeping the values of other labels elements. Any
+        other matrix is removed with its metadata and calculated again, so the
+        values of other labels elements are lost, and a warning names them. If
+        `sdata` is backed by zarr, the stored matrix decides, not unsaved
+        changes in memory.
     pred_class_column
         Column in `table.obs` that will receive predicted class labels.
     pred_confidence_column
@@ -315,7 +320,13 @@ def apply_classifier_with_feature_extraction_from_path(
         required when the classifier was trained on intensity features
         and ignored for morphology-only classifiers.
     overwrite_feature_key
-        Whether to replace an existing `table.obsm[feature_key]`.
+        Whether an existing `table.obsm[feature_key]` may be replaced. A matrix
+        harpy calculated with the same features and channels is updated for
+        `labels_name` only, keeping the values of other labels elements. Any
+        other matrix is removed with its metadata and calculated again, so the
+        values of other labels elements are lost, and a warning names them. If
+        `sdata` is backed by zarr, the stored matrix decides, not unsaved
+        changes in memory.
     pred_class_column
         Column in `table.obs` that will receive predicted class labels.
     pred_confidence_column

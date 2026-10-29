@@ -7,8 +7,11 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 import dask.array as da
 import numpy as np
 import zarr
+from harpy.table.io._components import _check_in_memory_versus_storage_axes, _component_update_destination
+from harpy.table.io._write_validation import _validated_observation_pairs
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 from loguru import logger
+from spatialdata.models import TableModel
 from xarray import DataArray
 
 from spatiato.core.feature_matrix_metadata import (
@@ -22,7 +25,7 @@ if TYPE_CHECKING:
     from spatialdata import SpatialData
 
 FeatureExtractionChannel = int | str
-ExistingFeatureMatrixKind = Literal["none", "compatible", "incompatible"]
+ExistingFeatureMatrixKind = Literal["absent", "compatible", "incompatible"]
 FeatureMatrixChangeKind = Literal["created", "updated"]
 
 _INTENSITY_FEATURES = frozenset({"sum", "mean", "var", "min", "max", "kurtosis", "skew"})
@@ -209,7 +212,7 @@ class ExistingFeatureMatrix:
 
     `kind` decides what an overwrite does:
 
-    - `"none"`: there is no matrix, and extraction creates it. Metadata without
+    - `"absent"`: there is no matrix, and extraction creates it. Metadata without
       a matrix (`orphaned_metadata`) has no values to lose and is replaced.
     - `"compatible"`: harpy accepts the matrix for a regional update. Rows of
       the selected labels elements are replaced; rows of `unselected_regions`
@@ -219,7 +222,7 @@ class ExistingFeatureMatrix:
       are lost.
 
     `reason` is set only for `"incompatible"`, and `orphaned_metadata` only for
-    `"none"`.
+    `"absent"`.
     """
 
     kind: ExistingFeatureMatrixKind
@@ -234,8 +237,8 @@ class ExistingFeatureMatrix:
             raise ValueError('Kind "incompatible" requires a `reason`.')
         if self.kind != "incompatible" and self.reason is not None:
             raise ValueError(f'`reason` only applies to kind "incompatible", not {self.kind!r}.')
-        if self.orphaned_metadata and self.kind != "none":
-            raise ValueError(f'`orphaned_metadata` only applies to kind "none", not {self.kind!r}.')
+        if self.orphaned_metadata and self.kind != "absent":
+            raise ValueError(f'`orphaned_metadata` only applies to kind "absent", not {self.kind!r}.')
 
 
 @dataclass(frozen=True)
@@ -284,6 +287,9 @@ def check_existing_feature_matrix(
     Like harpy, backed SpatialData is checked against the store, without
     loading matrix values: an entry present only in memory was never saved and
     is incompatible, and unsaved changes to a stored entry are not seen.
+
+    Raises `ValueError` when harpy would reject any feature update of the table
+    because of its rows, so nothing is removed for an update that cannot succeed.
     """
     import harpy as hp
 
@@ -292,6 +298,7 @@ def check_existing_feature_matrix(
     unselected_regions = tuple(
         region for region in get_table_metadata(sdata, table_name).regions if region not in selected_regions
     )
+    _validate_table_rows(sdata, table_name)
     memory_matrix = table.obsm[feature_key] if feature_key in table.obsm else None
     memory_metadata = _feature_metadata(table.uns, feature_key)
 
@@ -315,7 +322,7 @@ def check_existing_feature_matrix(
 
     if matrix is None:
         return ExistingFeatureMatrix(
-            "none",
+            "absent",
             unselected_regions=unselected_regions,
             orphaned_metadata=metadata is not None or memory_metadata is not None,
         )
@@ -369,9 +376,10 @@ def calculate_feature_matrix(
     overwrite_feature_key
         Whether an existing feature matrix may be replaced.
     confirmed_existing_entry
-        The kind of existing entry the user confirmed replacing, checked again
-        here before anything is removed or calculated. `None` acts on whatever
-        is found.
+        The kind of existing entry found before launching: for the widget, the
+        kind the user confirmed in the overwrite dialog, or `"absent"` when there
+        was no dialog. Checked again here before anything is removed or
+        calculated. `None` acts on whatever is found.
 
     Raises
     ------
@@ -388,7 +396,7 @@ def calculate_feature_matrix(
 
     labels_names = tuple(triplet.labels_name for triplet in triplets)
     if create_table:
-        existing = ExistingFeatureMatrix("none")
+        existing = ExistingFeatureMatrix("absent")
     else:
         existing = check_existing_feature_matrix(
             sdata,
@@ -399,7 +407,7 @@ def calculate_feature_matrix(
         )
     if confirmed_existing_entry is not None and existing.kind != confirmed_existing_entry:
         raise FeatureMatrixChangedError(f'Feature matrix "{feature_key}" changed since you confirmed; calculate again.')
-    if existing.kind != "none" and not overwrite_feature_key:
+    if existing.kind != "absent" and not overwrite_feature_key:
         raise ValueError(
             f'Feature matrix "{feature_key}" already exists in table "{table_name}". '
             "Set `overwrite_feature_key=True` to replace it."
@@ -408,7 +416,7 @@ def calculate_feature_matrix(
     change_kind: FeatureMatrixChangeKind
     regions: tuple[str, ...]
     match existing.kind:
-        case "none":
+        case "absent":
             change_kind, regions = "created", labels_names
             if existing.orphaned_metadata:
                 logger.info(
@@ -420,9 +428,8 @@ def calculate_feature_matrix(
             # The matrix is removed and calculated again, so every region changes.
             change_kind, regions = "updated", get_table_metadata(sdata, table_name).regions
             # Removing first is not atomic: validate what harpy would otherwise only
-            # reject after the removal. Rows that differ between memory and store
-            # are not checked; harpy rejects them only after the removal (accepted,
-            # see https://github.com/saeyslab/harpy/issues/281).
+            # reject after the removal. `check_existing_feature_matrix(...)` above
+            # already validated the table rows.
             _validate_labels_have_observations(sdata, table_name, labels_names)
             lost = (
                 f" Values for labels element(s) {_quoted_names(existing.unselected_regions)} are lost."
@@ -605,6 +612,25 @@ def _validate_labels_have_observations(sdata: SpatialData, table_name: str, labe
             raise ValueError(f"Labels element `{labels_name}` does not exist in the selected SpatialData object.")
         if labels_name not in observed_regions:
             raise ValueError(f"Labels element `{labels_name}` has no observations in table `{table_name}`.")
+
+
+def _validate_table_rows(sdata: SpatialData, table_name: str) -> None:
+    """Raise when harpy would reject every feature update of the table because of its rows.
+
+    Runs harpy's own row validation from `_existing_feature_matrix(...)`: the
+    rows in memory need valid, unique region/instance pairs and, for backed
+    SpatialData, must match the store in value and order. Only the stored index
+    and identity columns are read. Remove once
+    https://github.com/saeyslab/harpy/issues/281 is released: harpy's public
+    check runs this validation.
+    """
+    table, group = _component_update_destination(sdata, table_name=table_name)
+    if group is None:
+        _validated_observation_pairs(table.obs, table.uns[TableModel.ATTRS_KEY], label="In-memory observation")
+    else:
+        _check_in_memory_versus_storage_axes(
+            table=table, group=group, indices={"obs": table.obs.index}, stored_new_raw_var=None
+        )
 
 
 def _quoted_names(names: Sequence[str]) -> str:
