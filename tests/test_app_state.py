@@ -317,6 +317,34 @@ def test_spatiato_app_state_does_not_clear_a_newer_same_path_token(sdata_blobs) 
     assert state.is_table_dirty(sdata_blobs, "table") is True
 
 
+def test_spatiato_app_state_publishes_persisted_change_without_snapshot(qtbot, sdata_blobs) -> None:
+    state = SpatiatoAppState()
+    dirty_event = TableStateChangedEvent(
+        sdata=sdata_blobs,
+        table_name="table",
+        paths=frozenset({TableComponentPath("obs", ("user_class",))}),
+        regions=("blobs_labels",),
+        change_kind="updated",
+        source="test",
+    )
+    state.record_table_mutation(dirty_event)
+    persisted_event = TableStateChangedEvent(
+        sdata=sdata_blobs,
+        table_name="table",
+        paths=frozenset({TableComponentPath("obsm", ("features",))}),
+        regions=("blobs_labels",),
+        change_kind="created",
+        source="test",
+    )
+
+    with qtbot.waitSignal(state.table_state_changed) as blocker:
+        state.record_persisted_table_change(persisted_event)
+
+    assert blocker.args == [persisted_event]
+    # Without a snapshot nothing is cleared, and the persisted paths are not marked dirty.
+    assert state.snapshot_table_dirty_state(sdata_blobs, "table").paths == {TableComponentPath("obs", ("user_class",))}
+
+
 def test_spatiato_app_state_reload_clears_only_covered_paths(sdata_blobs) -> None:
     state = SpatiatoAppState()
     obs_path = TableComponentPath("obs", ("user_class",))

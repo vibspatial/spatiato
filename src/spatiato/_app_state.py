@@ -351,8 +351,8 @@ class SpatiatoAppState(QObject):
        persistence service successfully writes it and its captured mutation
        token is still current.
     2. ``record_persisted_table_change()`` clears a component that an operation
-       already persisted itself, again only when its captured token is still
-       current.
+       already persisted itself, when given the snapshot captured before the
+       operation, again only when its captured token is still current.
     3. ``record_table_reload()`` clears a component whose in-memory state was
        deliberately replaced with the persisted state.
 
@@ -398,9 +398,7 @@ class SpatiatoAppState(QObject):
         old_coordinate_system = self.coordinate_system
         replaces_current = old_sdata is not None and old_sdata is not sdata
         if replaces_current and not discard_current:
-            raise RuntimeError(
-                "Replacing or clearing the active SpatialData requires explicit discard authorization."
-            )
+            raise RuntimeError("Replacing or clearing the active SpatialData requires explicit discard authorization.")
 
         if replaces_current:
             self.viewer_adapter.remove_layers_for_sdata(old_sdata)
@@ -497,9 +495,7 @@ class SpatiatoAppState(QObject):
             self._coordinate_system_change_participant is not None
             and participant is not self._coordinate_system_change_participant
         ):
-            raise RuntimeError(
-                "A coordinate-system change participant is already registered for this viewer session."
-            )
+            raise RuntimeError("A coordinate-system change participant is already registered for this viewer session.")
         self._coordinate_system_change_participant = participant
 
     def unregister_coordinate_system_change_participant(
@@ -597,11 +593,17 @@ class SpatiatoAppState(QObject):
     def record_persisted_table_change(
         self,
         event: TableStateChangedEvent,
-        snapshot: TableDirtySnapshot,
+        snapshot: TableDirtySnapshot | None = None,
     ) -> None:
-        """Publish an already-persisted change without clearing newer mutations."""
-        self._validate_snapshot_identity(snapshot, event.sdata, event.table_name)
-        self.acknowledge_table_write(snapshot, persisted_paths=event.paths)
+        """Publish an already-persisted change without clearing newer mutations.
+
+        Pass the dirty snapshot captured before the operation to clear the dirty
+        paths it persisted. Without one, nothing is cleared and the change is
+        only published.
+        """
+        if snapshot is not None:
+            self._validate_snapshot_identity(snapshot, event.sdata, event.table_name)
+            self.acknowledge_table_write(snapshot, persisted_paths=event.paths)
         self.table_state_changed.emit(event)
 
     def record_table_reload(self, event: TableStateChangedEvent) -> None:
