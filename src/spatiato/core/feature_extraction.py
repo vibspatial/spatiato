@@ -289,6 +289,11 @@ def check_existing_feature_matrix(
     loading matrix values: an entry present only in memory was never saved and
     is incompatible, and unsaved changes to a stored entry are not seen.
 
+    A caller may run it before launching, for example to choose a confirmation,
+    and pass the returned `ExistingFeatureMatrix.kind` to
+    `calculate_feature_matrix(confirmed_existing_entry=...)`, which runs it
+    again and stops if the kind changed.
+
     Raises `ValueError` when harpy would reject any feature update of the table
     because of its rows, so nothing is removed for an update that cannot succeed.
     """
