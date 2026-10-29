@@ -460,8 +460,11 @@ def calculate_feature_matrix(
             # Table-name collisions are blocked in the UI/controller; replacing an
             # existing table would need a broader table and .obsm replacement policy.
             overwrite_output_table=False,
-            # The existing entry was checked above. harpy's flag only concerns the
-            # store, and is still needed there for orphaned stored metadata.
+            # Spatiato applied the caller's `overwrite_feature_key` above. harpy's
+            # flag only guards entries in the store: pass True for an existing
+            # table, so harpy also replaces orphaned stored metadata, which
+            # Spatiato treats as absent. harpy rejects True when it creates a
+            # new table.
             overwrite_feature_key=not create_table,
             to_coordinate_system=_resolve_harpy_coordinate_system_parameter(triplets),
         )
