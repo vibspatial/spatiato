@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
-from spatiato._app_state import TableReloadRequest
+from spatiato._app_state import TableDirtySnapshot, TableReloadRequest
 from spatiato.core.feature_extraction import (
     ExistingFeatureMatrix,
     ExistingFeatureMatrixKind,
@@ -133,11 +133,21 @@ class FeatureExtractionBindingState:
 
 @dataclass(frozen=True)
 class FeatureExtractionJob:
-    """Immutable payload copied on the main thread and consumed by a worker."""
+    """Immutable payload copied on the main thread and consumed by a worker.
+
+    `dirty_snapshot` is the target table's dirty state captured at launch. The
+    controller does not interpret it: every result of the job carries it back,
+    and the widget records the result with it, so only paths that were dirty at
+    launch and that the job wrote can become clean. In practice there are none,
+    because launching is refused while the key's paths have unsaved changes.
+    `None` when the caller tracks no dirty state, for example for a new table:
+    the result is then only published.
+    """
 
     job_id: int
     sdata: SpatialData
     request: FeatureExtractionRequest
+    dirty_snapshot: TableDirtySnapshot | None = None
 
     @property
     def labels_names(self) -> tuple[str, ...]:
@@ -189,7 +199,8 @@ class FeatureExtractionResult:
     `regions` are the table regions whose rows changed, as table events report
     them: the selected labels elements, or every region of the table after a
     full replacement or a removal (`change_kind="removed"`, when extraction
-    failed after the previous matrix was removed).
+    failed after the previous matrix was removed). `dirty_snapshot` is the
+    job's launch snapshot (`FeatureExtractionJob.dirty_snapshot`).
     """
 
     job_id: int
@@ -199,6 +210,7 @@ class FeatureExtractionResult:
     feature_key: str
     regions: tuple[str, ...]
     change_kind: FeatureMatrixWriteChangeKind = "created"
+    dirty_snapshot: TableDirtySnapshot | None = None
 
     @property
     def triplet_count(self) -> int:
@@ -226,6 +238,7 @@ def _run_feature_extraction_job(job: FeatureExtractionJob) -> FeatureExtractionR
         feature_key=request.feature_key,
         regions=calculation.regions,
         change_kind=calculation.change_kind,
+        dirty_snapshot=job.dirty_snapshot,
     )
 
 
@@ -289,15 +302,6 @@ class FeatureExtractionController:
     def status_kind(self) -> str:
         """Return the latest status level: info, warning, success, or error."""
         return self._status_kind
-
-    @property
-    def active_job_id(self) -> int | None:
-        """Return the job running for the current selection.
-
-        `None` when no job runs, or when the running job was detached because
-        an input changed; a detached job still counts for `has_job_in_flight`.
-        """
-        return self._job.job_id if self._job is not None and not self._job_detached else None
 
     @property
     def has_job_in_flight(self) -> bool:
@@ -509,12 +513,15 @@ class FeatureExtractionController:
         *,
         overwrite_feature_key: bool = False,
         confirmed_existing_entry: ExistingFeatureMatrixKind | None = None,
+        dirty_snapshot: TableDirtySnapshot | None = None,
     ) -> bool:
         """Launch feature extraction for the current bound inputs.
 
         `confirmed_existing_entry` is the kind returned by
         `check_existing_feature_matrix(...)`, which the worker checks again
-        before it removes or calculates anything.
+        before it removes or calculates anything. `dirty_snapshot`, the target
+        table's dirty state at launch, is carried back unchanged in the job's
+        results (`FeatureExtractionJob.dirty_snapshot`).
         """
         if self._is_shutdown:
             return False
@@ -529,6 +536,7 @@ class FeatureExtractionController:
             self._last_job_id + 1,
             overwrite_feature_key=bool(overwrite_feature_key),
             confirmed_existing_entry=confirmed_existing_entry,
+            dirty_snapshot=dirty_snapshot,
         )
         if job is None:
             return False
@@ -638,6 +646,7 @@ class FeatureExtractionController:
         *,
         overwrite_feature_key: bool,
         confirmed_existing_entry: ExistingFeatureMatrixKind | None = None,
+        dirty_snapshot: TableDirtySnapshot | None = None,
     ) -> FeatureExtractionJob | None:
         if self._selected_spatialdata is None:
             self._set_status(FEATURE_EXTRACTION_IDLE_STATUS, kind="warning")
@@ -721,7 +730,12 @@ class FeatureExtractionController:
             overwrite_feature_key=overwrite_feature_key,
             confirmed_existing_entry=confirmed_existing_entry,
         )
-        return FeatureExtractionJob(job_id=job_id, sdata=self._selected_spatialdata, request=request)
+        return FeatureExtractionJob(
+            job_id=job_id,
+            sdata=self._selected_spatialdata,
+            request=request,
+            dirty_snapshot=dirty_snapshot,
+        )
 
     def _set_status(self, message: str, *, kind: str) -> None:
         self._status_message = message
@@ -875,6 +889,7 @@ class FeatureExtractionController:
                     feature_key=error.feature_key,
                     regions=error.regions,
                     change_kind="removed",
+                    dirty_snapshot=job.dirty_snapshot,
                 )
             )
             if is_active:
