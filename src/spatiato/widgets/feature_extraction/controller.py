@@ -483,6 +483,11 @@ class FeatureExtractionController:
         if sdata is None or table_name is None or feature_key is None or self._create_table:
             raise RuntimeError("Checking an existing feature matrix requires a bound existing table and feature key.")
 
+        # Only backed data is checked. harpy merges with the existing entry it
+        # reads from the store, so unsaved changes to the key in memory would be
+        # dropped. Unbacked, harpy merges with the matrix in memory, so nothing
+        # is lost; and since unbacked data can't be written or reloaded, a block
+        # here would stop every recalculation of the key.
         if sdata.is_backed():
             key_paths = (
                 TableComponentPath("obsm", (feature_key,)),
