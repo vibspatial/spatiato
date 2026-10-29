@@ -201,12 +201,12 @@ def test_feature_extraction_widget_destruction_retains_reload_guard_until_worker
     qtbot.waitUntil(lambda: worker.quit_called)
 
     assert controller in app_state._table_reload_participants
-    assert controller.has_in_flight_jobs is True
+    assert controller.has_job_in_flight is True
 
     worker.finished.emit()
     qtbot.waitUntil(lambda: controller not in app_state._table_reload_participants)
 
-    assert controller.has_in_flight_jobs is False
+    assert controller.has_job_in_flight is False
 
 
 def test_feature_extraction_widget_blocks_matching_shared_reload_with_user_feedback(
@@ -2038,6 +2038,7 @@ def test_feature_extraction_widget_refreshes_table_selection_after_controller_su
             labels_names=("blobs_labels",),
             table_name="table",
             feature_key="features",
+            regions=("blobs_labels",),
         )
     )
 
@@ -2069,6 +2070,7 @@ def test_feature_extraction_widget_promotes_created_table_to_existing_selection(
             labels_names=("blobs_labels",),
             table_name="new_table",
             feature_key="features",
+            regions=("blobs_labels",),
         )
     )
 
@@ -2117,6 +2119,7 @@ def test_feature_extraction_widget_uses_existing_overwrite_prompt_after_created_
             labels_names=("blobs_labels",),
             table_name="new_table",
             feature_key="features",
+            regions=("blobs_labels",),
         )
     )
 
@@ -2158,6 +2161,7 @@ def test_feature_extraction_widget_records_feature_matrix_change_in_shared_app_s
         labels_names=("blobs_labels",),
         table_name="table",
         feature_key="features_new",
+        regions=("blobs_labels",),
         change_kind="created",
     )
 
@@ -2189,6 +2193,7 @@ def test_feature_extraction_widget_keeps_backed_harpy_write_clean(
         labels_names=("blobs_labels",),
         table_name="table",
         feature_key="features_new",
+        regions=("blobs_labels",),
         change_kind="created",
     )
     widget._active_feature_extraction_snapshot = feature_extraction_widget_module._ActiveFeatureExtractionSnapshot(
