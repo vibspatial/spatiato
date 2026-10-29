@@ -613,7 +613,10 @@ drop the field from Spatiato's interpretation. Cosmetic; lowest priority.
 ### P7. `overwrite_feature_key` changed meaning in harpy 0.5.0
 
 Status: decisions 1-9 agreed (4-8 added on 2026-10-26 and 9 on 2026-10-27,
-after checking the spec against the code); not implemented yet.
+after checking the spec against the code). Step 1 implemented on 2026-10-29
+(core function, headless, core tests; flow documented in
+`docs/development/feature_extraction.md`); step 2 (widget and controller) not
+started.
 
 Found by the P0 run:
 `tests/test_headless.py::test_compute_features_for_classifier_returns_normalized_target`
