@@ -7,12 +7,13 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 import dask.array as da
 import numpy as np
 import zarr
+from harpy.image._image import _get_spatial_element
+from harpy.table._add_feature_matrix import _resolve_channels
 from harpy.table.io._components import _check_in_memory_versus_storage_axes, _component_update_destination
 from harpy.table.io._write_validation import _validated_observation_pairs
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 from loguru import logger
 from spatialdata.models import TableModel
-from xarray import DataArray
 
 from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
@@ -561,43 +562,18 @@ def _resolve_source_channels(
     image_name: str,
     channels: Sequence[FeatureExtractionChannel] | None,
 ) -> list[str]:
-    """Resolve a channel selection to channel names, as harpy's `_resolve_channels(...)` does.
+    """Resolve a channel selection to the channel names harpy stores in `source_channels`.
 
-    `None` selects all channels, an integer is an index and a string is a name.
-    Duplicates are dropped, and an unnamed channel becomes `channel_{index}`.
+    Calls harpy's private `_resolve_channels(...)` on the image harpy reads (the
+    highest resolution), so the names match harpy's exactly. Remove once
+    https://github.com/saeyslab/harpy/issues/281 is released.
     """
+    # harpy's image lookup raises KeyError for a missing image; callers expect ValueError.
     if image_name not in sdata.images:
         raise ValueError(f"Image element `{image_name}` is not available in the selected SpatialData object.")
-    image_element = sdata.images[image_name]
-    image = image_element if isinstance(image_element, DataArray) else next(iter(image_element["scale0"].values()))
-    available_channels = list(image.c.data)
-
-    if channels is None:
-        indices = list(range(len(available_channels)))
-    else:
-        index_by_name = {str(name): index for index, name in enumerate(available_channels)}
-        indices = []
-        for channel in channels:
-            if isinstance(channel, (int, np.integer)) and not isinstance(channel, bool):
-                if channel < 0 or channel >= len(available_channels):
-                    raise ValueError(
-                        f"Channel index `{channel}` is out of range for image element `{image_name}`. "
-                        f"Available indices are 0 through {len(available_channels) - 1}."
-                    )
-                index = int(channel)
-            else:
-                if str(channel) not in index_by_name:
-                    raise ValueError(
-                        f"Channel `{channel}` was not found in image element `{image_name}`. "
-                        f"Available channels are {[str(name) for name in available_channels]}."
-                    )
-                index = index_by_name[str(channel)]
-            if index not in indices:
-                indices.append(index)
-
-    return [
-        f"channel_{index}" if available_channels[index] is None else str(available_channels[index]) for index in indices
-    ]
+    image = _get_spatial_element(sdata, element_name=image_name)
+    channel_names, _ = _resolve_channels(image, None if channels is None else list(channels))
+    return channel_names
 
 
 def _is_dense_matrix(matrix: Any) -> bool:
