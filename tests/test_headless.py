@@ -464,7 +464,6 @@ def test_compute_features_for_classifier_rejects_spatialdata_invalid_feature_key
 def test_compute_features_for_classifier_returns_normalized_target(sdata_blobs: SpatialData) -> None:
     bundle = _make_area_classifier_bundle()
     table = sdata_blobs["table"]
-    table.obsm["computed_area"] = np.zeros((table.n_obs, 1), dtype=np.float64)
 
     resolved_target = headless.compute_features_for_classifier(
         sdata_blobs,
@@ -482,6 +481,39 @@ def test_compute_features_for_classifier_returns_normalized_target(sdata_blobs: 
     assert resolved_target.overwrite_feature_key is True
     metadata = table.uns[_FEATURE_MATRICES_KEY]["computed_area"]
     assert list(metadata["feature_columns"]) == ["area"]
+
+
+def test_compute_features_for_classifier_requires_overwrite_for_existing_matrix(sdata_blobs: SpatialData) -> None:
+    bundle = _make_area_classifier_bundle()
+    target = headless.HeadlessFeatureTarget(
+        table_name="table",
+        feature_key="computed_area",
+        triplets=(headless.FeatureExtractionTriplet("global", "blobs_labels", None),),
+    )
+    headless.compute_features_for_classifier(sdata_blobs, bundle, target=target)
+
+    with pytest.raises(ValueError, match="already exists"):
+        headless.compute_features_for_classifier(sdata_blobs, bundle, target=target)
+
+
+def test_compute_features_for_classifier_replaces_custom_matrix_when_overwriting(sdata_blobs: SpatialData) -> None:
+    bundle = _make_area_classifier_bundle()
+    table = sdata_blobs["table"]
+    table.obsm["computed_area"] = np.zeros((table.n_obs, 3), dtype=np.float64)
+
+    headless.compute_features_for_classifier(
+        sdata_blobs,
+        bundle,
+        target=headless.HeadlessFeatureTarget(
+            table_name="table",
+            feature_key="computed_area",
+            triplets=(headless.FeatureExtractionTriplet("global", "blobs_labels", None),),
+            overwrite_feature_key=True,
+        ),
+    )
+
+    assert table.obsm["computed_area"].shape == (table.n_obs, 1)
+    assert list(table.uns[_FEATURE_MATRICES_KEY]["computed_area"]["feature_columns"]) == ["area"]
 
 
 def test_apply_classifier_with_feature_extraction_writes_predictions(sdata_blobs: SpatialData) -> None:
