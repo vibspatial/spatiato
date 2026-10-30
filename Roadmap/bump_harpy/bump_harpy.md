@@ -361,19 +361,28 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    - P1 mostly disappears with step 3; reload reads lazily too (step 4).
 
    Open points:
-   - **Chunking.** Dask reads every block that contains a requested row. With
-     harpy's `"auto"` chunking a dense block is about 128 MiB (Dask's
-     `array.chunk-size`), so smaller matrices are read whole even for a few
-     rows, and scattered labeled training rows touch many blocks.
-     `dense_chunks="storage"` keeps harpy's stored row chunks (about 4 MiB).
-     Measure on a large multi-region table during step 3 and set it in the
-     reader (step 5). Measure lazy against backed `X` for coloring by var at
-     the same time.
-   - **Unsupported encodings.** A lazy read raises on matrix encodings harpy
-     does not support (`_decode_anndata_element(...)` in
-     `harpy/_storage/_anndata.py`) instead of falling back to an eager read.
-     Proposal: the reader falls back to an eager read for that table and logs
-     a warning.
+   - **Chunking** (a later optimization, out of scope for steps 3-5). Dask
+     reads every block that contains a requested row. With harpy's `"auto"`
+     chunking a dense block is about 128 MiB (Dask's `array.chunk-size`), so
+     smaller matrices are read whole even for a few rows, and scattered labeled
+     training rows touch many blocks. `dense_chunks="storage"` keeps harpy's
+     stored row chunks (about 4 MiB). The reader keeps harpy's defaults; measure
+     chunking, and lazy against backed `X` for coloring by var, only if reads
+     turn out noticeably slow.
+   - **Reading shared blocks twice** (considered on 2026-10-30, not planned).
+     A classifier job reads its training rows and its prediction rows
+     separately, so blocks they share are read twice, for example when both
+     scopes are the selected labels element. Reading the union of the
+     positions once and splitting it would avoid that. Accepted for now;
+     optimize only if it noticeably slows training down.
+   - **Unsupported encodings** (decided on 2026-10-30). A lazy read raises on
+     matrix encodings harpy does not support (`_decode_anndata_element(...)` in
+     `harpy/_storage/_anndata.py`). Spatiato does not fall back to an eager
+     read: the reader (step 5) and the reload (step 4) read lazily and raise
+     harpy's error. Handling such encodings is harpy's responsibility. A store
+     that opens today with spatialdata's eager reader can therefore fail to
+     open after the switch; accepted, since anndata writes standard matrices in
+     supported encodings.
    - **`Interactive(sdata)`** installs the caller's tables as they are; no
      conversion on entry. Consumers handle any representation (step 3).
 3. **Make consumers representation-agnostic** (P2, P1, P3), and read values
@@ -1278,14 +1287,16 @@ unsaved-changes block, dialogs, widget tests).
 
 ## Open Questions
 
-- The D1 open points (see "Migration Plan", step 2): chunking of lazy reads
-  (and lazy against backed `X`), measured during step 3; the fallback for
-  unsupported encodings.
+- The D1 open point (see "Migration Plan", step 2), as a later optimization
+  only if reads turn out noticeably slow: chunking of lazy reads (and lazy
+  against backed `X`).
 
 Settled on 2026-10-30 (see "Migration Plan", step 2):
 
 - D1: every table matrix stays lazy. Feature extraction keeps the lazy `obsm`
   that harpy attaches; the reader and the reload read lazily.
+- Unsupported matrix encodings: no fallback in Spatiato; a lazy read raises
+  harpy's error.
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
