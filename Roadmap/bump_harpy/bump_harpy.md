@@ -458,16 +458,16 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    extraction, and P2 was hit in real use. This step comes before the reader
    switch, which would otherwise spread the P2 bug to every table.
 
-   Readiness check (2026-10-30): 3a-3c are ready to implement; 3d needs the
-   four design points below settled first. Sub-steps, each committed
-   separately:
+   Readiness check (2026-10-30): every sub-step is ready to implement; the
+   four design points for 3d below were settled the same day. Sub-steps, each
+   committed separately:
 
    | Sub-step | Content | Ready? |
    |---|---|---|
    | 3a | Matrix helpers, with unit tests per representation | yes |
    | 3b | Coloring by `X` var through the column helper (P2) | yes |
    | 3c | Shape and dtype without loading (metadata inspection and registration, export and column checks), spatial query through the helpers, the P1 safeguard | yes |
-   | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | after design points 1-4 |
+   | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | yes (design points 1-4 settled) |
 
    Facts for the helpers, checked at runtime (anndata 0.13.4, dask 2026.8.0,
    zarr 3.2.1) on matrices written with anndata and read back through harpy's
@@ -503,17 +503,17 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    `calculate_feature_matrix(...)` after `hp.tb.add_feature_matrix(...)`; it
    runs in the worker, where harpy already installs its results.
 
-   Design points for 3d (proposals, to settle before 3d). Today the summary's
+   Design points for 3d (settled on 2026-10-30). Today the summary's
    "eligible rows" (scope rows with finite features) feed more than scoping:
    1. **What is reported before a job.** The status card ("Prediction rows:
       N"), the launch status ("… from N eligible rows …") and the "Need at
-      least …" messages use eligible counts. Proposal: before a job, report
+      least …" messages use eligible counts. Decision: before a job, report
       the rows in the scope; the rows used and skipped are reported after the
       job.
    2. **The counts in `uns["classifier_config"]`.** `n_training_rows` and
       `n_predicted_rows` come from the summary today
       (`_build_classifier_config(...)`); they are persisted, and "Loaded
-      predictions for N objects" reads them back. Proposal: the job result
+      predictions for N objects" reads them back. Decision: the job result
       carries the counts and the predicted row positions, and both the config
       and the prediction write (`_write_classifier_predictions(...)`, whose
       fill positions are already a subset of the cleared ones) use them.
@@ -521,10 +521,10 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       than two classes, after skipping; or no usable rows in the prediction
       scope. Today ineligibility is handled on the main thread by
       `_apply_ineligible_state(...)` (clears the scope's predictions, writes
-      the config with `trained=False`). Proposal: the worker returns an
+      the config with `trained=False`). Decision: the worker returns an
       "ineligible" result with its reason, not an exception, and the main
       thread passes it to `_apply_ineligible_state(...)`.
-   4. **Data structures.** `ResolvedClassifierScope` drops
+   4. **Data structures.** Decision: `ResolvedClassifierScope` drops
       `table_row_positions`, `n_eligible_rows` and
       `n_excluded_feature_invalid_rows`; `ClassifierJob` carries the matrix
       object and the positions instead of arrays copied on the main thread;
@@ -1397,6 +1397,9 @@ Settled on 2026-10-30 (see "Migration Plan", step 2):
   that harpy attaches; the reader and the reload read lazily.
 - Unsupported matrix encodings: no fallback in Spatiato; a lazy read raises
   harpy's error.
+- Step 3d design points 1-4 (see "Migration Plan", step 3): counts before
+  and after a job, config counts from the job result, ineligibility found in
+  the worker, and the data structures.
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
