@@ -103,6 +103,31 @@ in shape; `backend` is hard-coded `"numpy"` and laziness is not recorded.
 There is no public "materialize" helper; options are `mode="eager"` or
 `adata.to_memory()`.
 
+Checked against 0.5.2 on 2026-10-30 (for D1):
+
+- `hp.io.read_zarr` leaves tables out of spatialdata's read
+  (`selection=("images", "labels", "points", "shapes")`) and reads each table
+  with one `table_mode`; there is no per-component mode.
+- `uns` is always read eagerly, as are DataFrame-valued `obsm`/`varm` entries
+  and `raw.var`.
+- Lazy and backed reads raise on matrix encodings harpy does not support
+  (only dense `array`/`string-array` 0.2.0 and CSR/CSC 0.1.0); they do not
+  fall back to an eager read.
+- `read_table_components(...)` returns a dict of components, not an AnnData.
+  On backed SpatialData, harpy has no public way to install a value in memory
+  without writing it; plain assignment (`table.obsm[key] = value`) does that.
+- No harpy function lets the caller choose the reattachment mode; the chunk
+  settings of `add_table_components_by_region(...)` shape only the merge, and
+  the reattached array uses `"auto"` chunks.
+- `add_canonical_centers` attaches only the canonical `obsm` matrix, as a
+  backed `zarr.Array`. `allocate` is a deprecated alias of `aggregate_points`.
+- anndata 0.13.4 `AnnData.to_memory()` returns a new AnnData (Dask is
+  computed, `zarr.Array` and `CSRDataset`/`CSCDataset` are read); it does not
+  change the original.
+- Lazy sparse blocks are SciPy CSR (or CSC) matrices; `.compute()` returns a
+  `csr_matrix`. Dense lazy blocks span whole rows, about 128 MiB each with
+  `"auto"`; harpy stores dense matrices in about 4 MiB row chunks.
+
 ### Table component I/O
 
 Store-only functions (`hp.tb.io`, return `None`):
@@ -233,6 +258,23 @@ Main consumers:
   `_validate_canonical_matrix(...)` and other readers in `core/spatial_query/`
   use `np.asarray(...)` and reject sparse.
 
+Inventory of 2026-10-30 (for D1), adding to the list above:
+
+- Object Classification reads the selected matrix whole four times per refresh
+  (`_update_selection_status()`: twice through the widget's metadata check,
+  twice in `_prepare_classifier_summary(...)`), plus the finite-row mask; two
+  more once a trained model exists (export readiness).
+- Any `obsm` key can be the classifier's feature matrix: Object Classification
+  lists every key, `spatial_canonical` included, and selects the first one.
+- `X` is read only by the two coloring functions above. The var lists in the
+  UI use `var_names` only. `layers`, `obsp`, `varm`, `varp` and `raw` have no
+  consumers.
+- Lazy matrices already occur without a lazy reader: on backed SpatialData,
+  feature extraction leaves `obsm[feature_key]` as Dask, and creating a new
+  table reopens the whole table lazily, `X` included.
+- Reload reads every `obsm` key eagerly (`ad.io.read_elem`) and never reloads
+  `X`, `var` or `layers`.
+
 Observed with anndata 0.12.16 (scratch scripts, not in the test suite):
 
 | Matrix | Behavior |
@@ -287,27 +329,105 @@ Spatiato's own table I/O code, is the core of this bump. Order:
 1. **P7.** Its spec is complete. It lives in feature extraction, not
    persistence, and already goes through harpy's API. It makes the suite green,
    so the persistence refactor starts from a clean baseline.
-2. **D1: decide how tables live in memory** (open). Today every table is fully
-   loaded when a store is opened (`spatialdata.read_zarr`, which reads tables
-   with `anndata.read_zarr`); harpy's `hp.io.read_zarr` defaults to lazy. P1-P5
-   and the reader switch all follow from this choice. Starting proposal:
+2. **D1: how tables live in memory** (decided on 2026-10-30). Every table
+   matrix stays lazy: `X`, `obsm`, `layers`, `obsp`, `varm`, `varp` and `raw`.
+   Only `obs`, `var`, `uns` and DataFrame-valued `obsm` entries are in memory,
+   as harpy always reads them. This is harpy's default reader,
+   `hp.io.read_zarr(store)` (`table_mode="lazy"`), with nothing loaded
+   afterwards. Today every table is fully loaded when a store is opened
+   (`spatialdata.read_zarr`, which reads tables with `anndata.read_zarr`).
 
-   | Component | In memory | Why |
-   |---|---|---|
-   | `obs`, `var`, `uns` | loaded | harpy always loads them; small, and edited by widgets |
-   | `X` | lazy | can be huge (transcript counts); Spatiato only reads one column, for coloring by var |
-   | `obsm` feature matrices | loaded, or loaded once (after extraction or at first use) | the classifier needs the whole matrix; small next to `X` |
+   Why (inventory of 2026-10-30, see "Spatiato Today"):
+   - `X` is read in two places, both coloring by an `X` var on a user click:
+     one column, for the rows of one region. `layers`, `obsp`, `varm`, `varp`
+     and `raw` have no consumers.
+   - `obsm` feature matrices are read whole only by Object Classification, and
+     only because it derives the usable rows from the values (the finite-row
+     mask) on every refresh. That derivation moves (step 3), so values are read
+     only when a classifier job runs, and only the rows it uses.
+   - harpy attaches lazy matrices after its own writes on backed SpatialData
+     (feature extraction, `add_table`), so lazy is the representation Spatiato
+     meets anyway. Loading at open would only hold until the next extraction.
+   - Considered and rejected: loading `obsm` at open, at reload and after each
+     extraction (the first proposal). Simpler for consumers, but it costs
+     memory and open time for matrices that may never be used, and needs a load
+     step after every harpy write.
 
-   Other components follow from their consumers (P3). harpy's readers take one
-   `mode` for all matrices, so a split means reading lazily and loading the
-   chosen components afterwards.
-3. **Make consumers representation-agnostic** (P2, P1, P3): shared helpers
-   that turn any supported matrix into NumPy or SciPy, and that read one column
-   without loading the whole matrix; no full read on every refresh; tests with
-   backed handles. Needed whatever D1 decides: harpy already attaches lazy
-   matrices after a backed extraction, and P2 was hit in real use. This step
-   comes before the reader switch, which would otherwise spread the P2 bug to
-   every table.
+   Consequences:
+   - opening holds no matrix values; each classifier job reads its rows from
+     the store (no cache for now);
+   - lazy views depend on the store: data overwritten outside Spatiato (a
+     notebook, another process) is seen on the next read, as harpy documents;
+   - P1 mostly disappears with step 3; reload reads lazily too (step 4).
+
+   Open points:
+   - **Chunking.** Dask reads every block that contains a requested row. With
+     harpy's `"auto"` chunking a dense block is about 128 MiB (Dask's
+     `array.chunk-size`), so smaller matrices are read whole even for a few
+     rows, and scattered labeled training rows touch many blocks.
+     `dense_chunks="storage"` keeps harpy's stored row chunks (about 4 MiB).
+     Measure on a large multi-region table during step 3 and set it in the
+     reader (step 5). Measure lazy against backed `X` for coloring by var at
+     the same time.
+   - **Unsupported encodings.** A lazy read raises on matrix encodings harpy
+     does not support (`_decode_anndata_element(...)` in
+     `harpy/_storage/_anndata.py`) instead of falling back to an eager read.
+     Proposal: the reader falls back to an eager read for that table and logs
+     a warning.
+   - **`Interactive(sdata)`** installs the caller's tables as they are; no
+     conversion on entry. Consumers handle any representation (step 3).
+3. **Make consumers representation-agnostic** (P2, P1, P3), and read values
+   only where they are used:
+   - shared helpers: one turns any supported matrix, or selected rows of it,
+     into NumPy or SciPy (NumPy, SciPy, dense and sparse Dask, `zarr.Array`,
+     `CSRDataset`/`CSCDataset`); one reads one column for coloring by var (P2);
+   - shape and dtype from the matrix object, without loading:
+     `inspect_feature_matrix_metadata(...)`,
+     `register_feature_matrix_metadata(...)`,
+     `_validate_current_feature_matrix_matches_columns(...)`;
+   - Object Classification no longer scans the matrix (agreed on 2026-10-30).
+     One contract for every feature matrix, created by
+     `hp.tb.add_feature_matrix` or registered as custom: scope rows are the
+     rows of the scope's labels elements that the table annotates, and the
+     worker skips rows without finite features. The feature-matrix metadata
+     (`source_label`) is not used to scope rows: it would only allow an earlier
+     message, and it can be out of date when the matrix was changed outside
+     harpy.
+     - the summary, on every refresh, reads only `obs` and `uns`: scope rows as
+       `_resolve_classifier_scopes(...)` already resolves them (the selected
+       labels element, or every region of the table), the labeled count and
+       classes from `obs`, `n_features` from `shape[1]`. It keeps every check
+       that needs only `obs` and `uns` and blocks Train early: the table has
+       rows for the labels element (`obs`, `uns["spatialdata_attrs"]`), the
+       matrix exists with registered metadata, it has columns, and there are
+       enough labeled rows in at least two classes. Only a labels element whose
+       rows exist but have no features (for example, not covered by a regional
+       extraction) needs the job's read of `obsm`;
+     - the job carries the matrix object and the row positions instead of
+       copies made on the main thread. The worker reads the labeled training
+       rows and the prediction rows, drops rows with non-finite values (labels
+       elements without calculated features, table rows without an object in
+       the labels element, undefined features), checks the minimum labeled
+       count and the two classes again, then fits and predicts. The result
+       carries the predicted row positions and the number of skipped rows; both
+       are known only after the job. When every row of a labels element in the
+       scope is skipped, the message names that labels element (for example,
+       features were not calculated for it). Train is therefore no longer
+       disabled in advance for a labels element without features;
+     - headless `apply_classifier(...)` does the same;
+     - a classifier job may read while a feature extraction rewrites the same
+       key. Object Classification already drops in-flight results on an
+       `"updated"` event for its key
+       (`invalidate_for_feature_matrix_overwrite(...)`), and a failed read
+       becomes an error status. Accepted;
+   - spatial query's `obsm["spatial_canonical"]` (n × 2) stays as is:
+     `np.asarray(...)` computes dense Dask and `zarr.Array`, and the helpers
+     cover the rest;
+   - tests with lazy and backed matrices per consumer.
+
+   Needed regardless of D1: harpy already attaches lazy matrices after a backed
+   extraction, and P2 was hit in real use. This step comes before the reader
+   switch, which would otherwise spread the P2 bug to every table.
 4. **Swap the table I/O** (P5 writes, P4 reload):
    - writes through harpy's store-only `hp.tb.io.write_table_components(...)`
      and `delete_table_components(...)`. Spatiato's dirty tracking already
@@ -317,16 +437,15 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      replace them with lazy views of the store on every save;
    - not `write_table_updates(...)`: it compares the whole table with the store
      and never deletes, so it does not fit explicit dirty paths (non-goal);
-   - reload through `hp.tb.io.read_table_components(...)`, in the
-     representation chosen in D1;
+   - reload through `hp.tb.io.read_table_components(...)`, lazily (D1);
    - removed from `core/persistence.py` (416 lines): the direct zarr and
      anndata reads and writes, zarr group-structure handling
      (`_resolve_backed_table_group(...)` and the parent-chain helpers), and
      metadata consolidation. Kept: `TableComponentPath`, dirty tracking in
      `SpatiatoAppState`, the reload checks (`_validate_reload_binding(...)`),
      and restoring the in-memory state when a reload fails.
-5. **Switch the reader** (`_reader.py`) to `hp.io.read_zarr`, last: it changes
-   every table at once.
+5. **Switch the reader** (`_reader.py`) to `hp.io.read_zarr` (lazy, D1), last:
+   it changes every table at once.
 
 P6 (cosmetic) can be picked up along the way.
 
@@ -486,14 +605,16 @@ Resolution:
   reinstall it. This stops the chain and gives interactive use an in-memory
   matrix; it is a no-op for in-memory matrices.
 
-Direction:
+Direction (settled with D1 on 2026-10-30, see "Migration Plan", step 3):
 
 - read `shape` / `dtype` without materializing (summary, metadata inspection,
   column-count validation);
-- compute the finite-row mask once and cache it per matrix (e.g. keyed by table,
-  `obsm` key, and matrix object identity);
-- materialize once per classifier job, preferably inside the worker thread
-  instead of in `_prepare_classifier_job(...)` on the main thread.
+- no finite-row mask on refresh: the summary scopes rows by the labels
+  elements the table annotates, and the worker drops non-finite rows among the
+  rows it reads (this replaces the earlier idea of caching the mask);
+- read values once per classifier job, inside the worker thread, and only the
+  rows the job uses, instead of copying the matrix in
+  `_prepare_classifier_job(...)` on the main thread.
 
 ### P2. Lazy sparse matrices break
 
@@ -570,10 +691,9 @@ Direction: cover them with the P2 helper and add tests per consumer.
 `reload_table_components(...)` uses `ad.io.read_elem`, so "Reload Table State"
 replaces a lazy feature matrix with an in-memory copy.
 
-Direction: read with `hp.tb.io.read_table_components(...)`, in the
-representation chosen in D1 (see "Migration Plan", step 4), and keep Spatiato's
-reload-binding validation, `TableModel.validate`, and in-memory rollback around
-it.
+Direction: read with `hp.tb.io.read_table_components(...)`, lazily (D1; see
+"Migration Plan", step 4), and keep Spatiato's reload-binding validation,
+`TableModel.validate`, and in-memory rollback around it.
 
 ### P5. Replace Spatiato's on-disk writes with harpy's component API
 
@@ -1105,9 +1225,13 @@ unsaved-changes block, dialogs, widget tests).
 
 ## Tests to Add
 
-- dense Dask `obsm` feature matrix through metadata inspection, classifier
-  summary, training, and prediction, asserting no repeated full materialization
-  where P1 applies;
+- lazy (dense Dask) and backed `obsm` feature matrices through metadata
+  inspection, the classifier summary, training and prediction (D1, step 3):
+  - the summary reads no matrix values;
+  - a job reads only its rows, in the worker, and skips non-finite rows;
+  - the same for a matrix from `hp.tb.add_feature_matrix` and a custom one;
+  - a labels element without calculated features (all rows NaN) in the scope:
+    the job skips its rows, and the message names it;
 - lazy sparse `X` coloring by var (labels and shapes);
 - backed `zarr.Array` / `CSRDataset` consumers (P3);
 - reload keeps `obsm` lazy (P4);
@@ -1144,13 +1268,14 @@ unsaved-changes block, dialogs, widget tests).
 
 ## Open Questions
 
-- D1 (see "Migration Plan", step 2): how do tables live in memory, per
-  component? This also settles:
-  - whether feature extraction keeps the lazy `obsm` that harpy attaches, or
-    loads it once after extraction for interactive use. Since harpy 0.5.2,
-    unbacked SpatialData with in-memory matrices already gets NumPy, so this is
-    mainly about backed SpatialData (see P1);
-  - which `mode` the switched reader and the reload use.
+- The D1 open points (see "Migration Plan", step 2): chunking of lazy reads
+  (and lazy against backed `X`), measured during step 3; the fallback for
+  unsupported encodings.
+
+Settled on 2026-10-30 (see "Migration Plan", step 2):
+
+- D1: every table matrix stays lazy. Feature extraction keeps the lazy `obsm`
+  that harpy attaches; the reader and the reload read lazily.
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
