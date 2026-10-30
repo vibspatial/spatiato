@@ -595,7 +595,12 @@ Direction:
 - map paths: `("obs", col)` -> `("obs",)` (whole dataframe, as today),
   `("obsm", key)` -> `("obsm", key)`, `("uns", *keys)` -> `("uns", *keys)`;
 - pass `obs_identity` for obs-aligned writes; keep including `_colors` palette
-  paths explicitly, as widgets already do.
+  paths explicitly, as widgets already do;
+- block table writes while a feature extraction on the same table is still
+  writing, as reloads already are (`prepare_for_table_reload(...)` in
+  `widgets/feature_extraction/controller.py`). Today Write is not blocked, so
+  Spatiato's own writer and harpy's can run on the same store at once, which
+  harpy does not protect against (see P7, step 2 design, point 7).
 
 Additional reason (harpy 0.5.1+, anndata 0.13): anndata 0.13 shards zarr v3
 arrays by default (`ad.settings.auto_shard_zarr_v3` is `True` in anndata 0.13.4,
@@ -612,11 +617,13 @@ drop the field from Spatiato's interpretation. Cosmetic; lowest priority.
 
 ### P7. `overwrite_feature_key` changed meaning in harpy 0.5.0
 
-Status: decisions 1-9 agreed (4-8 added on 2026-10-26 and 9 on 2026-10-27,
-after checking the spec against the code). Step 1 implemented on 2026-10-29
-(core function, headless, core tests; flow documented in
-`docs/development/feature_extraction.md`); step 2 (widget and controller) not
-started.
+Status: implemented on 2026-10-29. Decisions 1-9 agreed (4-8 added on
+2026-10-26 and 9 on 2026-10-27, after checking the spec against the code).
+Step 1 (core function, headless, core tests) and step 2 (controller and widget,
+following the step 2 design points 1-9 below) are done; the flow is documented
+in `docs/development/feature_extraction.md`. Open follow-up: the public
+pre-launch check requested in https://github.com/saeyslab/harpy/issues/281,
+which would replace the copied and private harpy checks.
 
 Found by the P0 run:
 `tests/test_headless.py::test_compute_features_for_classifier_returns_normalized_target`
@@ -825,11 +832,27 @@ Decisions:
 
    What happens when a job finishes:
 
-   | Job when it finishes | Table event | Status and table-choice refresh |
-   |---|---|---|
-   | Active | yes | yes, as today |
-   | Cancelled, same SpatialData still selected | yes (new) | no |
-   | Cancelled, other SpatialData selected, or widget closed | no | no |
+   | Job when it finishes | Table event | Table-choice refresh | Status |
+   |---|---|---|---|
+   | Active | yes | yes, as today | yes |
+   | Cancelled, same SpatialData still selected | yes (new) | yes (added later, see below) | no |
+   | Cancelled, other SpatialData selected, or widget closed | no | no | no |
+
+   Added after step 2: a returned detached job also refreshes the table
+   choices. Before, a table created by a detached create-table job appeared in
+   the drop-down only at the next selection edit. The widget keeps the current
+   selection and only promotes a created table that is still the create-table
+   target (`_on_controller_table_selection_refresh_required(...)` in
+   `widgets/feature_extraction/widget.py`).
+
+   Also added after step 2: detachment is derived, not recorded. A job is
+   detached while the current selection is not the one it was launched for
+   (`_job_detached` and `_job_matches_selection(...)` in
+   `widgets/feature_extraction/controller.py`); a create-table job also matches
+   the existing-table selection of its table. Before, any rebind set a flag
+   that stayed set, so promoting the created table detached the active job
+   (its "wrote …" status was lost at `finished`), and changing an input back
+   left its own calculation showing "waiting for the previous calculation".
 
    A table event is decision 6's event for a success, or the `"removed"` event
    after a failure that follows the removal.
@@ -988,6 +1011,86 @@ Step 2 design (agreed on 2026-10-29, after checking the code):
 6. **Cancelling and shutdown split.** `_cancel_active_worker(...)` serves both
    rebinding and `shutdown(...)` today. Rebinding detaches without `quit()`
    (decision 9); shutdown keeps calling `quit()`.
+7. **One extraction at a time while a job is still writing** (found on
+   2026-10-29; the gap predates P7, because `quit()` never stopped the work).
+   - How two jobs overlap today: the widget does not lock its inputs during a
+     run, any input change detaches the running job (its harpy call keeps
+     running), and `can_calculate` only checks `is_running`, which looks at the
+     active job. Calculate is therefore enabled again, and a second click runs
+     a second extraction in parallel, usually on the same table.
+   - harpy gives no protection against concurrent writers ("No locking
+     coordinates concurrent access", `_publish_staged_paths(...)` in
+     `harpy/_storage/_publication.py`). One backed extraction publishes only
+     `obsm/<key>` and `uns/feature_matrices/<key>` (checked on 2026-10-29), so
+     different keys do not overwrite each other's data paths, but they share:
+     - the store's root metadata: each write saves its bytes before
+       publishing and restores them on failure (`_publish_table_paths(...)` in
+       `harpy/table/io/_write.py`), so a failing job can drop the other job's
+       entry from the consolidated metadata;
+     - created parents: the job that creates `uns/feature_matrices` removes it
+       on failure, together with the other job's metadata in it;
+     - the table in memory: harpy installs whole `obsm` and `uns` slots built
+       from a copy taken just before (`_install_memory_updates(...)` in
+       `harpy/table/io/_components.py`), so overlapping installs can drop the
+       other job's entry from memory.
+
+     With the same key it is worse: the second job checks, and harpy reads the
+     existing entry, before the first job writes, so it acts on an outdated
+     view (the confirmed-kind re-check does not help), and the later result
+     silently replaces the earlier one.
+   - Fix: `can_calculate` and `calculate()` check whether any job is in flight
+     (`has_job_in_flight`, see point 8) instead of only the active job, with
+     the status "Feature extraction: waiting for the previous calculation to
+     finish writing.". `_on_worker_finished(...)` also
+     notifies a state change when a detached job finishes, so Calculate is
+     enabled again (today it only does so for the active job).
+8. **One job slot** (agreed on 2026-10-29). With point 7 the controller has at
+   most one harpy job, so `_in_flight_jobs` (a dict) and the separate
+   active-worker pointer become one slot: `_job`, its `_worker`, and
+   `_job_detached`, set when an input changes (later derived from the
+   selection; see decision 9).
+   - Public contract: `has_job_in_flight` (was `has_in_flight_jobs`): a harpy
+     job has not finished, also when detached; it may still write the table,
+     in memory and, for backed SpatialData, in the store, and blocks launches
+     and reloads. With `can_calculate` and `status_message`, that is the whole
+     contract: `is_running` and, after point 9, `active_job_id` were removed,
+     and the status code reads the private `_job_detached` flag.
+   - Signals still carry the job id, so a stray signal is never taken for the
+     current job.
+   - Launching into an occupied slot raises `RuntimeError`. `calculate()`
+     returns first, with a status, so this only catches programming errors.
+   - The guard is per controller: a widget opened while a closed one's job
+     still writes gets its own controller and may start a second job.
+     Accepted: rare, and a guard across widgets would need shared state in
+     `SpatiatoAppState`.
+9. **The launch snapshot travels with the job** (agreed on 2026-10-29). For
+   backed SpatialData the widget records a result with
+   `record_persisted_table_change(event, snapshot)`, whose
+   `acknowledge_table_write(...)` (`_app_state.py`) clears the dirty paths
+   that the snapshot captured and that an event path (`obsm/<key>`,
+   `uns/feature_matrices/<key>`) covers; a change made after launch has a
+   fresh token and stays dirty.
+   - The widget takes one dirty snapshot at the click. Its paths go to the
+     check (the unsaved-changes block of point 3), and the snapshot itself to
+     `calculate(..., dirty_snapshot=...)`. The controller carries it without
+     interpreting it: `FeatureExtractionJob.dirty_snapshot`, copied into the
+     success result by the worker and into the `"removed"` result by
+     `_on_worker_errored(...)`. The widget records each result with its own
+     `result.dirty_snapshot`.
+   - Recording is therefore correct by construction, independent of the
+     block: the block keeps its own purpose (decision 7, unsaved changes that
+     harpy would drop). A first version recorded without a snapshot, which
+     was only correct because of the block, so the widget depended on a
+     controller rule it could not see.
+   - Gone from the widget: `_active_feature_extraction_snapshot`, its
+     job-id matching and its clearing on detach; detached jobs use their own
+     launch snapshot. Decision 9 point 4 (empty snapshot for a job that is no
+     longer active) becomes moot.
+   - `record_persisted_table_change(...)` takes an optional snapshot; a new
+     table's result has none and only publishes the event.
+   - The widget no longer uses `active_job_id`, so the controller no longer
+     exposes it; the one test that read it takes the job id from the job
+     passed to its worker factory.
 
 Tests that change: `_DeferredWorker` in `tests/test_feature_extraction.py`
 stops emitting `returned` after `quit()`; the two rebinding tests of decision
