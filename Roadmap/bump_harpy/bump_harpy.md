@@ -358,9 +358,13 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      the store (no cache for now);
    - lazy views depend on the store: data overwritten outside Spatiato (a
      notebook, another process) is seen on the next read, as harpy documents;
-   - P1 mostly disappears with step 3; reload reads lazily too (step 4).
+   - P1 mostly disappears with step 3; reload reads lazily too (step 4);
+   - D1 is about matrices read from a store. On unbacked SpatialData a Dask
+     matrix is an in-memory graph with no store behind it, and harpy 0.5.2
+     keeps chaining merges onto it. The P1 safeguard computes it once after a
+     feature extraction (step 3); this does not contradict D1.
 
-   Open points:
+   Related points:
    - **Chunking** (a later optimization, out of scope for steps 3-5). Dask
      reads every block that contains a requested row. With harpy's `"auto"`
      chunking a dense block is about 128 MiB (Dask's `array.chunk-size`), so
@@ -383,8 +387,11 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      that opens today with spatialdata's eager reader can therefore fail to
      open after the switch; accepted, since anndata writes standard matrices in
      supported encodings.
-   - **`Interactive(sdata)`** installs the caller's tables as they are; no
-     conversion on entry. Consumers handle any representation (step 3).
+   - **`Interactive(sdata)` and the headless API** take the caller's
+     SpatialData and never open a store (the headless `*_from_path(...)`
+     functions only load a classifier file). Its tables are used as they are,
+     with no conversion on entry. Consumers handle any representation
+     (step 3).
 3. **Make consumers representation-agnostic** (P2, P1, P3), and read values
    only where they are used:
    - shared helpers: one turns any supported matrix, or selected rows of it,
@@ -442,6 +449,9 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    - spatial query's `obsm["spatial_canonical"]` (n × 2) stays as is:
      `np.asarray(...)` computes dense Dask and `zarr.Array`, and the helpers
      cover the rest;
+   - feature extraction on unbacked SpatialData gets the P1 safeguard: if
+     `obsm[feature_key]` is still a Dask array after extraction, compute it once
+     and reinstall it (see P1, "Resolution");
    - tests with lazy and backed matrices per consumer.
 
    Needed regardless of D1: harpy already attaches lazy matrices after a backed
@@ -463,8 +473,11 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      metadata consolidation. Kept: `TableComponentPath`, dirty tracking in
      `SpatiatoAppState`, the reload checks (`_validate_reload_binding(...)`),
      and restoring the in-memory state when a reload fails.
-5. **Switch the reader** (`_reader.py`) to `hp.io.read_zarr` (lazy, D1), last:
-   it changes every table at once.
+5. **Switch the reader** to `hp.io.read_zarr` (lazy, D1), last: it changes
+   every table at once. Both places that open a store call
+   `spatialdata.read_zarr` today and both switch, so they give the same
+   representation: the napari reader (`_reader.py`) and the Viewer's "Open"
+   action (`widgets/viewer/widget.py`).
 
 P6 (cosmetic) can be picked up along the way.
 
@@ -622,7 +635,9 @@ Resolution:
   was a Dask array before extraction, e.g. a table read lazily and attached to
   in-memory SpatialData, or a custom Dask matrix), compute it once and
   reinstall it. This stops the chain and gives interactive use an in-memory
-  matrix; it is a no-op for in-memory matrices.
+  matrix; it is a no-op for in-memory matrices. Planned in step 3 of the
+  "Migration Plan"; it does not contradict D1, which is about matrices read
+  from a store.
 
 Direction (settled with D1 on 2026-10-30, see "Migration Plan", step 3):
 
