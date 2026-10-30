@@ -406,15 +406,24 @@ Spatiato's own table I/O code, is the core of this bump. Order:
        by a regional extraction): the job skips those rows and reports it;
      - the job carries the matrix object and the row positions instead of
        copies made on the main thread. The worker reads the labeled training
-       rows and the prediction rows, drops rows with non-finite values (labels
-       elements without calculated features, table rows without an object in
-       the labels element, undefined features), checks the minimum labeled
-       count and the two classes again, then fits and predicts. The result
-       carries the predicted row positions and the number of skipped rows; both
-       are known only after the job. When every row of a labels element in the
-       scope is skipped, the message names that labels element (for example,
-       features were not calculated for it). Train is therefore no longer
-       disabled in advance for a labels element without features;
+       rows and the prediction rows and skips every row with a NaN or ±inf in
+       any column, as today's finite-row mask does; only the place of the
+       check changes. Such rows come from labels elements without calculated
+       features, table rows without an object in the labels element, and
+       undefined features:
+       - a skipped labeled row is not used for training and does not count
+         towards the minimum labeled count or the two classes, so the worker
+         checks both again before fitting;
+       - a skipped prediction row gets no prediction, and its previous
+         prediction is cleared, as today (the prediction write clears every row
+         in the scope and fills only the predicted ones).
+
+       The result carries the predicted row positions and the number of
+       skipped rows; both are known only after the job. When every row of a
+       labels element in the scope is skipped, the message names that labels
+       element (for example, features were not calculated for it). Train is
+       therefore no longer disabled in advance for a labels element without
+       features;
      - headless `apply_classifier(...)` does the same;
      - a classifier job may read while a feature extraction rewrites the same
        key. Object Classification already drops in-flight results on an
