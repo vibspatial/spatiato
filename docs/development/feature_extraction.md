@@ -5,12 +5,8 @@ This document describes how Spatiato calculates a feature matrix with
 exists. It covers who decides what, what is rejected, and how memory and store
 relate. It is an internal developer contract, not user documentation.
 
-> **Status.** The core function and headless mode are implemented. The widget
-> and controller parts are planned (P7, step 2, in
-> [`Roadmap/bump_harpy/bump_harpy.md`](../../Roadmap/bump_harpy/bump_harpy.md))
-> and are marked _planned_ below. Until then, the widget only tests
-> `feature_key in table.obsm` before its dialog, and its worker calls harpy
-> directly.
+> The decisions behind this flow, and their reasons, are recorded in P7 of
+> [`Roadmap/bump_harpy/bump_harpy.md`](../../Roadmap/bump_harpy/bump_harpy.md).
 
 ## Terminology
 
@@ -33,9 +29,19 @@ relate. It is an internal developer contract, not user documentation.
   before launching. The core checks again and stops if the kind changed.
 - **Backed:** `sdata.path` is set, so the table also lives in a Zarr store.
   **Unbacked:** the table exists only in memory.
-- **Active job:** the widget's current extraction job. Changing an input
-  (a feature, the key, the table) cancels the running job: it is no longer
-  active, but its harpy call cannot be interrupted and runs to completion.
+- **Promotion:** after a job created a new table (create-table mode, "Create
+  table..." in the Table drop-down), the widget switches its selection from
+  "create `<table>`" to the existing `<table>`. The next Calculate then updates
+  that table instead of trying to create it again.
+- **Active job:** the running job while the current selection is the one it
+  was launched for. Changing an input (a feature, the key, the table) detaches
+  it: it is no longer active, but its harpy call cannot be interrupted and runs
+  to completion. Changing the input back makes it active again, and promotion
+  does not detach it: the selection is still that job's, now as an existing
+  table. Calculate stays disabled until the
+  job has finished writing, because harpy does not protect concurrent writers
+  to one store, so a widget has at most one job. Nothing is queued: the user
+  clicks Calculate again afterwards.
 
 ## Entry points
 
@@ -52,7 +58,7 @@ flowchart TD
         h_entry(["compute_features_for_classifier<br/>(also via apply_classifier_with_feature_extraction)"]) --> h_core["calculate_feature_matrix<br/>overwrite_feature_key: the caller's flag<br/>confirmed_existing_entry: None"]
         h_core --> h_bundle["Check the new matrix against the classifier;<br/>apply_classifier_with_feature_extraction<br/>then applies it"]
     end
-    subgraph widget["Widget, main thread (planned)"]
+    subgraph widget["Widget, main thread"]
         w_click(["Calculate"]) --> w_create{"Create a new table?"}
         w_create -- yes --> w_launch_new["Launch: overwrite False,<br/>confirmed None"]
         w_create -- no --> w_dirty{"Backed, and the obsm or metadata<br/>path of the key has unsaved changes?"}
@@ -72,15 +78,17 @@ flowchart TD
     w_request --> w_worker["Worker thread:<br/>calculate_feature_matrix"]
 ```
 
-The unsaved-changes block exists only in the widget, because dirty state lives
-in `SpatiatoAppState` on the main thread. The worker's re-check does not repeat
-it; a change made between launch and the re-check is not caught (accepted).
+The unsaved-changes block runs only on the main thread, at launch: dirty state
+lives in `SpatiatoAppState`, so the widget passes the table's dirty paths to the
+controller's `check_existing_feature_matrix(...)`, which applies the block. The
+worker's re-check does not repeat it; a change made between launch and the
+re-check is not caught (accepted).
 
 ## Classification in `check_existing_feature_matrix`
 
 `check_existing_feature_matrix(...)` classifies the existing entry without
-changing anything. The widget calls it on the main thread to pick a dialog
-(planned), and `calculate_feature_matrix(...)` calls it again in the worker. It
+changing anything. The widget calls it on the main thread to pick a dialog,
+and `calculate_feature_matrix(...)` calls it again in the worker. It
 raises when no update can succeed: rows that harpy would reject, an unknown
 channel or a missing image, or a backed table that is not in the store.
 
@@ -175,34 +183,38 @@ flowchart TD
 | Metadata without a matrix                              | absent, orphaned metadata replaced         | the same, for metadata in the store or in memory                                         |
 | Matrix only in memory (never saved)                    | –                                          | incompatible, "it is not saved": full replacement                                        |
 | Matrix only in the store (changed outside Spatiato)    | –                                          | the stored entry is checked; a regional update brings its other rows back into memory    |
-| Unsaved changes to a stored entry, tracked by Spatiato | –                                          | widget: blocked at launch (planned); headless: the store wins                            |
+| Unsaved changes to a stored entry, tracked by Spatiato | –                                          | widget: blocked at launch; headless: the store wins                                      |
 | Changes Spatiato does not track (notebook, other process) | –                                       | the store wins silently (accepted, as in harpy)                                          |
 | Rows invalid, or differ between memory and store       | invalid rows: raise before any change      | raise before any change                                                                  |
 | Where the result lands                                 | memory; the widget marks the paths dirty   | store and memory; already persisted                                                      |
 
-## After the worker (planned)
+## After the worker
 
 The worker returns the `FeatureMatrixCalculation` of the core, or raises. The
 controller decides what to publish. Jobs that are no longer active still
 publish their table change, because the harpy call cannot be interrupted and
-still writes.
+still writes. A returned job also refreshes the widget's table choices, since it
+may have created a table. The current selection is kept, unless the created
+table is still the create-table target: then it is promoted to an existing
+table.
 
 ```mermaid
 flowchart TD
     finished(["Worker returns or raises"]) --> same{"Widget open, and the job's<br/>SpatialData still selected?"}
     same -- no --> ignore[/"Nothing"/]
     same -- yes --> outcome{"Outcome?"}
-    outcome -- returned --> event_ok["Event: change kind and regions<br/>from FeatureMatrixCalculation"]
+    outcome -- returned --> refresh["Refresh table choices:<br/>keep the selection, or promote<br/>the table just created"]
+    refresh --> event_ok["Event: change kind and regions<br/>from FeatureMatrixCalculation"]
     outcome -- FeatureMatrixRemovedError --> event_removed["Event: removed,<br/>every region of the table"]
     outcome -- "any other error" --> active_error{"Active job?"}
     active_error -- yes --> status_error[/"Status: calculation failed"/]
     active_error -- no --> ignore
     event_ok --> active_ok{"Active job?"}
-    active_ok -- yes --> refresh["Refresh table choices;<br/>success status"]
+    active_ok -- yes --> status_ok[/"Status: wrote the matrix"/]
     event_removed --> active_removed{"Active job?"}
     active_removed -- yes --> status_removed[/"Status: the previous<br/>matrix was removed"/]
     event_ok & event_removed --> record{"Backed?"}
-    record -- yes --> persisted["record_persisted_table_change:<br/>already on disk; dirty state reconciled<br/>with the snapshot taken at launch"]
+    record -- yes --> persisted["record_persisted_table_change:<br/>already on disk; the job's launch snapshot<br/>clears what was dirty at launch"]
     record -- no --> mutation["record_table_mutation:<br/>the paths become dirty"]
     persisted & mutation --> consumers["Object Classification: updated on its key<br/>invalidates the classifier;<br/>a removed key rebinds its selection"]
 ```
@@ -214,7 +226,7 @@ Classification only invalidates its classifier on `updated`.
 
 ## Errors and outcomes
 
-| Error                                                   | Raised by                                          | Table changed? | Widget (planned)                                  | Headless   |
+| Error                                                   | Raised by                                          | Table changed? | Widget                                            | Headless   |
 | ------------------------------------------------------- | -------------------------------------------------- | -------------- | ------------------------------------------------- | ---------- |
 | Unsaved changes to the key (backed)                     | widget, before the check                           | no             | status, nothing launched                          | –          |
 | Rows harpy would reject                                 | `_validate_table_rows`, in the check               | no             | main thread: status; worker: status               | exception  |
