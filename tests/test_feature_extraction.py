@@ -1,15 +1,20 @@
 from __future__ import annotations
 
-import sys
-from types import SimpleNamespace
-
+import harpy as hp
 import numpy as np
 import pytest
 from qtpy.QtCore import QObject, Signal
 from spatialdata import SpatialData
 
-from spatiato._app_state import TableReloadRequest
+from spatiato._app_state import TableDirtySnapshot, TableReloadRequest
+from spatiato.core.feature_extraction import (
+    ExistingFeatureMatrix,
+    FeatureMatrixCalculation,
+    FeatureMatrixRemovedError,
+)
 from spatiato.core.persistence import TableComponentPath
+from spatiato.core.spatialdata import get_table_metadata
+from spatiato.widgets.feature_extraction import controller as controller_module
 from spatiato.widgets.feature_extraction.controller import (
     FEATURE_EXTRACTION_IDLE_STATUS,
     FeatureExtractionBindingState,
@@ -41,7 +46,9 @@ class _DeferredWorker(QObject):
 
     def emit_returned(self) -> None:
         assert self._result is not None
-        self.returned.emit(self._result)
+        # Like superqt's `WorkerBase.run()`: no `returned` after `quit()`.
+        if not self.quit_called:
+            self.returned.emit(self._result)
         self.finished.emit()
 
     def emit_errored(self, error: Exception) -> None:
@@ -57,7 +64,7 @@ def test_feature_extraction_controller_starts_idle() -> None:
 
     assert controller.status_message == FEATURE_EXTRACTION_IDLE_STATUS
     assert controller.status_kind == "warning"
-    assert controller.is_running is False
+    assert controller.has_job_in_flight is False
     assert controller.can_calculate is False
 
 
@@ -152,7 +159,7 @@ def test_feature_extraction_controller_bind_is_passive_and_ready_for_existing_ta
     assert context_changed is True
     assert controller.status_message == "Feature extraction: ready to calculate."
     assert controller.status_kind == "success"
-    assert controller.is_running is False
+    assert controller.has_job_in_flight is False
     assert controller.can_calculate is True
 
 
@@ -222,7 +229,7 @@ def test_feature_extraction_controller_bind_is_ready_for_create_table(
     assert controller.status_kind == "success"
     assert controller.can_calculate is True
     assert isinstance(job, FeatureExtractionJob)
-    assert job.change_kind == "created"
+    assert job.request.confirmed_existing_entry is None
     assert job.request.create_table is True
     assert job.request.table_name == "features_table"
     assert job.request.harpy_table_name is None
@@ -618,6 +625,7 @@ def test_feature_extraction_controller_requests_table_selection_refresh_on_succe
         labels_names=("blobs_labels",),
         table_name="table",
         feature_key="feature_matrix_1",
+        regions=("blobs_labels",),
     )
     deferred_worker = _DeferredWorker(result)
 
@@ -650,7 +658,7 @@ def test_feature_extraction_controller_requests_table_selection_refresh_on_succe
         == 'Feature extraction: wrote "feature_matrix_1" into table "table" as ".obsm[\'feature_matrix_1\']" '
         "with metadata in \".uns['feature_matrices']['feature_matrix_1']\"."
     )
-    assert controller.is_running is False
+    assert controller.has_job_in_flight is False
 
 
 def test_feature_extraction_controller_notifies_feature_matrix_change_on_success(sdata_blobs: SpatialData) -> None:
@@ -660,6 +668,7 @@ def test_feature_extraction_controller_notifies_feature_matrix_change_on_success
         labels_names=("blobs_labels",),
         table_name="table",
         feature_key="feature_matrix_1",
+        regions=("blobs_labels",),
         change_kind="created",
     )
     deferred_worker = _DeferredWorker(result)
@@ -697,6 +706,7 @@ def test_feature_extraction_controller_calculate_accepts_one_shot_overwrite_over
             labels_names=("blobs_labels",),
             table_name="table",
             feature_key="feature_matrix_1",
+            regions=("blobs_labels",),
         )
     )
 
@@ -733,6 +743,7 @@ def test_feature_extraction_controller_calculate_launches_job_with_selected_chan
             labels_names=("blobs_labels",),
             table_name="table",
             feature_key="feature_matrix_1",
+            regions=("blobs_labels",),
         )
     )
 
@@ -760,17 +771,162 @@ def test_feature_extraction_controller_calculate_launches_job_with_selected_chan
     assert captured_channels == [("0", "2")]
 
 
+def test_feature_extraction_controller_calculate_passes_confirmed_entry_and_dirty_snapshot(
+    sdata_blobs: SpatialData,
+) -> None:
+    captured_jobs: list[FeatureExtractionJob] = []
+    controller = FeatureExtractionController()
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    dirty_snapshot = TableDirtySnapshot(sdata=sdata_blobs, table_name="table", captured_path_tokens=())
+
+    def capture_worker(job: FeatureExtractionJob) -> _DeferredWorker:
+        captured_jobs.append(job)
+        return _DeferredWorker()
+
+    controller._create_feature_extraction_worker = capture_worker  # type: ignore[method-assign]
+
+    assert (
+        controller.calculate(
+            overwrite_feature_key=True,
+            confirmed_existing_entry="compatible",
+            dirty_snapshot=dirty_snapshot,
+        )
+        is True
+    )
+    (job,) = captured_jobs
+    assert job.request.confirmed_existing_entry == "compatible"
+    assert job.dirty_snapshot is dirty_snapshot
+
+
+def test_feature_extraction_controller_checks_existing_feature_matrix(sdata_blobs: SpatialData) -> None:
+    controller = FeatureExtractionController()
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+
+    existing = controller.check_existing_feature_matrix(dirty_paths=())
+
+    assert existing is not None
+    assert existing.kind == "absent"
+
+
+def test_feature_extraction_controller_reports_check_errors_in_its_status(sdata_blobs: SpatialData) -> None:
+    controller = FeatureExtractionController()
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    table = sdata_blobs["table"]
+    instance_key = get_table_metadata(sdata_blobs, "table").instance_key
+    instance_ids = table.obs[instance_key].to_numpy().copy()
+    instance_ids[1] = instance_ids[0]
+    table.obs[instance_key] = instance_ids
+
+    assert controller.check_existing_feature_matrix(dirty_paths=()) is None
+    assert controller.status_kind == "error"
+    assert "pairs must be non-null and unique" in controller.status_message
+
+
+@pytest.mark.parametrize(
+    "dirty_path",
+    [
+        TableComponentPath("obsm", ("feature_matrix_1",)),
+        TableComponentPath("uns", ("feature_matrices", "feature_matrix_1")),
+        TableComponentPath("uns", ("feature_matrices",)),
+    ],
+)
+def test_feature_extraction_controller_blocks_unsaved_changes_to_the_key_when_backed(
+    backed_sdata_blobs: SpatialData,
+    dirty_path: TableComponentPath,
+) -> None:
+    controller = FeatureExtractionController()
+    controller.bind(backed_sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+
+    assert controller.check_existing_feature_matrix(dirty_paths={dirty_path}) is None
+    assert controller.status_kind == "error"
+    assert controller.status_message == (
+        'Feature extraction: feature matrix "feature_matrix_1" has unsaved changes; write or reload the table first.'
+    )
+
+
+@pytest.mark.parametrize(
+    "dirty_path",
+    [
+        TableComponentPath("uns", ("feature_matrices", "feature_matrix_2")),
+        TableComponentPath("obs", ("annotation",)),
+    ],
+)
+def test_feature_extraction_controller_allows_unsaved_changes_elsewhere_when_backed(
+    backed_sdata_blobs: SpatialData,
+    dirty_path: TableComponentPath,
+) -> None:
+    controller = FeatureExtractionController()
+    controller.bind(backed_sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+
+    existing = controller.check_existing_feature_matrix(dirty_paths={dirty_path})
+
+    assert existing is not None
+    assert existing.kind == "absent"
+
+
+def test_feature_extraction_controller_ignores_unsaved_changes_when_unbacked(sdata_blobs: SpatialData) -> None:
+    controller = FeatureExtractionController()
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+
+    # Unbacked, harpy merges with the matrix in memory, so nothing is dropped; and
+    # since unbacked data can't be written or reloaded, a block here would stop
+    # every recalculation of the key.
+    existing = controller.check_existing_feature_matrix(dirty_paths={TableComponentPath("obsm", ("feature_matrix_1",))})
+
+    assert existing is not None
+    assert existing.kind == "absent"
+
+
+def test_run_feature_extraction_job_reports_change_kind_and_regions_of_the_core(
+    monkeypatch,
+    sdata_blobs: SpatialData,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_calculate_feature_matrix(sdata: SpatialData, **kwargs: object) -> FeatureMatrixCalculation:
+        captured_kwargs.update(kwargs)
+        return FeatureMatrixCalculation(
+            ExistingFeatureMatrix("incompatible", "it is not saved"),
+            "updated",
+            ("blobs_labels", "blobs_labels_2"),
+        )
+
+    monkeypatch.setattr(controller_module, "calculate_feature_matrix", fake_calculate_feature_matrix)
+    dirty_snapshot = TableDirtySnapshot(sdata=sdata_blobs, table_name="table", captured_path_tokens=())
+
+    result = _run_feature_extraction_job.__wrapped__(
+        FeatureExtractionJob(
+            job_id=3,
+            sdata=sdata_blobs,
+            request=FeatureExtractionRequest(
+                triplets=(FeatureExtractionTriplet("global", "blobs_labels", None),),
+                table_name="table",
+                create_table=False,
+                feature_names=("area",),
+                feature_key="feature_matrix_1",
+                overwrite_feature_key=True,
+                confirmed_existing_entry="incompatible",
+            ),
+            dirty_snapshot=dirty_snapshot,
+        )
+    )
+
+    assert captured_kwargs["confirmed_existing_entry"] == "incompatible"
+    assert captured_kwargs["overwrite_feature_key"] is True
+    assert captured_kwargs["create_table"] is False
+    assert result.change_kind == "updated"
+    assert result.regions == ("blobs_labels", "blobs_labels_2")
+    assert result.labels_names == ("blobs_labels",)
+    assert result.dirty_snapshot is dirty_snapshot
+
+
 def test_run_feature_extraction_job_passes_channels_to_harpy(monkeypatch, sdata_blobs: SpatialData) -> None:
     captured_kwargs: dict[str, object] = {}
 
     def fake_add_feature_matrix(**kwargs):
         captured_kwargs.update(kwargs)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "harpy",
-        SimpleNamespace(tb=SimpleNamespace(add_feature_matrix=fake_add_feature_matrix)),
-    )
+    monkeypatch.setattr(hp.tb, "add_feature_matrix", fake_add_feature_matrix)
 
     result = _run_feature_extraction_job.__wrapped__(
         FeatureExtractionJob(
@@ -803,6 +959,8 @@ def test_run_feature_extraction_job_passes_channels_to_harpy(monkeypatch, sdata_
         labels_names=("blobs_labels",),
         table_name="table",
         feature_key="feature_matrix_1",
+        regions=("blobs_labels",),
+        change_kind="created",
     )
 
 
@@ -815,11 +973,7 @@ def test_run_feature_extraction_job_submits_multi_target_request_to_harpy(
     def fake_add_feature_matrix(**kwargs):
         captured_kwargs.update(kwargs)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "harpy",
-        SimpleNamespace(tb=SimpleNamespace(add_feature_matrix=fake_add_feature_matrix)),
-    )
+    monkeypatch.setattr(hp.tb, "add_feature_matrix", fake_add_feature_matrix)
 
     result = _run_feature_extraction_job.__wrapped__(
         FeatureExtractionJob(
@@ -862,6 +1016,8 @@ def test_run_feature_extraction_job_submits_multi_target_request_to_harpy(
         labels_names=("blobs_labels", "blobs_multiscale_labels"),
         table_name="table",
         feature_key="feature_matrix_batch",
+        regions=("blobs_labels", "blobs_multiscale_labels"),
+        change_kind="created",
     )
     assert result.triplet_count == 2
 
@@ -884,11 +1040,7 @@ def test_run_feature_extraction_job_fills_one_feature_matrix_for_multiple_region
         features[region_values == "blobs_labels_2", 0] = 2.0
         table.obsm[feature_key] = features
 
-    monkeypatch.setitem(
-        sys.modules,
-        "harpy",
-        SimpleNamespace(tb=SimpleNamespace(add_feature_matrix=fake_add_feature_matrix)),
-    )
+    monkeypatch.setattr(hp.tb, "add_feature_matrix", fake_add_feature_matrix)
 
     result = _run_feature_extraction_job.__wrapped__(
         FeatureExtractionJob(
@@ -924,6 +1076,8 @@ def test_run_feature_extraction_job_fills_one_feature_matrix_for_multiple_region
         labels_names=("blobs_labels", "blobs_labels_2"),
         table_name="table_multi",
         feature_key=feature_key,
+        regions=("blobs_labels", "blobs_labels_2"),
+        change_kind="created",
     )
     assert result.triplet_count == 2
     assert features.shape == (table.n_obs, 1)
@@ -940,11 +1094,7 @@ def test_run_feature_extraction_job_submits_create_table_request_to_harpy(
     def fake_add_feature_matrix(**kwargs):
         captured_kwargs.update(kwargs)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "harpy",
-        SimpleNamespace(tb=SimpleNamespace(add_feature_matrix=fake_add_feature_matrix)),
-    )
+    monkeypatch.setattr(hp.tb, "add_feature_matrix", fake_add_feature_matrix)
 
     result = _run_feature_extraction_job.__wrapped__(
         FeatureExtractionJob(
@@ -976,6 +1126,8 @@ def test_run_feature_extraction_job_submits_create_table_request_to_harpy(
         labels_names=("blobs_labels",),
         table_name="features_table",
         feature_key="feature_matrix_1",
+        regions=("blobs_labels",),
+        change_kind="created",
     )
 
 
@@ -1005,7 +1157,7 @@ def test_feature_extraction_controller_propagates_worker_errors(sdata_blobs: Spa
     assert refresh_requests == []
     assert controller.status_kind == "error"
     assert controller.status_message == "Feature extraction: calculation failed: boom"
-    assert controller.is_running is False
+    assert controller.has_job_in_flight is False
 
 
 def test_feature_extraction_controller_requests_selection_refresh_before_feature_matrix_change(
@@ -1017,6 +1169,7 @@ def test_feature_extraction_controller_requests_selection_refresh_before_feature
         labels_names=("blobs_labels",),
         table_name="table",
         feature_key="feature_matrix_1",
+        regions=("blobs_labels",),
         change_kind="created",
     )
     deferred_worker = _DeferredWorker(result)
@@ -1046,19 +1199,28 @@ def test_feature_extraction_controller_requests_selection_refresh_before_feature
     assert notification_order == ["table:table", "event:table"]
 
 
-def test_feature_extraction_controller_drops_stale_results_after_rebinding(sdata_blobs: SpatialData) -> None:
+def test_feature_extraction_controller_publishes_detached_job_result_without_status(sdata_blobs: SpatialData) -> None:
+    """After a detached job returns, its table change is published, but not its status.
+
+    The table was still written, so the table choices are refreshed and
+    `on_feature_matrix_changed` fires (the widget turns it into a
+    `TableStateChangedEvent`). The status follows the current selection instead
+    of reporting the write.
+    """
     refresh_requests: list[str] = []
-    deferred_worker = _DeferredWorker(
-        FeatureExtractionResult(
-            job_id=1,
-            labels_names=("blobs_labels",),
-            table_name="table",
-            feature_key="feature_matrix_1",
-        )
+    changed_results: list[FeatureExtractionResult] = []
+    result = FeatureExtractionResult(
+        job_id=1,
+        labels_names=("blobs_labels",),
+        table_name="table",
+        feature_key="feature_matrix_1",
+        regions=("blobs_labels",),
     )
+    deferred_worker = _DeferredWorker(result)
 
     controller = FeatureExtractionController(
         on_table_selection_refresh_required=lambda result: refresh_requests.append(result.table_name),
+        on_feature_matrix_changed=changed_results.append,
     )
     controller.bind(
         sdata_blobs,
@@ -1084,20 +1246,165 @@ def test_feature_extraction_controller_drops_stale_results_after_rebinding(sdata
         "feature_matrix_2",
     )
 
-    assert deferred_worker.quit_called is True
-    assert controller.status_message == "Feature extraction: ready to calculate."
+    assert controller.has_job_in_flight is True
+    assert controller.status_message == "Feature extraction: waiting for the previous calculation to finish writing."
 
     deferred_worker.emit_returned()
 
-    assert refresh_requests == []
+    assert changed_results == [result]
+    assert refresh_requests == ["table"]
     assert controller.status_message == "Feature extraction: ready to calculate."
     assert controller.status_kind == "success"
 
 
-def test_feature_extraction_controller_blocks_matching_reload_until_every_superseded_worker_finishes(
+def test_feature_extraction_controller_reattaches_job_when_the_inputs_change_back(sdata_blobs: SpatialData) -> None:
+    """A job is detached only while the selection differs from the one it was launched for."""
+    deferred_worker = _DeferredWorker(
+        FeatureExtractionResult(
+            job_id=1,
+            labels_names=("blobs_labels",),
+            table_name="table",
+            feature_key="feature_matrix_1",
+            regions=("blobs_labels",),
+        )
+    )
+    controller = FeatureExtractionController()
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
+
+    assert controller.calculate() is True
+    calculating_status = controller.status_message
+
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_2")
+
+    assert controller.status_message == "Feature extraction: waiting for the previous calculation to finish writing."
+
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+
+    assert controller.status_message == calculating_status
+
+    deferred_worker.emit_returned()
+
+    assert controller.status_kind == "success"
+    assert controller.status_message.startswith('Feature extraction: wrote "feature_matrix_1" into table "table"')
+
+
+def test_feature_extraction_controller_ignores_detached_job_of_another_spatialdata(
+    sdata_blobs: SpatialData,
+    sdata_blobs_multi_region: SpatialData,
+) -> None:
+    changed_results: list[FeatureExtractionResult] = []
+    deferred_worker = _DeferredWorker(
+        FeatureExtractionResult(
+            job_id=1,
+            labels_names=("blobs_labels",),
+            table_name="table",
+            feature_key="feature_matrix_1",
+            regions=("blobs_labels",),
+        )
+    )
+    controller = FeatureExtractionController(on_feature_matrix_changed=changed_results.append)
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
+
+    assert controller.calculate() is True
+    controller.bind(
+        sdata_blobs_multi_region, "blobs_labels", None, "table_multi", "global", ["area"], "feature_matrix_1"
+    )
+    deferred_worker.emit_returned()
+
+    # The event would be built for the selected SpatialData, which is not the job's.
+    assert changed_results == []
+
+
+def test_feature_extraction_controller_publishes_removal_when_extraction_fails_after_it(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    refresh_requests: list[str] = []
+    changed_results: list[FeatureExtractionResult] = []
+    deferred_worker = _DeferredWorker()
+    controller = FeatureExtractionController(
+        on_table_selection_refresh_required=lambda result: refresh_requests.append(result.table_name),
+        on_feature_matrix_changed=changed_results.append,
+    )
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
+    dirty_snapshot = TableDirtySnapshot(sdata=sdata_blobs, table_name="table", captured_path_tokens=())
+
+    assert (
+        controller.calculate(
+            overwrite_feature_key=True,
+            confirmed_existing_entry="incompatible",
+            dirty_snapshot=dirty_snapshot,
+        )
+        is True
+    )
+    deferred_worker.emit_errored(
+        FeatureMatrixRemovedError(
+            table_name="table",
+            feature_key="feature_matrix_1",
+            regions=("blobs_labels", "blobs_labels_2"),
+            error=RuntimeError("boom"),
+        )
+    )
+
+    assert changed_results == [
+        FeatureExtractionResult(
+            job_id=1,
+            labels_names=("blobs_labels",),
+            table_name="table",
+            feature_key="feature_matrix_1",
+            regions=("blobs_labels", "blobs_labels_2"),
+            change_kind="removed",
+            dirty_snapshot=dirty_snapshot,
+        )
+    ]
+    assert refresh_requests == []
+    assert controller.status_kind == "error"
+    assert controller.status_message == (
+        'Feature extraction failed; the previous feature matrix "feature_matrix_1" was removed: boom'
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_change_kinds"),
+    [
+        (
+            FeatureMatrixRemovedError(
+                table_name="table",
+                feature_key="feature_matrix_1",
+                regions=("blobs_labels",),
+                error=RuntimeError("boom"),
+            ),
+            ["removed"],
+        ),
+        (RuntimeError("boom"), []),
+    ],
+)
+def test_feature_extraction_controller_reports_detached_job_failure_as_event_only(
+    sdata_blobs: SpatialData,
+    error: Exception,
+    expected_change_kinds: list[str],
+) -> None:
+    changed_results: list[FeatureExtractionResult] = []
+    deferred_worker = _DeferredWorker()
+    controller = FeatureExtractionController(on_feature_matrix_changed=changed_results.append)
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
+
+    assert controller.calculate() is True
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_2")
+    deferred_worker.emit_errored(error)
+
+    assert [result.change_kind for result in changed_results] == expected_change_kinds
+    assert controller.status_message == "Feature extraction: ready to calculate."
+
+
+def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_detached_worker_finishes(
+    sdata_blobs: SpatialData,
+) -> None:
+    state_changes: list[str] = []
+    controller = FeatureExtractionController(on_state_changed=lambda: state_changes.append("changed"))
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -1116,6 +1423,7 @@ def test_feature_extraction_controller_blocks_matching_reload_until_every_supers
                 labels_names=job.labels_names,
                 table_name=job.table_name,
                 feature_key=job.feature_key,
+                regions=job.labels_names,
             )
         )
         workers.append(worker)
@@ -1151,25 +1459,29 @@ def test_feature_extraction_controller_blocks_matching_reload_until_every_supers
         ["area"],
         "feature_matrix_2",
     )
-    assert workers[0].quit_called is True
-    assert controller.is_running is False
-    assert controller.has_in_flight_jobs is True
-
-    assert controller.calculate() is True
-    assert len(workers) == 2
-
-    workers[0].emit_finished()
-
-    assert controller.is_running is True
-    assert controller.has_in_flight_jobs is True
+    assert controller.has_job_in_flight is True
     with pytest.raises(RuntimeError, match="Feature Extraction is still writing it"):
         controller.prepare_for_table_reload(matching_request)
 
-    workers[1].emit_finished()
+    # harpy does not protect concurrent writers, so the next launch waits too.
+    waiting_status = "Feature extraction: waiting for the previous calculation to finish writing."
+    assert controller.can_calculate is False
+    assert controller.status_message == waiting_status
+    assert controller.calculate() is False
+    assert len(workers) == 1
+    assert controller.status_message == waiting_status
 
-    assert controller.is_running is False
-    assert controller.has_in_flight_jobs is False
+    state_changes.clear()
+    workers[0].emit_finished()
+
+    assert controller.has_job_in_flight is False
+    assert state_changes, "the widget must learn that Calculate is available again"
+    assert controller.can_calculate is True
+    assert controller.status_message == "Feature extraction: ready to calculate."
     controller.prepare_for_table_reload(matching_request)
+
+    assert controller.calculate() is True
+    assert len(workers) == 2
 
 
 def test_feature_extraction_controller_defers_reload_participant_release_until_workers_finish(
@@ -1195,11 +1507,10 @@ def test_feature_extraction_controller_defers_reload_participant_release_until_w
     controller.release_reload_participant_when_safe(lambda: released.append("released"))
 
     assert worker.quit_called is True
-    assert controller.is_running is False
-    assert controller.has_in_flight_jobs is True
+    assert controller.has_job_in_flight is True
     assert released == []
 
     worker.emit_finished()
 
-    assert controller.has_in_flight_jobs is False
+    assert controller.has_job_in_flight is False
     assert released == ["released"]
