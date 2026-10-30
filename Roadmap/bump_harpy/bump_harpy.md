@@ -400,9 +400,10 @@ Spatiato's own table I/O code, is the core of this bump. Order:
        that needs only `obs` and `uns` and blocks Train early: the table has
        rows for the labels element (`obs`, `uns["spatialdata_attrs"]`), the
        matrix exists with registered metadata, it has columns, and there are
-       enough labeled rows in at least two classes. Only a labels element whose
-       rows exist but have no features (for example, not covered by a regional
-       extraction) needs the job's read of `obsm`;
+       enough labeled rows in at least two classes. Every job reads `obsm` to
+       train and predict. The one problem that only shows up there is a labels
+       element whose rows exist but have no features (for example, not covered
+       by a regional extraction): the job skips those rows and reports it;
      - the job carries the matrix object and the row positions instead of
        copies made on the main thread. The worker reads the labeled training
        rows and the prediction rows, drops rows with non-finite values (labels
