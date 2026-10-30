@@ -31,6 +31,15 @@ _SPARSE_REPRESENTATIONS = (
     "backed_csc",
 )
 _REPRESENTATIONS = _DENSE_REPRESENTATIONS + _SPARSE_REPRESENTATIONS
+# What harpy's reader must return for the representations read from the store.
+_STORE_REPRESENTATION_TYPES: dict[str, type] = {
+    "lazy_dense": da.Array,
+    "lazy_csr": da.Array,
+    "lazy_csc": da.Array,
+    "backed_dense": zarr.Array,
+    "backed_csr": CSRDataset,
+    "backed_csc": CSCDataset,
+}
 
 
 def _dense_values() -> np.ndarray:
@@ -88,19 +97,16 @@ def _representation(name: str, store: Path) -> tuple[Any, np.ndarray]:
         "backed_csr": lambda: _read_component(store, ("X",), "backed"),
         "backed_csc": lambda: _read_component(store, ("layers", "csc"), "backed"),
     }
+    matrix = factories[name]()
+    # Test setup: without these checks, a change in harpy's reader would let the
+    # tests run on other representations than their names say.
+    expected_type = _STORE_REPRESENTATION_TYPES.get(name)
+    if expected_type is not None:
+        assert isinstance(matrix, expected_type), f"{name!r} is a {type(matrix).__name__}"
+    if name == "lazy_csr":
+        assert matrix.numblocks[0] > 1, "'lazy_csr' must span several Dask blocks"
     reference = dense if name in _DENSE_REPRESENTATIONS else csr.toarray()
-    return factories[name](), reference
-
-
-def test_representations_have_the_type_their_name_says(table_store: Path) -> None:
-    lazy_csr, _ = _representation("lazy_csr", table_store)
-    assert isinstance(lazy_csr, da.Array)
-    assert lazy_csr.numblocks[0] > 1
-    assert isinstance(_representation("lazy_dense", table_store)[0], da.Array)
-    assert isinstance(_representation("lazy_csc", table_store)[0], da.Array)
-    assert isinstance(_representation("backed_dense", table_store)[0], zarr.Array)
-    assert isinstance(_representation("backed_csr", table_store)[0], CSRDataset)
-    assert isinstance(_representation("backed_csc", table_store)[0], CSCDataset)
+    return matrix, reference
 
 
 def _assert_in_memory_values(result: Any, expected: np.ndarray) -> None:
