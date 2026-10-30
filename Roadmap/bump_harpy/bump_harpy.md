@@ -457,6 +457,91 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    Needed regardless of D1: harpy already attaches lazy matrices after a backed
    extraction, and P2 was hit in real use. This step comes before the reader
    switch, which would otherwise spread the P2 bug to every table.
+
+   Readiness check (2026-10-30): 3a-3c are ready to implement; 3d needs the
+   four design points below settled first. Sub-steps, each committed
+   separately:
+
+   | Sub-step | Content | Ready? |
+   |---|---|---|
+   | 3a | Matrix helpers, with unit tests per representation | yes |
+   | 3b | Coloring by `X` var through the column helper (P2) | yes |
+   | 3c | Shape and dtype without loading (metadata inspection and registration, export and column checks), spatial query through the helpers, the P1 safeguard | yes |
+   | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | after design points 1-4 |
+
+   Facts for the helpers, checked at runtime (anndata 0.13.4, dask 2026.8.0,
+   zarr 3.2.1) on matrices written with anndata and read back through harpy's
+   reader in lazy and backed mode:
+   - sparse without reading: `issparse(x._meta)` for Dask,
+     `isinstance(x, anndata.abc.CSRDataset)` (or `CSCDataset`) for backed
+     handles; `issparse(x)` is False for both;
+   - rows: `x[positions]` with a sorted NumPy position array works for every
+     representation (Dask then needs `.compute()`) and returns NumPy or SciPy,
+     in the input's sparse format. Pass a NumPy array, not a list: a list makes
+     `CSRDataset` read the whole matrix. `CSCDataset` always reads the whole
+     matrix for a row selection (rare: harpy writes dense `obsm` and CSR `X`);
+   - one column: `x[:, j:j+1]` is the only form that stays 2-D for every
+     representation; `x[:, j]` differs per representation and fails on a
+     multi-block Dask array of `csr_array` blocks;
+   - never `np.asarray(...)` on sparse representations: for SciPy sparse,
+     sparse Dask and `CSRDataset` it silently returns a 0-d object array.
+     Today's `normalize_feature_matrix(...)` relies on it;
+   - finite rows: `np.isfinite(m).all(axis=1)` for dense; through `indptr`
+     and `.data` for CSR; CSC needs `.tocsr()` first;
+   - computing Dask arrays and reading backed handles in worker threads works,
+     also concurrently;
+   - shape and dtype without loading must keep the checks
+     `normalize_feature_matrix(...)` makes today: 2-D (a 1-D matrix counts as
+     one column), the row count, and a numeric dtype (otherwise "invalid
+     matrix"). DataFrame entries have `.dtypes`, not `.dtype`; `CSRDataset`
+     has no `ndim`.
+
+   Also from the check: `_validate_canonical_matrix(...)` (spatial query)
+   rejects a sparse Dask or backed matrix only by accident (the 0-d result of
+   `np.asarray(...)` fails its shape check); the helpers' sparse detection
+   makes that explicit. The P1 safeguard belongs in
+   `calculate_feature_matrix(...)` after `hp.tb.add_feature_matrix(...)`; it
+   runs in the worker, where harpy already installs its results.
+
+   Design points for 3d (proposals, to settle before 3d). Today the summary's
+   "eligible rows" (scope rows with finite features) feed more than scoping:
+   1. **What is reported before a job.** The status card ("Prediction rows:
+      N"), the launch status ("… from N eligible rows …") and the "Need at
+      least …" messages use eligible counts. Proposal: before a job, report
+      the rows in the scope; the rows used and skipped are reported after the
+      job.
+   2. **The counts in `uns["classifier_config"]`.** `n_training_rows` and
+      `n_predicted_rows` come from the summary today
+      (`_build_classifier_config(...)`); they are persisted, and "Loaded
+      predictions for N objects" reads them back. Proposal: the job result
+      carries the counts and the predicted row positions, and both the config
+      and the prediction write (`_write_classifier_predictions(...)`, whose
+      fill positions are already a subset of the cleared ones) use them.
+   3. **Ineligibility found in the worker**: too few labeled rows, or fewer
+      than two classes, after skipping; or no usable rows in the prediction
+      scope. Today ineligibility is handled on the main thread by
+      `_apply_ineligible_state(...)` (clears the scope's predictions, writes
+      the config with `trained=False`). Proposal: the worker returns an
+      "ineligible" result with its reason, not an exception, and the main
+      thread passes it to `_apply_ineligible_state(...)`.
+   4. **Data structures.** `ResolvedClassifierScope` drops
+      `table_row_positions`, `n_eligible_rows` and
+      `n_excluded_feature_invalid_rows`; `ClassifierJob` carries the matrix
+      object and the positions instead of arrays copied on the main thread;
+      `ClassifierJobResult` gains the counts and the predicted positions. The
+      comments that state today's snapshot contract change with it
+      (`_prepare_classifier_job(...)`, `normalize_feature_matrix(...)`, the
+      `ClassifierJob` docstring). Safe: Spatiato never writes into `obsm`
+      arrays in place, and the job keeps its own reference to the matrix.
+
+   A behaviour change that follows: labeled counts and classes are counted
+   over all labeled rows in the scope, not only those with finite features,
+   which is why the worker checks them again. Tests: about 12 controller
+   tests, 3 widget tests and 1 multi-widget test build fake results from
+   `scope.table_row_positions` or assert eligible counts, and change with
+   point 4. The headless tests keep their field names
+   (`n_predicted_rows`, `n_skipped_feature_invalid_rows`). No test covers the
+   sparse finite check or most of the count messages today.
 4. **Swap the table I/O** (P5 writes, P4 reload):
    - writes through harpy's store-only `hp.tb.io.write_table_components(...)`
      and `delete_table_components(...)`. Spatiato's dirty tracking already
