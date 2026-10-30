@@ -2226,6 +2226,92 @@ def test_feature_extraction_widget_uses_existing_overwrite_prompt_after_created_
     assert recorder.launches == [{"overwrite_feature_key": True, "confirmed_existing_entry": "incompatible"}]
 
 
+def _launch_create_table_job(qtbot, sdata: SpatialData) -> tuple[FeatureExtractionWidget, _DeferredWorker]:
+    viewer = make_viewer_with_shared_sdata(sdata)
+    widget = FeatureExtractionWidget(viewer)
+    qtbot.addWidget(widget)
+    worker = _DeferredWorker()
+    widget._feature_extraction_controller._create_feature_extraction_worker = lambda _job: worker  # type: ignore[method-assign]
+    check_coordinate_system(widget, "global")
+    select_segmentation(widget, "global", 0)
+    widget.table_combo.setCurrentIndex(widget.table_combo.findText("Create table..."))
+    widget.new_table_name_line_edit.setText("new_table")
+    widget.findChild(QCheckBox, "feature_checkbox_area").setChecked(True)
+    widget.calculate_button.click()
+    assert worker.started is True
+    return widget, worker
+
+
+def _return_created_table(sdata: SpatialData, worker: _DeferredWorker) -> None:
+    # Stands in for harpy, which creates the table before the worker returns.
+    sdata.tables["new_table"] = sdata.tables["table"].copy()
+    worker.returned.emit(
+        FeatureExtractionResult(
+            job_id=1,
+            labels_names=("blobs_labels",),
+            table_name="new_table",
+            feature_key="features",
+            regions=("blobs_labels",),
+        )
+    )
+    worker.finished.emit()
+
+
+def test_feature_extraction_widget_reports_write_after_promoting_table_created_by_active_job(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget, worker = _launch_create_table_job(qtbot, sdata_blobs)
+    controller = widget._feature_extraction_controller
+
+    _return_created_table(sdata_blobs, worker)
+
+    assert widget.selected_table_mode == "existing"
+    assert widget.selected_table_name == "new_table"
+    assert controller.has_job_in_flight is False
+    assert controller.status_kind == "success"
+    assert controller.status_message.startswith('Feature extraction: wrote "features" into table "new_table"')
+    assert widget.calculate_button.isEnabled()
+
+
+def test_feature_extraction_widget_lists_table_created_by_detached_job_and_keeps_selection(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget, worker = _launch_create_table_job(qtbot, sdata_blobs)
+    widget.table_combo.setCurrentIndex(widget.table_combo.findText("table"))
+
+    assert widget.table_combo.findText("new_table") == -1
+
+    _return_created_table(sdata_blobs, worker)
+
+    assert widget.table_combo.findText("new_table") >= 0
+    assert widget.selected_table_mode == "existing"
+    assert widget.selected_table_name == "table"
+    assert widget._feature_extraction_controller.binding_state.table_name == "table"
+    assert widget._feature_extraction_controller.status_message == "Feature extraction: ready to calculate."
+
+
+def test_feature_extraction_widget_promotes_table_created_by_detached_job_that_is_still_the_target(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget, worker = _launch_create_table_job(qtbot, sdata_blobs)
+    # Changing only the key detaches the job; "new_table" stays the create-table target.
+    widget.output_key_line_edit.setText("features_2")
+
+    assert widget._feature_extraction_controller.status_message == (
+        "Feature extraction: waiting for the previous calculation to finish writing."
+    )
+
+    _return_created_table(sdata_blobs, worker)
+
+    assert widget.selected_table_mode == "existing"
+    assert widget.selected_table_name == "new_table"
+    assert widget._feature_extraction_controller.binding_state.create_table is False
+    assert widget._feature_extraction_controller.binding_state.feature_key == "features_2"
+
+
 def test_feature_extraction_widget_records_feature_matrix_change_in_shared_app_state(
     qtbot,
     sdata_blobs: SpatialData,
