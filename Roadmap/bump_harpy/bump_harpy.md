@@ -359,10 +359,13 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    - lazy views depend on the store: data overwritten outside Spatiato (a
      notebook, another process) is seen on the next read, as harpy documents;
    - P1 mostly disappears with step 3; reload reads lazily too (step 4);
-   - D1 is about matrices read from a store. On unbacked SpatialData a Dask
-     matrix is an in-memory graph with no store behind it, and harpy 0.5.2
-     keeps chaining merges onto it. The P1 safeguard computes it once after a
-     feature extraction (step 3); this does not contradict D1.
+   - on unbacked SpatialData whose caller attached a Dask matrix, harpy 0.5.2
+     keeps chaining regional merges onto it, because computing could read the
+     whole matrix from a store (the Dask array may still read from one).
+     Spatiato does not compute it either; feature extraction raises before
+     such a regional update, and tells the user to load the matrix into memory
+     or write to a store (decided on 2026-10-30, step 3, 3c.3; see P1,
+     "Resolution").
 
    Related points:
    - **Chunking** (a later optimization, out of scope for steps 3-5). Dask
@@ -450,9 +453,8 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    - spatial query's `obsm["spatial_canonical"]` (n × 2) stays as is:
      `np.asarray(...)` computes dense Dask and `zarr.Array`, and the helpers
      cover the rest;
-   - feature extraction on unbacked SpatialData gets the P1 safeguard: if
-     `obsm[feature_key]` is still a Dask array after extraction, compute it once
-     and reinstall it (see P1, "Resolution");
+   - feature extraction on unbacked SpatialData raises before a regional
+     update onto a matrix that is not in memory (see P1, "Resolution");
    - tests with lazy and backed matrices per consumer.
 
    Needed regardless of D1: harpy already attaches lazy matrices after a backed
@@ -467,8 +469,15 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    |---|---|---|
    | 3a | Matrix helpers, with unit tests per representation | implemented on 2026-10-30 (`core/table_matrix.py`, `tests/test_table_matrix.py`) |
    | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
-   | 3c | Shape and dtype without loading (metadata inspection and registration, export and column checks), spatial query through the helpers, the P1 safeguard | ready |
+   | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | ready |
+   | 3c.2 | Spatial query through the helpers: rows of one labels element with `read_matrix_rows(...)` (`core/spatial_query/centroids.py`, `annotation.py`), validation and cache update with `is_sparse_matrix(...)` and `read_matrix(...)` (`core/spatial_query/canonical.py`) | ready |
+   | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready, after 3c.1 and 3c.2 |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
+
+   3c.1-3c.3 are independent and committed separately; 3c.1 comes first,
+   because the classifier summary in 3d relies on its shape-only check, and
+   3c.3 comes last. 3c.3 replaces a safeguard that computed the matrix after
+   each extraction, dropped on 2026-10-30 (see P1, "Resolution").
 
    Facts for the helpers, checked at runtime (anndata 0.13.4, dask 2026.8.0,
    zarr 3.2.1) on matrices written with anndata and read back through harpy's
@@ -502,9 +511,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    Also from the check: `_validate_canonical_matrix(...)` (spatial query)
    rejects a sparse Dask or backed matrix only by accident (the 0-d result of
    `np.asarray(...)` fails its shape check); the helpers' sparse detection
-   makes that explicit. The P1 safeguard belongs in
-   `calculate_feature_matrix(...)` after `hp.tb.add_feature_matrix(...)`; it
-   runs in the worker, where harpy already installs its results.
+   makes that explicit.
 
    Design points for 3d (settled on 2026-10-30). Today the summary's
    "eligible rows" (scope rows with finite features) feed more than scoping:
@@ -718,14 +725,38 @@ Resolution:
   | Dask array | not measured | still chains: 104 tasks, 168 MiB held |
 
   Values are correct in every case.
-- **Spatiato**: only a safeguard is left. After extraction on unbacked
-  SpatialData, if `obsm[feature_key]` is still a Dask array (the attached matrix
-  was a Dask array before extraction, e.g. a table read lazily and attached to
-  in-memory SpatialData, or a custom Dask matrix), compute it once and
-  reinstall it. This stops the chain and gives interactive use an in-memory
-  matrix; it is a no-op for in-memory matrices. Planned in step 3 of the
-  "Migration Plan"; it does not contradict D1, which is about matrices read
-  from a store.
+- **Spatiato**: raise before such an update (decided on 2026-10-30; step 3,
+  3c.3). harpy 0.5.2 computes the merge only when the supplied and the
+  attached matrix are both in memory (`_components_by_region.py`: "Computing
+  reads nothing from storage"). When the attached matrix is not in memory (a
+  Dask array, or a `zarr.Array` or `CSRDataset` a caller attached), it keeps
+  chaining on unbacked SpatialData, on purpose: the matrix may still read from
+  a store, and computing would read all of it. Its docstring tells callers to
+  compute between repeated updates. That case only arises when a caller passes
+  such SpatialData (`Interactive(sdata)` or the headless API), for example a
+  table read lazily and attached to in-memory SpatialData, or a custom Dask
+  matrix. Spatiato's own reader gives backed SpatialData, where harpy writes to
+  the store and reattaches a fresh lazy read, so nothing chains.
+  - The check: `check_existing_feature_matrix(...)` raises `ValueError` when
+    the SpatialData is unbacked, the existing entry is compatible (a regional
+    update; on unbacked SpatialData, absent and incompatible entries give a
+    fresh in-memory matrix, and on backed SpatialData every write ends with a
+    fresh lazy read of the store, so nothing chains), and `obsm[feature_key]`
+    is not NumPy or SciPy CSR/CSC. Whether a Dask array
+    reads from a store cannot be detected reliably (harpy records it only in a
+    private registry), and the chain grows either way.
+  - The message says what to do: load the matrix into memory (for Dask,
+    `table.obsm[key] = table.obsm[key].compute()`) or write the SpatialData to
+    a store first. The widget shows it as a status and launches nothing; headless
+    raises; the worker's re-check raises too.
+  - Why raise, not warn: values stay correct, but memory and every later read
+    grow with each regional update, which a user only notices when it hurts; a
+    warning in napari's console is easily missed. Raising matches the contract
+    for unsupported encodings and P7's "check before changing anything", and
+    the case is rare.
+  - Dropped: a safeguard that computed the matrix after each extraction. It
+    would read the whole matrix, possibly from a store, against D1's "no
+    conversion; consumers handle any representation".
 
 Direction (settled with D1 on 2026-10-30, see "Migration Plan", step 3):
 
