@@ -20,6 +20,7 @@ from spatiato.core.class_palette import (
     validate_categorical_palette_source,
 )
 from spatiato.core.spatialdata import get_table, validate_table_binding
+from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
     build_string_categorical_values,
     default_categorical_palette_for_categories,
@@ -264,11 +265,7 @@ def _build_x_var_colormap(
     if np.any(obs_positions < 0):
         raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
 
-    column_values = table.X[obs_positions, int(var_index)]
-    if hasattr(column_values, "toarray"):
-        numeric_values = column_values.toarray().reshape(-1)
-    else:
-        numeric_values = np.asarray(column_values).reshape(-1)
+    numeric_values = read_matrix_column(table.X, int(var_index), rows=obs_positions)
     numeric_region_series = pd.Series(
         pd.to_numeric(numeric_values, errors="coerce").astype("float64"),
         index=region_rows.index,

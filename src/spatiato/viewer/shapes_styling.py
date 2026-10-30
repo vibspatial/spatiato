@@ -24,6 +24,7 @@ from spatiato.core.class_palette import (
     validate_categorical_palette_source,
 )
 from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata
+from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
     build_string_categorical_values,
     categorical_rgba_for_values,
@@ -568,11 +569,7 @@ def _get_table_color_values_by_instance(
         if np.any(obs_positions < 0):
             raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
 
-        column_values = table.X[obs_positions, int(var_index)]
-        if hasattr(column_values, "toarray"):
-            x_values = column_values.toarray().reshape(-1)
-        else:
-            x_values = np.asarray(column_values).reshape(-1)
+        x_values = read_matrix_column(table.X, int(var_index), rows=obs_positions)
         values = pd.Series(x_values, index=region_rows.index, name=var_name)
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
