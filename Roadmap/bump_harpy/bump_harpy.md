@@ -396,7 +396,8 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    only where they are used:
    - shared helpers: one turns any supported matrix, or selected rows of it,
      into NumPy or SciPy (NumPy, SciPy, dense and sparse Dask, `zarr.Array`,
-     `CSRDataset`/`CSCDataset`); one reads one column for coloring by var (P2);
+     `CSRDataset`/`CSCDataset`); one reads one column for coloring by var,
+     for the rows of one labels element only (P2);
    - shape and dtype from the matrix object, without loading:
      `inspect_feature_matrix_metadata(...)`,
      `register_feature_matrix_metadata(...)`,
@@ -462,12 +463,12 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    four design points for 3d below were settled the same day. Sub-steps, each
    committed separately:
 
-   | Sub-step | Content | Ready? |
+   | Sub-step | Content | Status |
    |---|---|---|
-   | 3a | Matrix helpers, with unit tests per representation | yes |
-   | 3b | Coloring by `X` var through the column helper (P2) | yes |
-   | 3c | Shape and dtype without loading (metadata inspection and registration, export and column checks), spatial query through the helpers, the P1 safeguard | yes |
-   | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | yes (design points 1-4 settled) |
+   | 3a | Matrix helpers, with unit tests per representation | implemented on 2026-10-30 (`core/table_matrix.py`, `tests/test_table_matrix.py`) |
+   | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
+   | 3c | Shape and dtype without loading (metadata inspection and registration, export and column checks), spatial query through the helpers, the P1 safeguard | ready |
+   | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
    Facts for the helpers, checked at runtime (anndata 0.13.4, dask 2026.8.0,
    zarr 3.2.1) on matrices written with anndata and read back through harpy's
@@ -482,7 +483,9 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      matrix for a row selection (rare: harpy writes dense `obsm` and CSR `X`);
    - one column: `x[:, j:j+1]` is the only form that stays 2-D for every
      representation; `x[:, j]` differs per representation and fails on a
-     multi-block Dask array of `csr_array` blocks;
+     multi-block Dask array of `csr_array` blocks. For the rows of one labels
+     element, read the rows first for matrices stored by rows (dense, CSR)
+     and the column first for CSC (see P2);
    - never `np.asarray(...)` on sparse representations: for SciPy sparse,
      sparse Dask and `CSRDataset` it silently returns a 0-d object array.
      Today's `normalize_feature_matrix(...)` relies on it;
@@ -784,17 +787,27 @@ Direction: one shared helper that turns any supported matrix type into an
 in-memory NumPy or SciPy array (NumPy, SciPy, dense Dask, sparse Dask, backed
 `zarr.Array`, `CSRDataset` / `CSCDataset`), and one helper that extracts a single
 column for `X`-var coloring without materializing the full matrix. Labels and
-shapes styling both use the column helper:
+shapes styling both use the column helper,
+`read_matrix_column(matrix, column, rows=obs_positions)` (step 3a), and cast
+the result to float64.
 
-- select the column first (`X[:, var_index]`), and `.compute()` it if it is a
-  Dask array;
-- if the result is sparse, call `.toarray()`; then
-  `np.asarray(..., dtype=np.float64).reshape(-1)`;
-- then select the rows with `[obs_positions]` in memory.
+Revised on 2026-10-30: the first direction was to select the column first
+(`X[:, var_index]`) and the region's rows afterwards, in memory. That reads the
+column for every row of the table, so for a CSR `X` (the usual case) every
+block of a lazy matrix, or every row of a `CSRDataset`, although coloring needs
+only the rows of one labels element. The helper now picks the order from how
+the matrix is stored:
 
-Selecting the column first avoids having Dask reorder all rows by a long
-position array on large tables. For Dask arrays of CSR blocks split by rows this
-still reads every block, but never builds the dense matrix.
+| Stored by | Read order | Reads |
+|---|---|---|
+| rows: dense, CSR (in memory, Dask, `CSRDataset`) | rows first, then the column in memory | only the blocks or rows of the labels element |
+| columns: CSC (in memory, Dask, `CSCDataset`) | the column first, then the rows in memory | one column block, or one column |
+| backed dense `zarr.Array` | rows and column in one orthogonal selection | only the chunks that overlap both |
+
+Values come back in the order of the row positions. The helper does not sort
+them: every representation handles unsorted positions, and for Dask sorting
+only saves a reorder step (measured on 2026-10-30 with dask 2026.8.0: 38
+against 76 tasks for 300 of 1,000 rows, no extra block reads).
 
 ### P3. Backed handles are untested
 
