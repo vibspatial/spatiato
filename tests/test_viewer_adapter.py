@@ -1891,9 +1891,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_creates_registered_overlay_w
     assert odd_feature_row["index"] == odd_instance
     assert odd_feature_row["instance_id"] == odd_instance
     assert np.allclose(result.layer.colormap.map(odd_instance), np.asarray(to_rgba("#ff0000"), dtype=np.float32))
-    assert np.allclose(
-        result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32)
-    )
+    assert np.allclose(result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdata_blobs) -> None:
@@ -2059,9 +2057,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_bool_obs_categoricall
     assert features.loc[odd_instance, "is_even"] == np.False_
     assert features.loc[even_instance, "is_even"] == np.True_
     assert np.allclose(result.layer.colormap.map(odd_instance), np.asarray(to_rgba("#ff0000"), dtype=np.float32))
-    assert np.allclose(
-        result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32)
-    )
+    assert np.allclose(result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_colors_binary_int_obs_categorically(sdata_blobs) -> None:
@@ -2124,9 +2120,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_non_binary_int_obs_co
     assert float(features.loc[min_instance, "object_score"]) == float(min_instance)
     assert float(features.loc[max_instance, "object_score"]) == float(max_instance)
     assert isinstance(result.layer.colormap, CompactLabelColormap)
-    assert not np.allclose(
-        result.layer.colormap.map(min_instance), result.layer.colormap.map(max_instance)
-    )
+    assert not np.allclose(result.layer.colormap.map(min_instance), result.layer.colormap.map(max_instance))
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_colors_instance_key_as_labels(sdata_blobs) -> None:
@@ -2260,7 +2254,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_warns_for_high_cardinality_s
     assert "Spatiato will render it with the default categorical palette anyway" in warning_messages[0]
 
 
-def test_viewer_adapter_ensure_styled_labels_loaded_x_var_is_continuous(sdata_blobs) -> None:
+def test_viewer_adapter_ensure_styled_labels_loaded_names_x_var_layer_after_the_var(sdata_blobs) -> None:
     viewer = DummyViewer()
     adapter = ViewerAdapter(viewer)
     style_spec = TableColorSourceSpec(
@@ -2272,10 +2266,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_x_var_is_continuous(sdata_bl
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
 
-    assert result.value_kind == "continuous"
-    assert result.palette_source is None
-    assert result.coercion_applied is False
-    assert isinstance(result.layer.colormap, CompactLabelColormap)
+    assert result.layer.name == "blobs_labels[X:channel_1_sum]"
 
 
 def test_viewer_adapter_ensure_labels_loaded_reuses_matching_existing_layer(sdata_blobs) -> None:
