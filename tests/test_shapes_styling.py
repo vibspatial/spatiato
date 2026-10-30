@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import anndata as ad
 import geopandas as gpd
+import harpy as hp
 import numpy as np
 import pandas as pd
 import pytest
+from _table_matrix_fixtures import FORMATS_AND_MODES, MATRIX_TYPE_BY_FORMAT_AND_MODE, matrix_in_format
 from matplotlib.colors import to_rgba
 from napari.layers import Points, Shapes
 from napari.utils.colormaps import label_colormap
 from shapely.geometry import Point, Polygon
+from spatialdata import SpatialData
 from spatialdata.models import TableModel
 
 from spatiato.core._color_source import ShapeColumnColorSourceSpec, TableColorSourceSpec
@@ -134,14 +137,19 @@ def test_align_table_color_source_to_shapes_rows_allows_partial_coverage_and_dup
     assert aligned.rendered_row_has_table_row.tolist() == [True, True, True, True, False]
 
 
-def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_region_rows() -> None:
+@pytest.mark.parametrize(("x_format", "mode"), FORMATS_AND_MODES)
+def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_region_rows(
+    x_format: str,
+    mode: str,
+    tmp_path,
+) -> None:
     geodataframe = gpd.GeoDataFrame(
         {},
         geometry=[_polygon(0), _polygon(2)],
         index=pd.Index(["cell_1", "cell_2"], name="instance_id"),
     )
     table = ad.AnnData(
-        X=np.asarray([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
+        X=matrix_in_format(np.asarray([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]), x_format),
         obs=pd.DataFrame(
             {
                 "region": ["cells", "other", "cells"],
@@ -151,6 +159,13 @@ def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_regi
         ),
         var=pd.DataFrame(index=["GeneA", "GeneB"]),
     )
+    path = tmp_path / "table.zarr"
+    parsed_table = TableModel.parse(table, region=["cells", "other"], region_key="region", instance_key="instance_id")
+    SpatialData(tables={"table": parsed_table}).write(path)
+    # Small sparse blocks put the two "cells" rows of a lazy CSR `X` in different blocks.
+    stored_table = hp.tb.io.read_table(path, table_name="table", mode=mode, sparse_chunks=2)
+    # Test setup: harpy's reader attaches `X` in the representation under test.
+    assert isinstance(stored_table.X, MATRIX_TYPE_BY_FORMAT_AND_MODE[x_format, mode])
     style_spec = TableColorSourceSpec(
         table_name="table",
         source_kind="x_var",
@@ -159,7 +174,7 @@ def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_regi
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
-        table=table,
+        table=stored_table,
         table_metadata=_table_metadata(regions=("cells", "other")),
         shapes_name="cells",
         shapes_element=geodataframe,
