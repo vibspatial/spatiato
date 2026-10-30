@@ -2524,7 +2524,12 @@ class FeatureExtractionWidget(QWidget):
         self._update_calculate_controls()
 
     def _on_controller_table_selection_refresh_required(self, result: FeatureExtractionResult) -> None:
-        self._refresh_table_names(preferred_existing_table_name=result.table_name)
+        # The job may have created its table, so rebuild the table choices. Keep
+        # the current selection, also after a detached job, unless the created
+        # table is still the create-table target: then promote it to an existing
+        # table, since creating it again would fail.
+        is_create_target = self.selected_new_table_name == result.table_name
+        self._refresh_table_names(preferred_existing_table_name=result.table_name if is_create_target else None)
         self._bind_current_selection()
 
     def _on_controller_feature_matrix_changed(self, result: FeatureExtractionResult) -> None:

@@ -271,22 +271,21 @@ class FeatureExtractionController:
         #   worker emits `finished`.
         # - At most one job at a time: harpy does not protect concurrent writers
         #   to one store, so `calculate()` waits while `_job` is set.
-        # - Changing an input detaches the job instead of calling `quit()`,
-        #   which cannot stop a running harpy call and would only suppress
-        #   `returned`. A detached job keeps writing; its table change is still
-        #   published, but the status and table choices follow the current
-        #   selection.
+        # - The job is detached while the current selection is not the one it was
+        #   launched for (`_job_detached`); changing the inputs back reattaches
+        #   it. Changing an input does not call `quit()`, which cannot stop a
+        #   running harpy call and would only suppress `returned`. A detached job
+        #   keeps writing; its table change is still published and the table
+        #   choices are refreshed, but the status and selection follow the
+        #   current inputs.
         # - Until `finished`, reloads of its table stay blocked, also when the
-        #   job was detached or the widget closed.
+        #   job is detached or the widget closed.
         # The limit holds per controller: closing the widget mid-run and opening
         # a new one gives a second controller, which may start a second job.
         # Accepted: rare, and a guard across widgets would need shared state in
         # `SpatiatoAppState`.
         self._job: FeatureExtractionJob | None = None
         self._worker: Any | None = None
-        # True once the job no longer belongs to the current selection: an input
-        # changed, or the widget closed, while its harpy call still runs.
-        self._job_detached = False
         self._release_reload_participant: Callable[[], None] | None = None
         self._is_shutdown = False
 
@@ -437,6 +436,7 @@ class FeatureExtractionController:
             or labels_name_hint != self._selected_labels_name_hint
             or coordinate_system_hint != self._selected_coordinate_system_hint
         )
+        was_detached = self._job_detached
 
         self._selected_spatialdata = sdata
         self._selected_triplets = triplets
@@ -447,10 +447,11 @@ class FeatureExtractionController:
         self._selected_labels_name_hint = labels_name_hint
         self._selected_coordinate_system_hint = coordinate_system_hint
 
-        if context_changed:
-            self._cancel_pending_and_active_jobs()
-
-        self._update_idle_status()
+        if was_detached and self._job is not None and not self._job_detached:
+            # The inputs changed back to the job's: it is active again.
+            self._set_calculating_status(self._job)
+        else:
+            self._update_idle_status()
         return context_changed
 
     def check_existing_feature_matrix(
@@ -552,21 +553,10 @@ class FeatureExtractionController:
         worker = self._create_feature_extraction_worker(job)
         self._job = job
         self._worker = worker
-        self._job_detached = False
         worker.returned.connect(partial(self._on_worker_returned, job.job_id))
         worker.errored.connect(partial(self._on_worker_errored, job.job_id))
         worker.finished.connect(partial(self._on_worker_finished, job.job_id))
-        if job.triplet_count == 1:
-            labels_name = job.labels_names[0]
-            self._set_status(
-                f'Feature extraction: calculating "{job.feature_key}" for labels element "{labels_name}".',
-                kind="info",
-            )
-        else:
-            self._set_status(
-                f'Feature extraction: calculating "{job.feature_key}" for {job.triplet_count} extraction targets.',
-                kind="info",
-            )
+        self._set_calculating_status(job)
         try:
             worker.start()
         except Exception:
@@ -579,7 +569,7 @@ class FeatureExtractionController:
 
         `calculate()` stores the launched job in `_job`, and `_on_worker_finished()`
         clears it when its worker emits `finished`. Until then, a reload of its
-        table is blocked, also when the job was detached because an input
+        table is blocked, also when the job is detached because an input
         changed or the widget closed: its Harpy call cannot be stopped and may
         still be writing.
 
@@ -604,7 +594,6 @@ class FeatureExtractionController:
         # A job still running when the widget closes loses its table event.
         if self._worker is not None:
             self._worker.quit()
-        self._detach_job()
         self._on_state_changed = None
         self._on_table_selection_refresh_required = None
         self._on_feature_matrix_changed = None
@@ -750,10 +739,10 @@ class FeatureExtractionController:
 
     def _notify_table_selection_refresh_required(self, result: FeatureExtractionResult) -> None:
         # Keep this local widget refresh hook separate from the shared
-        # table-state event. The owning widget uses the concrete result to
-        # refresh table choices and, after create-table writes, promote the new
-        # table into normal existing-table mode before downstream widgets
-        # consume the shared semantic event.
+        # table-state event. The owning widget refreshes its table choices and
+        # keeps the current selection, except that a created table that is still
+        # the create-table target is promoted to existing-table mode. This runs
+        # before downstream widgets consume the shared semantic event.
         if self._on_table_selection_refresh_required is not None:
             self._on_table_selection_refresh_required(result)
 
@@ -821,7 +810,8 @@ class FeatureExtractionController:
             return
 
         if self._job is not None:
-            # Keep "calculating …" for the active job; explain the wait for a detached one.
+            # Keep the job's own status ("calculating …", or its result) while it
+            # matches the selection; explain the wait for a detached one.
             if self._job_detached:
                 self._set_status(_WAITING_FOR_DETACHED_JOB_STATUS, kind="info")
             return
@@ -835,19 +825,38 @@ class FeatureExtractionController:
 
         self._set_status("Feature extraction: ready to calculate.", kind="success")
 
-    def _cancel_pending_and_active_jobs(self) -> None:
-        # Detach without `quit()`: the job keeps writing its table either way,
-        # and `quit()` would suppress the `returned` signal that publishes it.
-        self._detach_job()
+    def _set_calculating_status(self, job: FeatureExtractionJob) -> None:
+        if job.triplet_count == 1:
+            message = f'Feature extraction: calculating "{job.feature_key}" for labels element "{job.labels_names[0]}".'
+        else:
+            message = f'Feature extraction: calculating "{job.feature_key}" for {job.triplet_count} extraction targets.'
+        self._set_status(message, kind="info")
 
-    def _detach_job(self) -> None:
-        if self._job is not None:
-            self._job_detached = True
+    @property
+    def _job_detached(self) -> bool:
+        """Return whether a job is in flight for another selection than the current one."""
+        job = self._job
+        return job is not None and not self._job_matches_selection(job)
+
+    def _job_matches_selection(self, job: FeatureExtractionJob) -> bool:
+        """Return whether the current selection is the one `job` was launched for."""
+        request = job.request
+        same_mode = request.create_table == self._create_table
+        # Once a create-table job created its table, the widget promotes the
+        # selection from "create <table>" to the existing <table>: still this job.
+        promoted_after_creation = request.create_table and not self._create_table
+        return (
+            job.sdata is self._selected_spatialdata
+            and request.triplets == self._selected_triplets
+            and request.table_name == self._selected_table_name
+            and (same_mode or promoted_after_creation)
+            and request.feature_names == self._selected_feature_names
+            and request.feature_key == self._selected_feature_key
+        )
 
     def _clear_job(self) -> None:
         self._job = None
         self._worker = None
-        self._job_detached = False
 
     def _job_for(self, job_id: int) -> FeatureExtractionJob | None:
         """Return the job in flight if it has `job_id`; signals of other workers are ignored."""
@@ -862,14 +871,15 @@ class FeatureExtractionController:
         job = self._job_for(job_id)
         if self._is_shutdown or job is None or job.sdata is not self._selected_spatialdata:
             return
-        if self._job_detached:
-            # A detached job still wrote its table: publish the change only, and
-            # leave the status and table choices to the current selection.
-            self._notify_feature_matrix_changed(result)
-            return
 
+        # Any job may have created its table, also a detached one, so the widget
+        # refreshes its table choices (see `_notify_table_selection_refresh_required`).
         self._notify_table_selection_refresh_required(result)
         self._notify_feature_matrix_changed(result)
+        if self._job_detached:
+            # The status follows the current selection, not this job.
+            return
+
         self._set_status(
             "Feature extraction: "
             f'wrote "{result.feature_key}" into table "{result.table_name}" as '
@@ -882,7 +892,6 @@ class FeatureExtractionController:
         job = self._job_for(job_id)
         if self._is_shutdown or job is None or job.sdata is not self._selected_spatialdata:
             return
-        is_active = not self._job_detached
 
         if isinstance(error, FeatureMatrixRemovedError):
             # The previous matrix is gone, also for a detached job: publish it.
@@ -897,12 +906,12 @@ class FeatureExtractionController:
                     dirty_snapshot=job.dirty_snapshot,
                 )
             )
-            if is_active:
+            if not self._job_detached:
                 # The message already starts with "Feature extraction failed".
                 self._set_status(str(error), kind="error")
             return
 
-        if is_active:
+        if not self._job_detached:
             self._set_status(f"Feature extraction: calculation failed: {error}", kind="error")
 
     def _on_worker_finished(self, job_id: int) -> None:
@@ -912,7 +921,9 @@ class FeatureExtractionController:
             was_detached = self._job_detached
             self._clear_job()
             if was_detached and not self._is_shutdown:
-                # The detached job held back the next launch; Calculate is available again.
+                # The status still says "waiting for the previous calculation"; show
+                # the current selection's status instead, now that Calculate is
+                # available again.
                 self._update_idle_status()
             elif self._on_state_changed is not None:
                 self._on_state_changed()
