@@ -19,7 +19,7 @@ from spatiato.core.table_matrix import is_sparse_matrix, read_matrix, read_matri
 
 _N_OBS = 30
 _POSITIONS = np.array([0, 3, 5, 17, 29])
-_DENSE_REPRESENTATIONS = ("numpy", "dataframe", "dask_dense", "lazy_dense", "backed_dense")
+_DENSE_REPRESENTATIONS = ("numpy", "dask_dense", "lazy_dense", "backed_dense")
 _SPARSE_REPRESENTATIONS = (
     "csr",
     "csc",
@@ -84,7 +84,6 @@ def _representation(name: str, store: Path) -> tuple[Any, np.ndarray]:
     csr = _sparse_values()
     factories = {
         "numpy": lambda: dense,
-        "dataframe": lambda: pd.DataFrame(dense),
         "dask_dense": lambda: da.from_array(dense, chunks=(7, -1)),
         "lazy_dense": lambda: _read_component(store, ("obsm", "dense"), "lazy"),
         "backed_dense": lambda: _read_component(store, ("obsm", "dense"), "backed"),
@@ -244,9 +243,13 @@ def test_read_matrix_rows_reads_only_the_selected_rows_of_a_backed_csr_dataset(
     _assert_in_memory_values(result, reference[[0, 3, 17]])
 
 
-def test_table_matrix_helpers_reject_unsupported_types() -> None:
-    with pytest.raises(TypeError, match="Unsupported table matrix type 'list'"):
-        read_matrix([[1.0, 2.0]])
+@pytest.mark.parametrize(
+    ("matrix", "type_name"),
+    [([[1.0, 2.0]], "list"), (pd.DataFrame({"area": [1.0, 2.0]}), "DataFrame")],
+)
+def test_table_matrix_helpers_reject_unsupported_types(matrix: Any, type_name: str) -> None:
+    with pytest.raises(TypeError, match=f"Unsupported table matrix type '{type_name}'"):
+        read_matrix(matrix)
 
 
 def test_table_matrix_helpers_reject_matrices_that_are_not_2d() -> None:
