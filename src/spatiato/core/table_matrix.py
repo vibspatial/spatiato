@@ -3,9 +3,9 @@
 harpy attaches table matrices (`X`, `obsm`, `layers`, ...) in several forms:
 NumPy or SciPy arrays, Dask arrays (lazy; their blocks are NumPy or SciPy
 CSR/CSC), and backed handles (`zarr.Array`, anndata `CSRDataset`/`CSCDataset`).
-DataFrame-valued `obsm` entries are always in memory. These helpers read only
-what is asked for and return NumPy arrays or SciPy CSR/CSC matrices in the
-stored dtype; callers cast. A result may share memory with an in-memory input,
+These helpers read only what is asked for and return NumPy arrays or SciPy
+CSR/CSC matrices in the stored dtype; callers cast. DataFrame-valued `obsm`
+entries are not supported. A result may share memory with an in-memory input,
 so do not modify it in place.
 
 `np.asarray(...)` does not densify a sparse matrix: for a SciPy sparse matrix,
@@ -19,7 +19,6 @@ from typing import Any
 
 import dask.array as da
 import numpy as np
-import pandas as pd
 import zarr
 from anndata.abc import CSCDataset, CSRDataset
 from numpy.typing import ArrayLike
@@ -27,7 +26,7 @@ from scipy.sparse import issparse
 
 _BACKED_SPARSE_TYPES = (CSRDataset, CSCDataset)
 # SciPy sparse matrices are supported too; `issparse(...)` recognizes them.
-_SUPPORTED_DENSE_OR_HANDLE_TYPES = (np.ndarray, da.Array, zarr.Array, pd.DataFrame, *_BACKED_SPARSE_TYPES)
+_SUPPORTED_DENSE_OR_HANDLE_TYPES = (np.ndarray, da.Array, zarr.Array, *_BACKED_SPARSE_TYPES)
 _IN_MEMORY_SPARSE_FORMATS = ("csr", "csc")
 
 
@@ -52,8 +51,6 @@ def read_matrix(matrix: Any) -> Any:
         return matrix.to_memory()
     if isinstance(matrix, zarr.Array):
         return matrix[...]
-    if isinstance(matrix, pd.DataFrame):
-        return matrix.to_numpy()
     return _in_memory(matrix)
 
 
@@ -67,8 +64,6 @@ def read_matrix_rows(matrix: Any, positions: ArrayLike) -> Any:
     _validate_matrix(matrix)
     # A NumPy array, not a list: anndata reads a whole `CSRDataset` when indexed with a list.
     row_positions = _validated_positions(positions, n_rows=matrix.shape[0])
-    if isinstance(matrix, pd.DataFrame):
-        return matrix.iloc[row_positions].to_numpy()
     if isinstance(matrix, da.Array):
         return _in_memory(matrix[row_positions].compute())
     if isinstance(matrix, zarr.Array):
@@ -103,8 +98,6 @@ def read_matrix_column(matrix: Any, column: int, rows: ArrayLike | None = None) 
 
 
 def _column_values(matrix: Any, column: int) -> np.ndarray:
-    if isinstance(matrix, pd.DataFrame):
-        return matrix.iloc[:, column].to_numpy()
     # `[:, j:j+1]` stays 2-D for every representation; `[:, j]` does not (a 1-D
     # sparse result, or an error for Dask arrays of several `csr_array` blocks).
     values = _in_memory(matrix)[:, column : column + 1]
