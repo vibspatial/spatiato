@@ -19,6 +19,7 @@ from spatiato.core.class_palette import (
 )
 from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
+    feature_matrix_n_features,
     normalize_feature_columns,
     normalize_feature_matrix,
     normalize_feature_matrix_source_kind,
@@ -306,15 +307,15 @@ def _validate_current_feature_matrix_matches_columns(
     custom_obsm: bool = False,
 ) -> None:
     try:
-        feature_matrix = normalize_feature_matrix(table.obsm[feature_key], table.n_obs, copy=False)
+        n_features = feature_matrix_n_features(table.obsm[feature_key], table.n_obs)
     except KeyError as error:
         raise ValueError(f"Feature matrix `{feature_key}` is not available in `.obsm`.") from error
 
-    if int(feature_matrix.shape[1]) != len(feature_columns):
+    if n_features != len(feature_columns):
         raise ValueError(
             _format_feature_matrix_width_mismatch_error(
                 feature_key,
-                n_features=int(feature_matrix.shape[1]),
+                n_features=n_features,
                 metadata_n_features=len(feature_columns),
                 custom_obsm=custom_obsm,
             )
@@ -600,9 +601,7 @@ def _update_table_prediction_state(
         raise ValueError("Prediction row positions and class values must have equal lengths.")
     if prediction_row_positions.size != normalized_pred_confidences.size:
         raise ValueError("Prediction row positions and confidence values must have equal lengths.")
-    if prediction_row_positions.size and not bool(
-        np.isin(prediction_row_positions, clear_row_positions).all()
-    ):
+    if prediction_row_positions.size and not bool(np.isin(prediction_row_positions, clear_row_positions).all()):
         raise ValueError("Prediction row positions must be a subset of clear row positions.")
     if normalized_pred_classes.size and bool((normalized_pred_classes <= 0).any()):
         raise ValueError("Predicted class ids must be positive integers.")
@@ -620,8 +619,8 @@ def _update_table_prediction_state(
         replacement_pred_confidence.iloc[prediction_row_positions] = normalized_pred_confidences
 
     pred_class_changed = not has_pred_class or not replacement_pred_class.equals(table.obs[pred_class_column])
-    pred_confidence_changed = (
-        not has_pred_confidence or not replacement_pred_confidence.equals(table.obs[pred_confidence_column])
+    pred_confidence_changed = not has_pred_confidence or not replacement_pred_confidence.equals(
+        table.obs[pred_confidence_column]
     )
     next_palette = _derive_prediction_palette(
         table,
@@ -670,8 +669,7 @@ def _derive_prediction_palette(
         user_color_lookup = dict(zip(user_categories, user_colors, strict=True))
 
     return [
-        user_color_lookup.get(int(class_id), default_labeled_class_color(int(class_id)))
-        for class_id in pred_categories
+        user_color_lookup.get(int(class_id), default_labeled_class_color(int(class_id))) for class_id in pred_categories
     ]
 
 
