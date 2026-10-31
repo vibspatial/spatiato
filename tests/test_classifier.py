@@ -988,7 +988,8 @@ def test_classifier_controller_drops_stale_results(qtbot, monkeypatch, sdata_blo
         timeout=5000,
     )
 
-    assert call_log == [1, 2]
+    # Both jobs ran; their worker threads may start in either order.
+    assert sorted(call_log) == [1, 2]
     assert table.obs[PRED_CLASS_COLUMN].eq(2).all()
     assert controller.status_kind == "success"
 
