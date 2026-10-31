@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
+import pandas as pd
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
+
+from spatiato.core.table_matrix import is_sparse_matrix
 
 try:
     from scipy.sparse import issparse
@@ -47,6 +50,8 @@ _FEATURE_MATRIX_METADATA_STATUSES_REQUIRING_ERROR: tuple[FeatureMatrixMetadataSt
     "invalid_matrix",
     "registered_mismatched",
 )
+# NumPy dtype kinds of a numeric feature matrix: bool, signed and unsigned integer, float.
+_NUMERIC_DTYPE_KINDS = "biuf"
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,36 @@ def normalize_feature_matrix(feature_matrix: Any, n_obs: int, *, copy: bool = Tr
     return array.copy() if copy else array
 
 
+def feature_matrix_n_features(feature_matrix: Any, n_obs: int) -> int:
+    """Return the number of feature columns, checking the matrix from its shape and dtype only.
+
+    Makes the checks of `normalize_feature_matrix(...)` (2-D, one row per
+    observation, numeric values) without reading values, so a lazy or backed
+    matrix stays unread. A 1-D matrix counts as one column. DataFrames are
+    rejected: harpy never writes or updates a feature matrix as one. Raises
+    `ValueError`.
+    """
+    if isinstance(feature_matrix, pd.DataFrame):
+        raise ValueError(
+            "Feature matrices must be arrays, not DataFrames; store the values as an array, "
+            "for example with `.to_numpy()`."
+        )
+    shape = getattr(feature_matrix, "shape", None)
+    dtype = getattr(feature_matrix, "dtype", None)
+    if shape is None or dtype is None:
+        raise ValueError(f"Unsupported feature matrix type {type(feature_matrix).__name__!r}.")
+    # `len(shape)`, not `ndim`: `CSRDataset`/`CSCDataset` have no `ndim`.
+    if len(shape) not in (1, 2):
+        raise ValueError("Feature matrices stored in `.obsm` must be 2-dimensional.")
+    if shape[0] != n_obs:
+        raise ValueError(f"Feature matrix has {shape[0]} rows but the table has {n_obs} observations.")
+    # Bool, signed and unsigned integer, float. Without reading values, an
+    # `object` matrix cannot be known to hold numbers.
+    if dtype.kind not in _NUMERIC_DTYPE_KINDS:
+        raise ValueError(f"Feature matrix dtype `{dtype}` is not numeric.")
+    return 1 if len(shape) == 1 else int(shape[1])
+
+
 def inspect_feature_matrix_metadata(table: AnnData, feature_key: str) -> FeatureMatrixMetadataState:
     """Return the non-mutating metadata registration state for one `.obsm` key."""
     resolved_feature_key = _normalize_nonempty_str(feature_key, "feature_key")
@@ -147,15 +182,14 @@ def inspect_feature_matrix_metadata(table: AnnData, feature_key: str) -> Feature
         )
 
     try:
-        feature_matrix = normalize_feature_matrix(table.obsm[resolved_feature_key], table.n_obs, copy=False)
-    except (TypeError, ValueError) as error:
+        n_features = feature_matrix_n_features(table.obsm[resolved_feature_key], table.n_obs)
+    except ValueError as error:
         return FeatureMatrixMetadataState(
             feature_key=resolved_feature_key,
             status="invalid_matrix",
             error=str(error),
         )
 
-    n_features = int(feature_matrix.shape[1])
     feature_matrices_value = table.uns.get(_FEATURE_MATRICES_KEY)
     if feature_matrices_value is None:
         return FeatureMatrixMetadataState(
@@ -246,8 +280,7 @@ def register_feature_matrix_metadata(
         raise ValueError(f'Feature matrix "{resolved_feature_key}" is not available in ".obsm".')
 
     raw_feature_matrix = table.obsm[resolved_feature_key]
-    feature_matrix = normalize_feature_matrix(raw_feature_matrix, table.n_obs, copy=False)
-    n_features = int(feature_matrix.shape[1])
+    n_features = feature_matrix_n_features(raw_feature_matrix, table.n_obs)
     resolved_feature_columns = _normalize_feature_columns(
         feature_columns,
         feature_key=resolved_feature_key,
@@ -266,14 +299,15 @@ def register_feature_matrix_metadata(
     if resolved_feature_key in feature_matrices and not overwrite:
         raise ValueError(
             f'Feature matrix "{resolved_feature_key}" already has metadata in '
-            f'`.uns[{_FEATURE_MATRICES_KEY!r}][{resolved_feature_key!r}]`. Pass `overwrite=True` to replace it.'
+            f"`.uns[{_FEATURE_MATRICES_KEY!r}][{resolved_feature_key!r}]`. Pass `overwrite=True` to replace it."
         )
 
     metadata: dict[str, object] = {
         "feature_columns": list(resolved_feature_columns),
         "schema_version": FEATURE_MATRIX_METADATA_SCHEMA_VERSION,
-        "backend": "sparse" if issparse(raw_feature_matrix) else "numpy",
-        "dtype": _feature_matrix_dtype(raw_feature_matrix),
+        "backend": "sparse" if is_sparse_matrix(raw_feature_matrix) else "numpy",
+        # `feature_matrix_n_features(...)` above guarantees a dtype.
+        "dtype": str(raw_feature_matrix.dtype),
         "features": list(resolved_features),
         "source_kind": CUSTOM_OBSM_SOURCE_KIND,
     }
@@ -294,13 +328,6 @@ def normalize_feature_matrix_source_kind(feature_metadata: Mapping[str, object])
         allowed = ", ".join(f"`{kind}`" for kind in FEATURE_MATRIX_SOURCE_KINDS)
         raise ValueError(f"Feature metadata `source_kind` must be one of {allowed}; got {source_kind!r}.")
     return cast(FeatureMatrixSourceKind, source_kind)
-
-
-def _feature_matrix_dtype(feature_matrix: Any) -> str:
-    dtype = getattr(feature_matrix, "dtype", None)
-    if dtype is not None:
-        return str(dtype)
-    return str(np.asarray(feature_matrix).dtype)
 
 
 def _normalize_feature_columns(
