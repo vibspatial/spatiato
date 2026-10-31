@@ -275,9 +275,22 @@ def test_feature_matrix_metadata_reads_only_shape_and_dtype_of_a_lazy_matrix(met
     assert registered.n_features == 4
 
 
+def _fail_on_value_reads(monkeypatch: pytest.MonkeyPatch, handle: object) -> None:
+    """Make every way of reading the values of a backed handle fail."""
+
+    def fail_to_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the feature matrix values were read")
+
+    # `__array__` serves `np.asarray(...)`; `to_memory` loads a `CSRDataset`.
+    for name in ("__getitem__", "__array__", "to_memory"):
+        if hasattr(type(handle), name):
+            monkeypatch.setattr(type(handle), name, fail_to_read)
+
+
 @pytest.mark.parametrize("component", [("obsm", "dense"), ("X",)], ids=["zarr_array", "csr_dataset"])
 def test_feature_matrix_n_features_reads_a_backed_matrix_without_loading_it(
     component: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     adata = ad.AnnData(X=sparse.csr_matrix(np.eye(3, 5)))
@@ -285,8 +298,11 @@ def test_feature_matrix_n_features_reads_a_backed_matrix_without_loading_it(
     path = tmp_path / "table.zarr"
     SpatialData(tables={"table": TableModel.parse(adata)}).write(path)
     backed = hp.tb.io.read_table_components(path, table_name="table", components=[component], mode="backed")[component]
-    # Test setup: harpy's reader attaches a backed handle.
+    # Test setup: harpy's reader attaches a backed handle, and reading its values fails.
     assert isinstance(backed, (zarr.Array, CSRDataset))
+    _fail_on_value_reads(monkeypatch, backed)
+    with pytest.raises(AssertionError, match="values were read"):
+        backed[:]
 
     assert feature_matrix_n_features(backed, 3) == 5
 
