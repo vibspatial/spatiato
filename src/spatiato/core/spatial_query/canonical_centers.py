@@ -53,7 +53,7 @@ class CanonicalCentersStatus:
 
 
 @dataclass(frozen=True)
-class CanonicalRegionCenters:
+class CanonicalCentersRegion:
     """The canonical centers of one labels element, with the table rows they belong to.
 
     `row_positions`, `instance_ids` and `centers` are aligned and read-only:
@@ -117,17 +117,21 @@ def compute_canonical_centers(sdata: SpatialData, *, table_name: str) -> Canonic
     return "rebuilt" if had_centers else "created"
 
 
-def read_canonical_region_centers(
+def read_canonical_centers_region(
     sdata: SpatialData,
     *,
     table_name: str,
     labels_name: str,
-) -> CanonicalRegionCenters:
+) -> CanonicalCentersRegion:
     """Read the canonical centers of one labels element, and only its rows.
 
     Its rows are those whose region is `labels_name`, in table order, and their
-    instance IDs come from the table's instance column. The caller checks first
-    that the centers are valid (`canonical_centers_status(...)`).
+    instance IDs come from the table's instance column.
+
+    Call this only when `canonical_centers_status(...)` reports `"valid"`, which
+    also guarantees that every region the table declares is a labels element of
+    this SpatialData. It does not check this itself: harpy's check loads every
+    center of the table, and this reads only the rows of `labels_name`.
     """
     table = get_table(sdata, table_name)
     table_metadata = get_table_metadata(sdata, table_name)
@@ -146,7 +150,7 @@ def read_canonical_region_centers(
         raise ValueError(f"Table `{table_name}` has no canonical centers.")
     centers = np.asarray(read_matrix_rows(table.obsm[CANONICAL_OBSM_KEY], row_positions), dtype=np.float64)
 
-    return CanonicalRegionCenters(
+    return CanonicalCentersRegion(
         table_name=table_name,
         labels_name=labels_name,
         row_positions=_read_only(row_positions.astype(np.int64)),

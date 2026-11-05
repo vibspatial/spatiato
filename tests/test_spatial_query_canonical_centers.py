@@ -8,12 +8,12 @@ from spatialdata import SpatialData, read_zarr
 from spatialdata.models import Labels3DModel
 
 from spatiato.core.spatial_query.canonical_centers import (
+    CanonicalCentersRegion,
     CanonicalCentersStatus,
-    CanonicalRegionCenters,
     canonical_centers_status,
     compute_canonical_centers,
     is_canonical_query_labels,
-    read_canonical_region_centers,
+    read_canonical_centers_region,
 )
 from spatiato.core.spatialdata import get_table_metadata
 
@@ -42,9 +42,9 @@ def test_canonical_centers_status_sets_a_reason_exactly_for_invalid(state: str, 
     ],
     ids=["fewer_instance_ids", "more_instance_ids", "two_columns"],
 )
-def test_canonical_region_centers_require_aligned_arrays(instance_ids: np.ndarray, centers: np.ndarray) -> None:
+def test_canonical_centers_region_requires_aligned_arrays(instance_ids: np.ndarray, centers: np.ndarray) -> None:
     with pytest.raises(ValueError, match="must describe the same rows"):
-        CanonicalRegionCenters("table", "blobs_labels", np.array([0, 1, 2]), instance_ids, centers)
+        CanonicalCentersRegion("table", "blobs_labels", np.array([0, 1, 2]), instance_ids, centers)
 
 
 def test_canonical_centers_are_absent_then_created_then_rebuilt_in_memory(sdata_blobs: SpatialData) -> None:
@@ -116,14 +116,14 @@ def test_compute_canonical_centers_passes_harpys_error_through_without_changing_
     assert _state(sdata_blobs) == "absent"
 
 
-def test_read_canonical_region_centers_reads_the_rows_of_one_labels_element(
+def test_read_canonical_centers_region_reads_the_rows_of_one_labels_element(
     sdata_blobs_multi_region: SpatialData,
 ) -> None:
     compute_canonical_centers(sdata_blobs_multi_region, table_name=_MULTI)
     table = sdata_blobs_multi_region[_MULTI]
     rows = np.flatnonzero((table.obs["region"] == "blobs_labels_2").to_numpy())
 
-    region = read_canonical_region_centers(sdata_blobs_multi_region, table_name=_MULTI, labels_name="blobs_labels_2")
+    region = read_canonical_centers_region(sdata_blobs_multi_region, table_name=_MULTI, labels_name="blobs_labels_2")
 
     assert region.table_name == _MULTI
     assert region.labels_name == "blobs_labels_2"
@@ -135,28 +135,34 @@ def test_read_canonical_region_centers_reads_the_rows_of_one_labels_element(
         assert array.flags.writeable is False
 
 
-def test_read_canonical_region_centers_reads_a_lazy_backed_matrix(backed_sdata_blobs: SpatialData) -> None:
-    compute_canonical_centers(backed_sdata_blobs, table_name="table")
-    matrix = backed_sdata_blobs["table"].obsm[CANONICAL_OBSM_KEY]
+def test_read_canonical_centers_region_reads_a_lazy_backed_matrix(
+    backed_sdata_blobs_multi_region: SpatialData,
+) -> None:
+    compute_canonical_centers(backed_sdata_blobs_multi_region, table_name=_MULTI)
+    matrix = backed_sdata_blobs_multi_region[_MULTI].obsm[CANONICAL_OBSM_KEY]
+    assert isinstance(matrix, da.Array)
 
-    region = read_canonical_region_centers(backed_sdata_blobs, table_name="table", labels_name="blobs_labels")
+    region = read_canonical_centers_region(
+        backed_sdata_blobs_multi_region, table_name=_MULTI, labels_name="blobs_labels_2"
+    )
 
+    assert isinstance(region.centers, np.ndarray)
     np.testing.assert_array_equal(region.centers, matrix.compute()[region.row_positions])
 
 
-def test_read_canonical_region_centers_rejects_an_unannotated_labels_element(sdata_blobs: SpatialData) -> None:
+def test_read_canonical_centers_region_rejects_an_unannotated_labels_element(sdata_blobs: SpatialData) -> None:
     compute_canonical_centers(sdata_blobs, table_name="table")
 
     with pytest.raises(ValueError, match="does not annotate labels element `blobs_multiscale_labels`"):
-        read_canonical_region_centers(sdata_blobs, table_name="table", labels_name="blobs_multiscale_labels")
+        read_canonical_centers_region(sdata_blobs, table_name="table", labels_name="blobs_multiscale_labels")
 
 
-def test_read_canonical_region_centers_rejects_a_table_without_centers(sdata_blobs: SpatialData) -> None:
+def test_read_canonical_centers_region_rejects_a_table_without_centers(sdata_blobs: SpatialData) -> None:
     with pytest.raises(ValueError, match="has no canonical centers"):
-        read_canonical_region_centers(sdata_blobs, table_name="table", labels_name="blobs_labels")
+        read_canonical_centers_region(sdata_blobs, table_name="table", labels_name="blobs_labels")
 
 
-def test_read_canonical_region_centers_rejects_a_background_instance_id(sdata_blobs: SpatialData) -> None:
+def test_read_canonical_centers_region_rejects_a_background_instance_id(sdata_blobs: SpatialData) -> None:
     compute_canonical_centers(sdata_blobs, table_name="table")
     table = sdata_blobs["table"]
     instance_key = get_table_metadata(sdata_blobs, "table").instance_key
@@ -165,7 +171,7 @@ def test_read_canonical_region_centers_rejects_a_background_instance_id(sdata_bl
     table.obs[instance_key] = instance_ids
 
     with pytest.raises(ValueError, match="must be positive integers"):
-        read_canonical_region_centers(sdata_blobs, table_name="table", labels_name="blobs_labels")
+        read_canonical_centers_region(sdata_blobs, table_name="table", labels_name="blobs_labels")
 
 
 def test_is_canonical_query_labels_accepts_only_2d_labels_elements(sdata_blobs: SpatialData) -> None:
