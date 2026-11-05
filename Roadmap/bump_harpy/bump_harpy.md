@@ -519,16 +519,20 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3a | Matrix helpers, with unit tests per representation | implemented on 2026-10-30 (`core/table_matrix.py`, `tests/test_table_matrix.py`) |
    | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
    | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | implemented on 2026-10-30 (`feature_matrix_n_features(...)`); an `object`-dtype matrix is now rejected as not numeric, and a DataFrame feature matrix is rejected (harpy never writes one), so `core/table_matrix.py` no longer supports DataFrames either |
-   | 3c.2 | Spatial Query's canonical centers through harpy (P8): validate with `validate_canonical_centers(sdata, table_name=...)`, compute every labels element with `hp.tb.add_canonical_centers(..., overwrite=True)` in the worker, find the selected labels element's rows from the table annotation and read them with `read_matrix_rows(...)`; events (`"created"`/`"rebuilt"`), persisted change for backed and mutation for unbacked SpatialData, a reload guard while the worker writes, a plain 2-D dims check for the labels choices, and the annotation module reading the keys from the table; delete `canonical_models.py`, `canonical.py` and `centroids.py` and their tests | unblocked by harpy 0.5.3; needs a readiness check and a split into parts, after 3c.4 |
+   | 3c.2a | Spatial Query's canonical centers through harpy (P8), additive: a new `core/spatial_query/canonical_centers.py` with the centers status (`validate_canonical_centers(...)`), the calculation (`hp.tb.add_canonical_centers(..., overwrite=True)`), a labels element's centers from the table annotation and `read_matrix_rows(...)`, and the 2-D labels check; unit tests on unbacked and backed SpatialData, including a version-1 record and a table harpy cannot compute | ready (readiness check of 2026-11-05 below) |
+   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | ready, after 3c.2a |
+   | 3c.2c | Cleanup: delete `canonical.py`, `canonical_models.py`, `centroids.py`, their re-exports and their two test modules (28 tests of Spatiato's own cache logic), and the obsolete persistence tests (design point 5); docs and plan | ready, after 3c.2b |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
    | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
-   3c.1-3c.4 are committed separately; 3c.1 comes first, because the
-   classifier summary in 3d relies on its shape-only check. 3c.4 comes before
-   3c.2, because a feature-matrix record under a reserved key would make
-   `add_canonical_centers` reject the table. 3c.3 and 3d are independent of
-   3c.2 and 3c.4. 3c.3 replaces a safeguard that computed the matrix after
+   3c.1-3c.4 are committed separately, 3c.2 in its three parts (a, b, c, in
+   that order); 3c.1 comes first, because the classifier summary in 3d relies
+   on its shape-only check. 3c.4 comes before 3c.2, because a feature-matrix
+   record under a reserved key would make `add_canonical_centers` reject the
+   table. 3c.2 comes next: until it lands, Spatial Query rewrites harpy 0.5.3's
+   version-2 canonical centers as version-1 records, which harpy rejects. 3c.3
+   and 3d are independent of 3c.2 and 3c.4. 3c.3 replaces a safeguard that computed the matrix after
    each extraction, dropped on 2026-10-30 (see P1, "Resolution"). 3c.2
    replaced, on 2026-11-01, a plan to route Spatiato's own canonical-center
    code through the matrix helpers; harpy 0.5.3 unblocked it on 2026-11-05.
@@ -601,6 +605,62 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    point 4. The headless tests keep their field names
    (`n_predicted_rows`, `n_skipped_feature_invalid_rows`). No test covers the
    sparse finite check or most of the count messages today.
+
+   Readiness check for 3c.2 (2026-11-05, against harpy 0.5.3). Today the
+   centers worker computes without changing anything, and the main thread
+   installs the result (`apply_canonical_cache_update(...)`). With harpy,
+   `add_canonical_centers(...)` computes and installs in the worker, and, for
+   backed SpatialData, writes to the store there. What uses Spatiato's
+   canonical code, and what replaces it:
+
+   | Where | Today | With harpy |
+   |---|---|---|
+   | widget: inspection (labels change, table change, reload, every Run) | `inspect_canonical_cache(...)`, a report with five states | `validate_canonical_centers(...)`: absent, valid, or invalid with harpy's message |
+   | widget: labels choices | Spatiato's source signature, 2-D only | scale0 dims `(y, x)` and an integer dtype |
+   | controller: valid centers | read the cache on the main thread | read the labels element's rows with `read_matrix_rows(...)` |
+   | controller: otherwise | the worker computes without changing anything; the main thread applies the regional update | the worker runs `add_canonical_centers(...)` and changes the table |
+   | query and its models | `CanonicalCentersResult` with a binding and a source signature; the 2-D check reads `source_signature.dims` | a small "region centers" type: table, labels element, rows, instance IDs, centers |
+   | annotation: the live binding and the provenance check at Apply | harpy-style binding, digest, `n_obs`, per-region metadata | rows and instance IDs from the table annotation |
+   | status card | texts for valid, absent, partial, stale and invalid | three states |
+
+   Spatial Query is a reload participant but never blocks a reload: its
+   `prepare_for_table_reload(...)` only cancels its own work, which was safe
+   while its worker did not change the table. Cancelling calls `quit()`, which
+   would now lose the result of a worker that did change the table.
+
+   Design points for 3c.2 (settled on 2026-11-05):
+   1. **The centers worker follows Feature Extraction's job contract**
+      (decisions 9 and P7 step 2, points 7-9): one centers job at a time; a
+      cancel detaches the job instead of calling `quit()`; a detached or late
+      job still publishes its table change when the same SpatialData is still
+      selected; reloads of the table are blocked until the job finishes, also
+      after the widget closes (a deferred release of the reload participant,
+      as in Feature Extraction).
+   2. **Events and persistence:** `"created"` when the table had no canonical
+      centers at launch, `"rebuilt"` otherwise; the regions are every labels
+      element of the table, since harpy recomputes all of them; backed
+      SpatialData records a persisted change with the dirty snapshot taken at
+      launch, unbacked SpatialData records a mutation.
+   3. **Status card:** "Centers for "X" will be reused." (valid); "Centers for
+      every labels element of table "T" will be calculated before querying."
+      (absent); "... will be recalculated before querying." (invalid), with
+      harpy's message as the tooltip, also for Spatiato's version-1 records.
+   4. **Provenance check at Apply:** the centers are still valid, the labels
+      element's rows and instance IDs are unchanged (from the annotation), and
+      its centers are unchanged. The digest, `n_obs` and source-signature
+      comparisons go: harpy no longer has them.
+   5. **Persistence tests of the canonical cache** (`test_persistence.py`,
+      "round trips as one dirty unit" and "failed second write") are deleted:
+      Spatiato no longer writes these components itself. Check first that the
+      generic nested-`uns` persistence they exercised stays covered (Spatial
+      Query's palette paths, Object Classification's config).
+   6. **Concurrent harpy writes** of Feature Extraction and Spatial Query to
+      the same store stay unprotected for now (the shared write guard noted
+      under P5), as Feature Extraction already accepts across controllers.
+
+   3c.2b is the large part: the types flow from the controller through the
+   query to annotation, so the switch cannot be split further without
+   temporary adapters.
 4. **Swap the table I/O** (P5 writes, P4 reload):
    - writes through harpy's store-only `hp.tb.io.write_table_components(...)`
      and `delete_table_components(...)`. Spatiato's dirty tracking already
@@ -1448,7 +1508,8 @@ unsaved-changes block, dialogs, widget tests).
 Status: decided on 2026-11-01. The harpy side shipped in 0.5.3 on 2026-11-05
 (#283, addressing https://github.com/saeyslab/harpy/issues/279 and
 https://github.com/saeyslab/harpy/issues/282; see "Harpy 0.5.3: What
-Changed"). Implemented as 3c.2 of the "Migration Plan", after P9.
+Changed"). Implemented as 3c.2 of the "Migration Plan" (parts 3c.2a-c, with
+the readiness check and design points of 2026-11-05 under step 3), after P9.
 
 Today Spatiato computes canonical centers per labels element
 (`core/spatial_query/centroids.py`, 162 lines) and keeps a regional cache with
