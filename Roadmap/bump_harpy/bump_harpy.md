@@ -657,6 +657,31 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    6. **Concurrent harpy writes** of Feature Extraction and Spatial Query to
       the same store stay unprotected for now (the shared write guard noted
       under P5), as Feature Extraction already accepts across controllers.
+   7. **In line with Feature Extraction** (agreed on 2026-11-05). Points 1, 2
+      and 6 copy Feature Extraction's contract for writing a table through
+      harpy: the harpy call installs (and writes the store) in the worker, one
+      job per controller, detaching instead of `quit()`, publishing for
+      detached jobs, the reload guard with a deferred release, persisted
+      change against mutation with the launch snapshot. Three differences are
+      intentional:
+      - no confirmation dialog and no unsaved-changes block: Feature Extraction
+        protects values that cannot be recomputed (other labels elements'
+        features, unsaved edits harpy's store-based merge would drop), while
+        canonical centers are derived data that harpy replaces entirely and
+        that can be recomputed at any time;
+      - `"rebuilt"` instead of Feature Extraction's `"updated"` for a full
+        replacement: Feature Extraction uses `"updated"` because Object
+        Classification only invalidates its classifier on it, and no consumer
+        depends on `"updated"` for canonical centers;
+      - the event's regions are every labels element of the table, since
+        harpy recomputes all of them, not only the ones the job targeted.
+
+      The job contract is mirrored in Spatial Query's controller, not shared:
+      3c.2b is already the large part, and changing Feature Extraction's
+      controller inside it adds risk. Extracting a shared "table-writing job"
+      helper (job slot, derived detachment, reload guard with deferred
+      release, publishing for detached jobs) is a follow-up, once both
+      controllers exist and are known to stay identical.
 
    3c.2b is the large part: the types flow from the controller through the
    query to annotation, so the switch cannot be split further without
@@ -1671,6 +1696,8 @@ from harpy if it becomes public; until then, Spatiato names the two keys
 - The D1 open point (see "Migration Plan", step 2), as a later optimization
   only if reads turn out noticeably slow: chunking of lazy reads (and lazy
   against backed `X`).
+- Follow-up after 3c.2: extract one "table-writing job" helper shared by the
+  Feature Extraction and Spatial Query controllers (3c.2 design point 7).
 
 Settled on 2026-10-30 (see "Migration Plan", step 2):
 
