@@ -19,6 +19,7 @@ from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
     FEATURE_MATRIX_METADATA_SCHEMA_VERSION,
     HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
+    validate_feature_key_not_reserved,
 )
 from spatiato.core.spatialdata import get_table, get_table_metadata
 
@@ -295,10 +296,12 @@ def check_existing_feature_matrix(
     again and stops if the kind changed.
 
     Raises `ValueError` when harpy would reject any feature update of the table
-    because of its rows, so nothing is removed for an update that cannot succeed.
+    because of its rows, or `feature_key` because it is reserved for spatial
+    coordinates, so nothing is removed for an update that cannot succeed.
     """
     import harpy as hp
 
+    validate_feature_key_not_reserved(feature_key)
     table = get_table(sdata, table_name)
     selected_regions = {triplet.labels_name for triplet in triplets}
     unselected_regions = tuple(
@@ -397,6 +400,8 @@ def calculate_feature_matrix(
     """
     import harpy as hp
 
+    # Before anything is removed: an existing `obsm["spatial"]` holds coordinates.
+    validate_feature_key_not_reserved(feature_key)
     if create_table and overwrite_feature_key:
         raise ValueError("Cannot overwrite a feature key while creating a new table.")
 
