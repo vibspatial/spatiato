@@ -1473,7 +1473,7 @@ wheels = [
 
 [[package]]
 name = "harpy-analysis"
-version = "0.5.2"
+version = "0.5.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anndata" },
@@ -1498,9 +1498,9 @@ dependencies = [
     { name = "voronoi-diagram-for-polygons" },
     { name = "zarr" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6a/b4/4cec7b93b16e009bb7c36e93659a6d4b28a1ae63c8ff9da0e03a7651f5e0/harpy_analysis-0.5.2.tar.gz", hash = "sha256:4478be80462c4057514373d7102ab4906638b5316ea6784daa669609b05d943f", size = 21747857, upload-time = "2026-10-25T05:54:54.424Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a2/0d/5934babb1d34cefbdbb3b65b3e0bca655ce641b671a38d72229d277421d8/harpy_analysis-0.5.3.tar.gz", hash = "sha256:55137a9ae2356a245407b2047d98f240ea8d30d1f2394adf3f0788794ea35c9c", size = 21752392, upload-time = "2026-11-05T08:46:50.689Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/ba/da47674c5e18d34b46b08b3ba1f7a49762a2fad772c9e815e855cbe840d5/harpy_analysis-0.5.2-py3-none-any.whl", hash = "sha256:95552de5ff20049272bb277161f02c301560e1e9be0f0a11566c98269e7ca790", size = 961008, upload-time = "2026-10-25T05:54:51.94Z" },
+    { url = "https://files.pythonhosted.org/packages/68/c8/881ab4beb28c94ca3971634cc1384fd6338cfa544f6b412c73e5231a7bc0/harpy_analysis-0.5.3-py3-none-any.whl", hash = "sha256:598eaea7f27384cbd284bce41b5e095fdc3f250bdd6e961cdda93d65d9ea23e5", size = 948772, upload-time = "2026-11-05T08:46:48.102Z" },
 ]
 
 [[package]]
@@ -5051,7 +5051,7 @@ torch = [
 requires-dist = [
     { name = "dask", extras = ["dataframe"] },
     { name = "filelock", specifier = ">=3.20.1" },
-    { name = "harpy-analysis", specifier = ">=0.5.2" },
+    { name = "harpy-analysis", specifier = ">=0.5.3" },
     { name = "joblib" },
     { name = "lazy-loader", specifier = ">=0.4" },
     { name = "loguru" },
