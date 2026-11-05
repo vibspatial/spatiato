@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import dask.array as da
+import harpy as hp
 import numpy as np
 import zarr
 from harpy.image._image import _get_spatial_element
@@ -299,8 +300,6 @@ def check_existing_feature_matrix(
     because of its rows, or `feature_key` because it is reserved for spatial
     coordinates, so nothing is removed for an update that cannot succeed.
     """
-    import harpy as hp
-
     validate_feature_key_not_reserved(feature_key)
     table = get_table(sdata, table_name)
     selected_regions = {triplet.labels_name for triplet in triplets}
@@ -398,9 +397,9 @@ def calculate_feature_matrix(
     FeatureMatrixRemovedError
         Extraction failed after an incompatible matrix was removed.
     """
-    import harpy as hp
-
-    # Before anything is removed: an existing `obsm["spatial"]` holds coordinates.
+    # Check this first. `obsm["spatial"]` usually holds coordinates without
+    # feature metadata, which counts as an incompatible entry: it would be
+    # removed below, in memory and in the store, before harpy rejects the key.
     validate_feature_key_not_reserved(feature_key)
     if create_table and overwrite_feature_key:
         raise ValueError("Cannot overwrite a feature key while creating a new table.")
