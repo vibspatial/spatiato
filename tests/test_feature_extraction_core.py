@@ -252,6 +252,38 @@ def test_calculate_feature_matrix_validates_labels_before_removal(sdata_blobs_mu
     assert table.obsm[_KEY] is custom_matrix
 
 
+@pytest.mark.parametrize("feature_key", ["spatial", "spatial_canonical"])
+def test_calculate_feature_matrix_rejects_a_reserved_key_before_removal(
+    sdata_blobs_multi_region: SpatialData,
+    feature_key: str,
+) -> None:
+    table = sdata_blobs_multi_region[_TABLE]
+    # Coordinates without feature metadata: an incompatible entry, which a
+    # feature extraction would otherwise remove first.
+    coordinates = np.ones((table.n_obs, 2))
+    table.obsm[feature_key] = coordinates
+
+    with pytest.raises(ValueError, match="is reserved for spatial coordinates"):
+        calculate_feature_matrix(
+            sdata_blobs_multi_region,
+            table_name=_TABLE,
+            feature_key=feature_key,
+            triplets=_triplets("blobs_labels"),
+            feature_names=("area",),
+            overwrite_feature_key=True,
+        )
+    with pytest.raises(ValueError, match="is reserved for spatial coordinates"):
+        check_existing_feature_matrix(
+            sdata_blobs_multi_region,
+            table_name=_TABLE,
+            feature_key=feature_key,
+            triplets=_triplets("blobs_labels"),
+            feature_names=("area",),
+        )
+
+    assert table.obsm[feature_key] is coordinates
+
+
 def test_check_existing_feature_matrix_rejects_duplicate_rows(sdata_blobs_multi_region: SpatialData) -> None:
     table = sdata_blobs_multi_region[_TABLE]
     instance_key = get_table_metadata(sdata_blobs_multi_region, _TABLE).instance_key

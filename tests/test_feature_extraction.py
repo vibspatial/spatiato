@@ -185,6 +185,23 @@ def test_feature_extraction_controller_rejects_spatialdata_invalid_feature_key(
     assert controller._prepare_feature_extraction_job(8, overwrite_feature_key=False) is None
 
 
+@pytest.mark.parametrize("feature_key", ["spatial", "spatial_canonical"])
+def test_feature_extraction_controller_rejects_a_reserved_feature_key(
+    sdata_blobs: SpatialData,
+    feature_key: str,
+) -> None:
+    controller = FeatureExtractionController()
+
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], feature_key)
+
+    assert controller.can_calculate is False
+    assert controller.status_kind == "warning"
+    assert controller.status_message == (
+        "Feature extraction: choose a valid feature matrix key. "
+        f'`.obsm` key "{feature_key}" is reserved for spatial coordinates and cannot hold a feature matrix.'
+    )
+
+
 def test_feature_extraction_controller_blocks_when_no_table_is_selected(sdata_blobs: SpatialData) -> None:
     controller = FeatureExtractionController()
 
