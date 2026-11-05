@@ -135,6 +135,14 @@ def test_get_table_obsm_keys_returns_sorted_feature_matrix_keys(sdata_blobs: Spa
     assert obsm_keys == ["features_1", "features_2"]
 
 
+def test_get_table_obsm_keys_leaves_out_the_keys_reserved_for_spatial_coordinates(sdata_blobs: SpatialData) -> None:
+    table = sdata_blobs["table"]
+    table.obsm["spatial"] = np.zeros((table.n_obs, 2))
+    table.obsm["spatial_canonical"] = np.zeros((table.n_obs, 3))
+
+    assert get_table_obsm_keys(sdata_blobs, "table") == ["features_1", "features_2"]
+
+
 def test_get_table_obs_color_source_options_classifies_supported_columns(sdata_blobs: SpatialData) -> None:
     table = sdata_blobs["table"]
     n_obs = table.n_obs

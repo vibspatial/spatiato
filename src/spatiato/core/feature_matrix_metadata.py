@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 import pandas as pd
+from harpy.table.canonical_centers import CANONICAL_OBSM_KEY
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
 from spatiato.core.table_matrix import is_sparse_matrix
@@ -52,6 +53,17 @@ _FEATURE_MATRIX_METADATA_STATUSES_REQUIRING_ERROR: tuple[FeatureMatrixMetadataSt
 )
 # NumPy dtype kinds of a numeric feature matrix: bool, signed and unsigned integer, float.
 _NUMERIC_DTYPE_KINDS = "biuf"
+# `.obsm` keys harpy reserves for spatial coordinates: harpy rejects a feature
+# matrix under either, and a table registering one fails `hp.tb.validate_table`.
+RESERVED_OBSM_KEYS = frozenset({CANONICAL_OBSM_KEY, "spatial"})
+
+
+def validate_feature_key_not_reserved(feature_key: str) -> None:
+    """Raise `ValueError` when `feature_key` is reserved for spatial coordinates."""
+    if feature_key in RESERVED_OBSM_KEYS:
+        raise ValueError(
+            f'`.obsm` key "{feature_key}" is reserved for spatial coordinates and cannot hold a feature matrix.'
+        )
 
 
 @dataclass(frozen=True)
@@ -276,6 +288,7 @@ def register_feature_matrix_metadata(
 ) -> dict[str, object]:
     """Register classifier schema metadata for an existing `.obsm` matrix."""
     resolved_feature_key = _normalize_nonempty_str(feature_key, "feature_key")
+    validate_feature_key_not_reserved(resolved_feature_key)
     if resolved_feature_key not in table.obsm:
         raise ValueError(f'Feature matrix "{resolved_feature_key}" is not available in ".obsm".')
 

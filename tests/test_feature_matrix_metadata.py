@@ -47,6 +47,17 @@ def test_register_feature_matrix_metadata_rejects_missing_obsm_key() -> None:
         register_feature_matrix_metadata(table, "missing")
 
 
+@pytest.mark.parametrize("feature_key", ["spatial", "spatial_canonical"])
+def test_register_feature_matrix_metadata_rejects_a_reserved_key(feature_key: str) -> None:
+    table = _make_table()
+    table.obsm[feature_key] = np.zeros((table.n_obs, 2))
+
+    with pytest.raises(ValueError, match=f'`.obsm` key "{feature_key}" is reserved for spatial coordinates'):
+        register_feature_matrix_metadata(table, feature_key)
+
+    assert "feature_matrices" not in table.uns
+
+
 def test_register_feature_matrix_metadata_registers_one_dimensional_matrix() -> None:
     table = _make_table()
     table.obsm["scores"] = np.array([0.1, 0.2, 0.3], dtype=np.float32)
