@@ -18,6 +18,7 @@ from spatiato.core._color_source import (
     TableColorSourceSpec,
     TableColorValueKind,
 )
+from spatiato.core.feature_matrix_metadata import RESERVED_OBSM_KEYS
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -269,9 +270,12 @@ def validate_table_binding(sdata: SpatialData, labels_name: str, table_name: str
 
 
 def get_table_obsm_keys(sdata: SpatialData, table_name: str) -> list[str]:
-    """Return the available feature matrix keys from `adata.obsm` for a table in a SpatialData object."""
+    """Return the `adata.obsm` keys of a table that can hold a feature matrix, sorted.
+
+    The keys reserved for spatial coordinates (`RESERVED_OBSM_KEYS`) are left out.
+    """
     table = get_table(sdata, table_name)
-    return sorted(table.obsm.keys())
+    return sorted(key for key in table.obsm.keys() if key not in RESERVED_OBSM_KEYS)
 
 
 def get_table_obs_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:

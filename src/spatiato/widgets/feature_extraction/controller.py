@@ -22,6 +22,7 @@ from spatiato.core.feature_extraction import (
     calculate_feature_matrix,
     check_existing_feature_matrix,
 )
+from spatiato.core.feature_matrix_metadata import validate_feature_key_not_reserved
 from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatialdata import get_table
 from spatiato.core.validation import normalize_spatialdata_name, validate_new_spatialdata_element_name
@@ -995,6 +996,7 @@ def _get_feature_key_validation_error(feature_key: str | None) -> str | None:
 
     try:
         normalize_spatialdata_name(feature_key, "feature matrix key")
+        validate_feature_key_not_reserved(feature_key)
     except ValueError as error:
         return f"Feature extraction: choose a valid feature matrix key. {error}"
     return None

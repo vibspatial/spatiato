@@ -228,6 +228,7 @@ Classification only invalidates its classifier on `updated`.
 
 | Error                                                   | Raised by                                          | Table changed? | Widget                                            | Headless   |
 | ------------------------------------------------------- | -------------------------------------------------- | -------------- | ------------------------------------------------- | ---------- |
+| Reserved key (`spatial`, `spatial_canonical`)           | the controller's key check; the check and `calculate_feature_matrix` first | no | Calculate disabled, status                     | exception  |
 | Unsaved changes to the key (backed)                     | widget, before the check                           | no             | status, nothing launched                          | –          |
 | Rows harpy would reject                                 | `_validate_table_rows`, in the check               | no             | main thread: status; worker: status               | exception  |
 | Unknown channel, missing image                          | channel resolution, in the check                   | no             | the same                                          | exception  |
