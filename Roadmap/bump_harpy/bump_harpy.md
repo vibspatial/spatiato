@@ -1,13 +1,14 @@
-# Bump Harpy to 0.5.2: Lazy Matrices and Table Component I/O
+# Bump Harpy to 0.5.3: Lazy Matrices and Table Component I/O
 
 Status: investigation done. Problems are listed below and will be tackled one by
 one, in the order of "Migration Plan"; each section's direction is a proposal to
 settle when we pick it up. Target moved from harpy 0.5.0 to 0.5.2 on
-2026-10-25.
+2026-10-25, and to 0.5.3 on 2026-11-05 (canonical-center refactor and
+reserved `.obsm` keys, see "Harpy 0.5.3: What Changed").
 
 ## Goal
 
-Move Spatiato to `harpy-analysis>=0.5.2` and handle the two harpy 0.5.0 changes
+Move Spatiato to `harpy-analysis>=0.5.3` and handle the two harpy 0.5.0 changes
 that affect Spatiato:
 
 - **lazy matrices**: harpy now attaches table matrices as Dask arrays or backed
@@ -16,7 +17,8 @@ that affect Spatiato:
   individual table components, overlapping with Spatiato's own reader/writer.
 
 harpy 0.5.1 also raises the `anndata` floor to `>=0.13`, so the move to anndata
-0.13 is part of this bump.
+0.13 is part of this bump. harpy 0.5.3 moves canonical centers fully to harpy
+(P8) and reserves two `.obsm` keys (P9).
 
 Development policy: develop against harpy releases from PyPI, not against
 harpy's `main` branch. When Spatiato needs an unreleased harpy change, pin it
@@ -32,13 +34,14 @@ Remove it once harpy releases the change, and before any Spatiato release.
 
 ## Environment
 
-- `pyproject.toml`: `harpy-analysis>=0.5.2` (raised from `>=0.4.4` to `>=0.5.0`
-  in `d895ea5`, then to `>=0.5.2`), `spatialdata>=0.8.0` (needed with anndata
-  0.13, see P0), `napari[all]>=0.7.1`. Spatiato does not declare `anndata`;
-  harpy's floor applies.
-- `.venv` has **harpy 0.5.2**, `anndata 0.13.4`, `spatialdata 0.8.0`,
-  `dask 2026.8.0`, `zarr 3.2.1`, `numpy 2.3.5`; `uv.lock` is refreshed. See P0
-  for the test runs on 0.5.0 and 0.5.2.
+- `pyproject.toml`: `harpy-analysis>=0.5.3` (raised from `>=0.4.4` to `>=0.5.0`
+  in `d895ea5`, then to `>=0.5.2`, and to `>=0.5.3` on 2026-11-05),
+  `spatialdata>=0.8.0` (needed with anndata 0.13, see P0),
+  `napari[all]>=0.7.1`. Spatiato does not declare `anndata`; harpy's floor
+  applies.
+- `.venv` has **harpy 0.5.3** (since 2026-11-05), `anndata 0.13.4`,
+  `spatialdata 0.8.0`, `dask 2026.8.0`, `zarr 3.2.1`, `numpy 2.3.5`. See P0
+  for the test runs on 0.5.0, 0.5.2 and 0.5.3.
 - harpy 0.5.2 requires `anndata>=0.13`, `spatialdata>=0.7.3`, and `zarr>=3.2.1`.
   spatialdata 0.7.3 does not work with anndata 0.13, so in practice it needs
   `spatialdata>=0.8.0` (see P0).
@@ -49,6 +52,7 @@ Remove it once harpy releases the change, and before any Spatiato release.
   | 0.5.0 | `6299266` | lazy matrices and table component I/O ("Feature/table qc (#264)") |
   | 0.5.1 | `a65e793` | "Feature/qc metrics (#271)", the `feature/qc_metrics` branch; anndata `>=0.13` |
   | 0.5.2 | `5ff8c3e` | "Fix/cosmx reader fov coordinates (#275)", including the fix for https://github.com/saeyslab/harpy/issues/274 |
+  | 0.5.3 | `4363428` | "Feature/concat tables (#283)": the canonical-center refactor (https://github.com/saeyslab/harpy/issues/279, https://github.com/saeyslab/harpy/issues/282) and reserved `.obsm` keys |
 
 - Source reviewed at tag `v0.5.0`, on the `feature/qc_metrics` branch (before it
   became 0.5.1), and in #275. The storage design is documented in harpy's
@@ -223,6 +227,50 @@ Relevant elsewhere:
 - harpy's `[tool.uv] override-dependencies` (`numpy>=2.4.6`, `numba>=0.64.0`)
   apply to harpy's own environment only; neither is in harpy 0.5.2's published
   requirements, so they do not reach Spatiato (`.venv` has numpy 2.3.5).
+
+## Harpy 0.5.3: What Changed
+
+Checked on 2026-11-05 against the installed 0.5.3 and harpy's
+`roadmap/concat_tables/canonical_cache.md`. https://github.com/saeyslab/harpy/issues/279
+and https://github.com/saeyslab/harpy/issues/282 are addressed by #283, though
+both are still open on GitHub.
+
+- **Canonical centers** (P8):
+  - `hp.tb.add_canonical_centers(sdata, *, table_name, overwrite=False)` loses
+    `labels_name` and always computes every labels element the table
+    annotates. It installs through `hp.tb.io.add_table_components`: on
+    unbacked SpatialData the matrix is NumPy in memory; on backed SpatialData
+    the two canonical components are written to the store and the matrix is
+    reattached lazily, as a Dask array, no longer as a read-only `zarr.Array`.
+    `overwrite` only concerns the store (`FileExistsError` without it). It
+    first checks the whole table as `hp.tb.validate_table` does, except the
+    canonical centers it replaces.
+  - `harpy.table.canonical_centers.validate_canonical_centers(sdata, *,
+    table_name)` replaces `validate_canonical_payload` and reads the region
+    and instance keys and the declared regions from the table's annotation.
+    It returns `None` without canonical centers, the metadata when they are
+    valid, and raises `ValueError` otherwise.
+  - The record is schema version 2: no `coverage` (row count and instance
+    digest), so row subsets and reorders keep the centers valid. A version-1
+    record, such as every record Spatiato wrote, raises with a hint to
+    rebuild with `overwrite=True`. Validation compares each declared region's
+    labels source (dims, shape, dtype) and algorithm version, and requires
+    finite values and `z = 0` for 2-D labels.
+  - The cache API is deleted or private: `inspect_canonical_cache`,
+    `read_canonical_centers_from_cache`, the reports, states and update
+    payloads, `build_canonical_region_binding` and the instance digest. A
+    reader finds a labels element's rows from the table annotation.
+- **Reserved `.obsm` keys** (P9): `spatial_canonical` and `spatial`.
+  `add_feature_matrix` rejects either as `feature_key`, before computing, and
+  `validate_table` rejects a feature-matrix record under either.
+- **Unchanged for Spatiato:** every private name it imports
+  (`_resolve_channels`, `_get_spatial_element`, `_component_update_destination`,
+  `_check_in_memory_versus_storage_axes`, `_validated_observation_pairs`,
+  `_FEATURE_MATRICES_KEY`) and the public `get_dataarray` and
+  `RasterAggregator` still exist; regional updates of an unbacked matrix still
+  chain lazy merges unless both matrices are in memory (3c.3 relies on this).
+  Spatiato's custom feature-matrix records (`source_kind="custom_obsm"`) pass
+  harpy's record checks.
 
 ## Spatiato Today
 
@@ -471,16 +519,19 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3a | Matrix helpers, with unit tests per representation | implemented on 2026-10-30 (`core/table_matrix.py`, `tests/test_table_matrix.py`) |
    | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
    | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | implemented on 2026-10-30 (`feature_matrix_n_features(...)`); an `object`-dtype matrix is now rejected as not numeric, and a DataFrame feature matrix is rejected (harpy never writes one), so `core/table_matrix.py` no longer supports DataFrames either |
-   | 3c.2 | Spatial Query's canonical centers through harpy (P8): validate with `validate_canonical_payload(...)`, compute every labels element with `hp.tb.add_canonical_centers(..., overwrite=True)` in the worker, read the selected labels element's rows with `read_matrix_rows(...)`; delete `canonical_models.py`, `canonical.py` and `centroids.py` | waits on the harpy issue for unbacked SpatialData (P8) |
+   | 3c.2 | Spatial Query's canonical centers through harpy (P8): validate with `validate_canonical_centers(sdata, table_name=...)`, compute every labels element with `hp.tb.add_canonical_centers(..., overwrite=True)` in the worker, find the selected labels element's rows from the table annotation and read them with `read_matrix_rows(...)`; events (`"created"`/`"rebuilt"`), persisted change for backed and mutation for unbacked SpatialData, a reload guard while the worker writes, a plain 2-D dims check for the labels choices, and the annotation module reading the keys from the table; delete `canonical_models.py`, `canonical.py` and `centroids.py` and their tests | unblocked by harpy 0.5.3; needs a readiness check and a split into parts, after 3c.4 |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
+   | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | ready; before 3c.2 |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
-   3c.1-3c.3 are independent and committed separately; 3c.1 comes first,
-   because the classifier summary in 3d relies on its shape-only check. 3c.2
-   waits on harpy (P8), so 3c.3 and 3d can go before it. 3c.3 replaces a
-   safeguard that computed the matrix after each extraction, dropped on
-   2026-10-30 (see P1, "Resolution"). 3c.2 replaced, on 2026-11-01, a plan to
-   route Spatiato's own canonical-center code through the matrix helpers.
+   3c.1-3c.4 are committed separately; 3c.1 comes first, because the
+   classifier summary in 3d relies on its shape-only check. 3c.4 comes before
+   3c.2, because a feature-matrix record under a reserved key would make
+   `add_canonical_centers` reject the table. 3c.3 and 3d are independent of
+   3c.2 and 3c.4. 3c.3 replaces a safeguard that computed the matrix after
+   each extraction, dropped on 2026-10-30 (see P1, "Resolution"). 3c.2
+   replaced, on 2026-11-01, a plan to route Spatiato's own canonical-center
+   code through the matrix helpers; harpy 0.5.3 unblocked it on 2026-11-05.
 
    Facts for the helpers, checked at runtime (anndata 0.13.4, dask 2026.8.0,
    zarr 3.2.1) on matrices written with anndata and read back through harpy's
@@ -677,6 +728,14 @@ Remaining P0 items, checked on 2026-10-23:
   Rerun on 2026-10-24 against the #275 branch (the code released as 0.5.2,
   with anndata 0.12.16): every case above, including 5 more overwrites, gives
   NumPy.
+- Run on 2026-11-05 against harpy 0.5.3 (anndata 0.13.4, spatialdata 0.8.0),
+  in parallel, over the 19 test modules that call harpy or depend on what it
+  attaches: feature extraction (core, controller, widget), multi-widget,
+  headless, persistence, app state, the six Spatial Query modules, the
+  classifier and Object Classification widget, the matrix helpers, feature
+  matrix metadata, and labels and shapes styling. 681 passed. Spatiato does
+  not call harpy's canonical-center API yet (P8), so 0.5.3's changes there do
+  not reach these tests.
 
 ### P1. Dense Dask feature matrices are fully materialized on every use
 
@@ -1386,10 +1445,10 @@ unsaved-changes block, dialogs, widget tests).
 
 ### P8. Spatial Query computes canonical centers itself
 
-Status: decided on 2026-11-01. Waits on a harpy change: support for
-SpatialData without a backing store
-(https://github.com/saeyslab/harpy/issues/282, see "harpy issue" below). Implemented as
-3c.2 of the "Migration Plan".
+Status: decided on 2026-11-01. The harpy side shipped in 0.5.3 on 2026-11-05
+(#283, addressing https://github.com/saeyslab/harpy/issues/279 and
+https://github.com/saeyslab/harpy/issues/282; see "Harpy 0.5.3: What
+Changed"). Implemented as 3c.2 of the "Migration Plan", after P9.
 
 Today Spatiato computes canonical centers per labels element
 (`core/spatial_query/centroids.py`, 162 lines) and keeps a regional cache with
@@ -1403,11 +1462,9 @@ package, documented as the integration contract for Spatiato
 (`docs/canonical_centers.md` in harpy), and `hp.tb.add_canonical_centers`. Same
 algorithm (`RasterAggregator.center_of_mass` on `scale0`, intrinsic pixel
 frame, `(z, y, x)` float64) and record layout; only the instance-digest domain
-differs (`spatiato/...` against `napari-harpy/...`), so neither side's digests
-match the other's records. #282 also asks harpy to rename its domain to
-`harpy/...` (`napari-harpy` is Spatiato's former name), unless #279 drops the
-digest altogether. Checked on 2026-11-01: the harpy repository and the
-installed 0.5.2 are identical here.
+differed (`spatiato/...` against `napari-harpy/...`). harpy 0.5.3 drops the
+instance digest and the cache API, and moves the record to schema version 2,
+so that difference no longer matters.
 
 Decision:
 
@@ -1417,18 +1474,26 @@ Decision:
   considered on 2026-11-01 (`add_canonical_centers(..., region=...)`) and
   dropped, as not worth it for harpy or Spatiato.
 - **Spatiato relies on harpy and keeps no canonical logic of its own:**
-  - status, and every Run: `validate_canonical_payload(...)` (public;
-    `hp.tb.validate_table` wraps it). It returns `None` when there are no
-    canonical centers and raises `ValueError` when they are stale,
-    incomplete, not finite or do not match the table; it reads the
-    `(n_obs, 3)` matrix and labels metadata, no pixels;
+  - status, and every Run: `validate_canonical_centers(sdata,
+    table_name=...)` (public, in `harpy.table.canonical_centers`;
+    `hp.tb.validate_table` runs it too). It reads the annotation from the
+    table, returns `None` when there are no canonical centers, and raises
+    `ValueError` when they are stale (another labels source or algorithm
+    version), not finite, malformed, or in schema version 1. It reads the
+    `(n_obs, 3)` matrix and labels metadata, no pixels. Row subsets and
+    reorders keep the centers valid;
   - when absent or invalid: `hp.tb.add_canonical_centers(sdata,
     table_name=..., overwrite=True)` in the worker, which recomputes every
-    labels element of the table;
-  - reading: the selected labels element's rows with `read_matrix_rows(...)`,
-    with harpy's public `build_canonical_region_binding(...)` for the row
-    positions. The provenance check at Apply validates again and compares
-    those rows;
+    labels element of the table. `overwrite=True` is needed for backed
+    SpatialData whose store already has canonical centers; it is ignored for
+    unbacked SpatialData. Afterwards the matrix is NumPy (unbacked) or a lazy
+    Dask array (backed); `read_matrix_rows(...)` reads either;
+  - reading: the selected labels element's rows with `read_matrix_rows(...)`.
+    Spatiato finds those rows and their instance IDs from the table's
+    annotation (`get_table_keys(table)`), as Object Classification does with
+    `_resolve_region_row_positions(...)`; harpy keeps its region binding
+    private. The provenance check at Apply validates again and compares those
+    rows;
   - deleted: `canonical_models.py`, `canonical.py`, `centroids.py`, the cache
     states and actions, and the regional update. The status card shows
     "valid", "absent", or "needs recalculation" with harpy's message. Spatial
@@ -1437,7 +1502,10 @@ Decision:
 - **Persistence:** for backed SpatialData, harpy writes the canonical
   components itself. Spatiato records a persisted change, as for feature
   extraction, not a dirty mutation, and blocks reloads of the table while the
-  worker writes. Feature Extraction and Spatial Query can then both write
+  worker writes. For unbacked SpatialData the centers exist only in memory and
+  are recorded as a mutation, as Feature Extraction does. The event is
+  `"created"` when the table had no canonical centers, and `"rebuilt"` when
+  they were replaced. Feature Extraction and Spatial Query can then both write
   through harpy at once, which harpy does not protect against, so the shared
   write guard noted under P5 must cover both widgets.
 - **Accepted costs:**
@@ -1445,19 +1513,45 @@ Decision:
     recomputed;
   - Spatial Query is unavailable for a table whose centers cannot all be
     computed: a region that is not a labels element, a region without rows,
-    or a table row without pixels. The status shows harpy's reason;
-  - canonical centers written by Spatiato so far count as invalid and are
-    recomputed once. Not backward compatible; these are young features.
+    or a table row without pixels. The same holds for a table that
+    `hp.tb.validate_table` rejects for an unrelated reason, since
+    `add_canonical_centers` checks the whole table first: for example a
+    feature-matrix record under a reserved `.obsm` key (P9). The status shows
+    harpy's reason;
+  - canonical centers written by Spatiato so far are schema version 1, fail
+    validation with harpy's rebuild hint, and are recomputed once. Not
+    backward compatible; these are young features.
 
-harpy issue (opened on 2026-11-01:
-https://github.com/saeyslab/harpy/issues/282; related:
-https://github.com/saeyslab/harpy/issues/279, canonical-center validation and
-row subsets): `add_canonical_centers` rejects SpatialData without a backing store
-(`_validate_canonical_centers_destination(...)` in
-`harpy/table/_canonical_centers.py`: "requires a SpatialData object backed by a
-writable Zarr store"). Ask it to install the centers in memory for such
-SpatialData, as `add_feature_matrix` does. Until harpy releases that, Spatial
-Query cannot compute canonical centers on in-memory SpatialData.
+harpy issues: https://github.com/saeyslab/harpy/issues/282 (opened on
+2026-11-01) asked `add_canonical_centers` to support SpatialData without a
+backing store, and https://github.com/saeyslab/harpy/issues/279 to stop row
+subsets invalidating canonical centers. Both are addressed in 0.5.3 (#283),
+which also drops the instance digest whose domain #282 asked to rename.
+
+### P9. Reserved `.obsm` keys
+
+Status: found on 2026-11-05 (harpy 0.5.3). Implemented as 3c.4 of the
+"Migration Plan", before 3c.2.
+
+harpy 0.5.3 reserves `obsm["spatial_canonical"]` and `obsm["spatial"]`:
+`add_feature_matrix` rejects either as `feature_key`, and `validate_table`
+rejects a feature-matrix record under either. Spatiato blocks neither:
+
+- Feature Extraction's key check (`_get_feature_key_validation_error(...)` in
+  `widgets/feature_extraction/controller.py`) accepts both, so harpy raises in
+  the worker instead of the widget refusing up front;
+- Object Classification lists every `obsm` key (`get_table_obsm_keys(...)` in
+  `core/spatialdata.py`), so a user can register `spatial` or
+  `spatial_canonical` as a custom feature matrix. harpy's `validate_table`
+  then rejects the table, and so does `add_canonical_centers`, which checks
+  the whole table first: Spatial Query becomes unavailable because of an
+  unrelated registration.
+
+Direction: Feature Extraction rejects the reserved keys in its key check, with
+the other key errors; Object Classification leaves them out of its
+feature-matrix choices and refuses to register them. Take the reserved set
+from harpy if it becomes public; until then, Spatiato names the two keys
+(harpy's `_RESERVED_OBSM_KEYS` is private).
 
 ## Tests to Add
 
@@ -1473,8 +1567,11 @@ Query cannot compute canonical centers on in-memory SpatialData.
   without recomputation; absent or stale centers are recomputed with
   `add_canonical_centers`; only the selected labels element's rows are read;
   backed SpatialData records a persisted change and blocks reloads while the
-  worker writes; a table whose centers cannot all be computed shows harpy's
-  reason; in-memory SpatialData once harpy supports it;
+  worker writes; in-memory SpatialData records a mutation; a version-1 record
+  is recomputed; a table whose centers cannot all be computed shows harpy's
+  reason;
+- reserved `.obsm` keys (P9): Feature Extraction rejects them before
+  launching; Object Classification does not offer or register them;
 - backed `zarr.Array` / `CSRDataset` consumers (P3);
 - reload keeps `obsm` lazy (P4);
 - persistence through harpy's API: write, delete, rollback on failure,
@@ -1527,8 +1624,14 @@ Settled on 2026-10-30 (see "Migration Plan", step 2):
 Settled on 2026-11-01 (see P8):
 
 - Spatial Query relies on harpy for canonical centers, all or nothing: no
-  regional updates, no canonical logic left in Spatiato. Waits on harpy
-  supporting SpatialData without a backing store.
+  regional updates, no canonical logic left in Spatiato. harpy 0.5.3 supports
+  SpatialData without a backing store (settled on 2026-11-05).
+
+Settled on 2026-11-05:
+
+- Target harpy 0.5.3 (`harpy-analysis>=0.5.3`), which ships the canonical-center
+  refactor (P8) and reserves two `.obsm` keys (P9, implemented as 3c.4 before
+  3c.2).
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
