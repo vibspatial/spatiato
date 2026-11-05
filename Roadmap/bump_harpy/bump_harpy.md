@@ -521,7 +521,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | implemented on 2026-10-30 (`feature_matrix_n_features(...)`); an `object`-dtype matrix is now rejected as not numeric, and a DataFrame feature matrix is rejected (harpy never writes one), so `core/table_matrix.py` no longer supports DataFrames either |
    | 3c.2 | Spatial Query's canonical centers through harpy (P8): validate with `validate_canonical_centers(sdata, table_name=...)`, compute every labels element with `hp.tb.add_canonical_centers(..., overwrite=True)` in the worker, find the selected labels element's rows from the table annotation and read them with `read_matrix_rows(...)`; events (`"created"`/`"rebuilt"`), persisted change for backed and mutation for unbacked SpatialData, a reload guard while the worker writes, a plain 2-D dims check for the labels choices, and the annotation module reading the keys from the table; delete `canonical_models.py`, `canonical.py` and `centroids.py` and their tests | unblocked by harpy 0.5.3; needs a readiness check and a split into parts, after 3c.4 |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
-   | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | ready; before 3c.2 |
+   | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
    3c.1-3c.4 are committed separately; 3c.1 comes first, because the
@@ -1530,7 +1530,7 @@ which also drops the instance digest whose domain #282 asked to rename.
 
 ### P9. Reserved `.obsm` keys
 
-Status: found on 2026-11-05 (harpy 0.5.3). Implemented as 3c.4 of the
+Status: found and implemented on 2026-11-05 (harpy 0.5.3), as 3c.4 of the
 "Migration Plan", before 3c.2.
 
 harpy 0.5.3 reserves `obsm["spatial_canonical"]` and `obsm["spatial"]`:
