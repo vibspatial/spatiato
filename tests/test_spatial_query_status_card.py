@@ -1,8 +1,7 @@
-from types import SimpleNamespace
-
 import pytest
 
-from spatiato.core.spatial_query import CanonicalCacheState, SpatialAnnotationSummary
+from spatiato.core.spatial_query import SpatialAnnotationSummary
+from spatiato.core.spatial_query.canonical_centers import CanonicalCentersStatus
 from spatiato.widgets.spatial_query.status_card import (
     build_spatial_annotation_failure_status_card_spec,
     build_spatial_annotation_outcome_status_card_spec,
@@ -11,42 +10,53 @@ from spatiato.widgets.spatial_query.status_card import (
 )
 
 
-@pytest.mark.parametrize(
-    ("state", "expected_kind", "expected_cache_text"),
-    [
-        (CanonicalCacheState.VALID, "success", "will be reused"),
-        (CanonicalCacheState.ABSENT, "info", "will be calculated"),
-        (CanonicalCacheState.PARTIAL, "info", "will be calculated"),
-        (CanonicalCacheState.STALE, "warning", "will be refreshed"),
-        (CanonicalCacheState.INVALID, "info", "will be recalculated"),
-    ],
-)
-def test_spatial_query_status_describes_ready_cache_states(
-    state: CanonicalCacheState,
-    expected_kind: str,
-    expected_cache_text: str,
-) -> None:
-    report = SimpleNamespace(
-        labels_name="cells",
-        state=state,
-        mismatches=(SimpleNamespace(detail="technical mismatch detail"),),
-    )
-
-    spec = build_spatial_query_status_card_spec(
+def _configuration_spec(
+    centers_status: CanonicalCentersStatus,
+    *,
+    waiting_for_centers_job: bool = False,
+    table_busy_message: str | None = None,
+):
+    return build_spatial_query_status_card_spec(
         has_spatialdata=True,
         coordinate_system="global",
         saved_shapes_name="regions",
         has_unsaved_shapes_changes=False,
         labels_name="cells",
         table_name="table",
-        cache_report=report,
-        canonical_input_inspection_error=None,
+        centers_status=centers_status,
         annotation_column_error=None,
         annotation_column_description='New column "spatial_annotation"',
         annotation_mutation_error=None,
         annotation_mutation_description='Action: Set annotation to "tumor".',
         layer_styling_error=None,
+        waiting_for_centers_job=waiting_for_centers_job,
+        table_busy_message=table_busy_message,
     )
+
+
+@pytest.mark.parametrize(
+    ("centers_status", "expected_kind", "expected_centers_line"),
+    [
+        (CanonicalCentersStatus("table", "valid"), "success", 'Centers for "cells" will be reused.'),
+        (
+            CanonicalCentersStatus("table", "absent"),
+            "info",
+            'Centers for every labels element of table "table" will be calculated before querying.',
+        ),
+        (
+            CanonicalCentersStatus("table", "invalid", "harpy's technical reason"),
+            "info",
+            'Centers for every labels element of table "table" will be recalculated before querying.',
+        ),
+    ],
+    ids=["valid", "absent", "invalid"],
+)
+def test_spatial_query_status_describes_the_three_canonical_centers_states(
+    centers_status: CanonicalCentersStatus,
+    expected_kind: str,
+    expected_centers_line: str,
+) -> None:
+    spec = _configuration_spec(centers_status)
 
     visible_text = "\n".join(spec.lines)
     assert spec.source == "configuration"
@@ -55,10 +65,27 @@ def test_spatial_query_status_describes_ready_cache_states(
     assert 'Shapes "regions" will query labels "cells".' in visible_text
     assert 'Target: New column "spatial_annotation".' in visible_text
     assert 'Action: Set annotation to "tumor".' in visible_text
-    assert expected_cache_text in visible_text
-    assert "technical mismatch detail" not in visible_text
-    if state is CanonicalCacheState.INVALID:
-        assert spec.tooltip_message == "technical mismatch detail"
+    assert expected_centers_line in visible_text
+    # harpy's reason is the tooltip of invalid centers, never the visible text.
+    assert "harpy's technical reason" not in visible_text
+    if centers_status.state == "invalid":
+        assert spec.tooltip_message == "harpy's technical reason"
+
+
+def test_spatial_query_status_says_a_detached_centers_job_is_still_writing() -> None:
+    spec = _configuration_spec(CanonicalCentersStatus("table", "absent"), waiting_for_centers_job=True)
+
+    assert spec.title == "Center Calculation Still Writing"
+    assert spec.lines == ("Waiting for the previous center calculation to finish writing.",)
+
+
+def test_spatial_query_status_says_another_job_keeps_the_table_busy() -> None:
+    message = 'Table "table" is busy: Feature Extraction is still writing its results.'
+
+    spec = _configuration_spec(CanonicalCentersStatus("table", "valid"), table_busy_message=message)
+
+    assert spec.title == "Table Busy"
+    assert spec.lines == (message,)
 
 
 @pytest.mark.parametrize(

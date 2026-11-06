@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+from harpy.table.canonical_centers import CANONICAL_OBSM_KEY
 from matplotlib.colors import to_rgba
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QObject, Qt, Signal
 from spatialdata import SpatialData
 from spatialdata.transformations import Identity, set_transformation
 
@@ -17,21 +18,18 @@ import spatiato.widgets.persistence.controls as persistence_controls_module
 import spatiato.widgets.spatial_query.widget as widget_module
 from spatiato._app_state import ShapesElementReloadedEvent, TableReloadRequest, TableStateChangedEvent
 from spatiato.core.persistence import TableComponentPath
-from spatiato.core.spatial_query import (
-    CANONICAL_CACHE_PATHS,
-    CANONICAL_OBSM_KEY,
-    CanonicalCacheState,
-    CanonicalCenterQueryResult,
-    CanonicalCentersResult,
-    apply_canonical_cache_update,
-    build_canonical_cache_update_payload,
-    inspect_canonical_cache,
-    read_canonical_centers_from_cache,
+from spatiato.core.spatial_query import CanonicalCenterQueryResult
+from spatiato.core.spatial_query.canonical_centers import (
+    CANONICAL_CENTERS_PATHS,
+    canonical_centers_status,
+    compute_canonical_centers,
+    read_canonical_centers_region,
 )
 from spatiato.viewer._styling import MISSING_CATEGORICAL_COLOR
 from spatiato.widgets.annotation.models import AnnotationContext, ShapesAnnotationTarget
+from spatiato.widgets.spatial_query.controller import CanonicalCentersChangeResult
 from spatiato.widgets.spatial_query.widget import (
-    CANONICAL_CACHE_UPDATE_SOURCE,
+    CANONICAL_CENTERS_SOURCE,
     SPATIAL_QUERY_ANNOTATION_SOURCE,
     SpatialQuery,
 )
@@ -112,20 +110,12 @@ def _add_default_annotation_column(sdata: SpatialData) -> None:
 
 
 def _query_result(sdata: SpatialData, *, count: int = 2) -> CanonicalCenterQueryResult:
-    report = inspect_canonical_cache(sdata, table_name="table", labels_name="blobs_labels")
-    if report.state is not CanonicalCacheState.VALID:
-        centers = np.zeros((report.binding.n_obs, 3), dtype=np.float64)
-        payload = build_canonical_cache_update_payload(
-            binding=report.binding,
-            centers=centers,
-            source_signature=report.source_signature,
-        )
-        apply_canonical_cache_update(sdata, payload)
-        report = inspect_canonical_cache(sdata, table_name="table", labels_name="blobs_labels")
-    canonical_centers = read_canonical_centers_from_cache(sdata, report)
+    if canonical_centers_status(sdata, table_name="table").state != "valid":
+        compute_canonical_centers(sdata, table_name="table")
+    region = read_canonical_centers_region(sdata, table_name="table", labels_name="blobs_labels")
     return CanonicalCenterQueryResult(
-        canonical_centers=canonical_centers,
-        matched_instance_ids=np.sort(canonical_centers.binding.instance_ids)[:count],
+        canonical_centers=region,
+        matched_instance_ids=np.sort(region.instance_ids)[:count],
     )
 
 
@@ -349,7 +339,7 @@ def test_spatial_query_shapes_reload_invalidates_only_a_matching_accepted_run(
     assert "reviewed_annotation" not in sdata_blobs.tables["table"].obs
 
 
-def test_spatial_query_adopts_reloaded_columns_cache_and_neutral_styling(
+def test_spatial_query_adopts_reloaded_columns_centers_status_and_neutral_styling(
     qtbot,
     backed_sdata_blobs: SpatialData,
 ) -> None:
@@ -378,7 +368,7 @@ def test_spatial_query_adopts_reloaded_columns_cache_and_neutral_styling(
     assert widget.selected_column_mode == "new"
     assert widget.new_column_edit.text() == "draft_annotation"
     assert widget.selected_column_name == "draft_annotation"
-    assert widget.cache_report is not None
+    assert widget.centers_status is not None
     neutral_rgba = np.asarray(to_rgba(MISSING_CATEGORICAL_COLOR), dtype=np.float32)
     assert np.allclose(viewer.layers[0].colormap.map(1), neutral_rgba)
 
@@ -392,14 +382,14 @@ def test_spatial_query_shell_requires_an_explicit_new_column_name_and_captures_r
     widget = SpatialQuery(viewer)
     qtbot.addWidget(widget)
     inspection_calls = 0
-    real_inspect = widget_module.inspect_canonical_cache
+    real_status = widget_module.canonical_centers_status
 
     def record_inspection(*args, **kwargs):
         nonlocal inspection_calls
         inspection_calls += 1
-        return real_inspect(*args, **kwargs)
+        return real_status(*args, **kwargs)
 
-    monkeypatch.setattr(widget_module, "inspect_canonical_cache", record_inspection)
+    monkeypatch.setattr(widget_module, "canonical_centers_status", record_inspection)
     obs_before = sdata_blobs.tables["table"].obs.copy(deep=True)
     uns_before = copy.deepcopy(sdata_blobs.tables["table"].uns)
 
@@ -407,7 +397,7 @@ def test_spatial_query_shell_requires_an_explicit_new_column_name_and_captures_r
 
     assert widget.selected_labels_name is None
     assert widget.selected_table_name is None
-    assert widget.cache_report is None
+    assert widget.centers_status is None
     assert inspection_calls == 0
     assert viewer.layers == []
 
@@ -419,7 +409,7 @@ def test_spatial_query_shell_requires_an_explicit_new_column_name_and_captures_r
     assert widget.new_column_edit.text() == ""
     assert widget.new_column_edit.placeholderText() == "spatial_annotation"
     assert widget.selected_column_name is None
-    assert widget.cache_report is not None
+    assert widget.centers_status is not None
     assert widget.run_button.isEnabled() is False
     assert "Enter a new annotation column name" in _status_text(widget.status_label)
     assert inspection_calls == 1
@@ -434,12 +424,13 @@ def test_spatial_query_shell_requires_an_explicit_new_column_name_and_captures_r
     assert "Enter a non-empty annotation value" in _status_text(widget.status_label)
     widget.annotation_value_edit.setText("tumor")
     assert widget.run_button.isEnabled() is True
-    assert inspection_calls == 1  # Status rendering reuses the captured report.
+    assert inspection_calls == 1  # Status rendering reuses the checked status.
 
-    starts: list[tuple[object, object, str, str]] = []
+    starts: list[tuple[object, object, str, str, str]] = []
 
-    def start_spatial_query(sdata, report, *, shapes_name, coordinate_system):
-        starts.append((sdata, report, shapes_name, coordinate_system))
+    def start_spatial_query(sdata, centers_status, *, labels_name, shapes_name, coordinate_system, dirty_snapshot):
+        del dirty_snapshot
+        starts.append((sdata, centers_status, labels_name, shapes_name, coordinate_system))
         return True
 
     monkeypatch.setattr(widget._controller, "start_spatial_query", start_spatial_query)
@@ -447,12 +438,12 @@ def test_spatial_query_shell_requires_an_explicit_new_column_name_and_captures_r
 
     assert len(starts) == 1
     assert starts[0][0] is sdata_blobs
-    assert starts[0][1] is widget.cache_report
-    assert starts[0][2:] == ("blobs_circles", "global")
+    assert starts[0][1] is widget.centers_status
+    assert starts[0][2:] == ("blobs_labels", "blobs_circles", "global")
     assert widget._active_run_intent is not None
     assert widget._active_run_intent.annotation_action == "set"
     assert widget._active_run_intent.annotation_value == "tumor"
-    assert inspection_calls == 2  # Run performs one fresh authoritative inspection.
+    assert inspection_calls == 2  # Run checks the canonical centers status once more.
     pd.testing.assert_frame_equal(sdata_blobs.tables["table"].obs, obs_before)
     assert sdata_blobs.tables["table"].uns == uns_before
 
@@ -710,34 +701,12 @@ def test_spatial_query_shell_clears_new_column_draft_when_table_changes(
     assert widget.run_button.isEnabled() is False
 
 
-def test_spatial_query_shell_blocks_live_input_inspection_failure(
-    qtbot,
-    monkeypatch: pytest.MonkeyPatch,
-    sdata_blobs: SpatialData,
-) -> None:
-    def reject_inspection(*args, **kwargs):
-        raise ValueError("invalid current table binding")
-
-    monkeypatch.setattr(widget_module, "inspect_canonical_cache", reject_inspection)
-    widget = SpatialQuery()
-    qtbot.addWidget(widget)
-
-    widget.apply_annotation_context(_context(sdata_blobs))
-    _select_labels(widget)
-
-    assert widget.cache_report is None
-    assert widget.run_button.isEnabled() is False
-    status_text = _status_text(widget.status_label)
-    assert "Labels or Table Validation Failed" in status_text
-    assert "invalid current table binding" in status_text
-    assert "cannot calculate centers until this issue is resolved" in status_text
-
-
-def test_spatial_query_shell_keeps_invalid_cache_ready_for_recalculation(
+def test_spatial_query_shell_keeps_invalid_centers_ready_for_recalculation(
     qtbot,
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
+    # A matrix without its record is invalid.
     table.obsm[CANONICAL_OBSM_KEY] = np.zeros((table.n_obs, 3), dtype=np.float64)
     widget = SpatialQuery(_Viewer())
     qtbot.addWidget(widget)
@@ -747,14 +716,15 @@ def test_spatial_query_shell_keeps_invalid_cache_ready_for_recalculation(
     widget.new_column_edit.setText("reviewed_annotation")
     widget.annotation_value_edit.setText("tumor")
 
-    report = widget.cache_report
-    assert report is not None
-    assert report.state is CanonicalCacheState.INVALID
+    centers_status = widget.centers_status
+    assert centers_status is not None
+    assert centers_status.state == "invalid"
     assert widget.run_button.isEnabled() is True
     status_text = _status_text(widget.status_label)
     assert "Spatial Query Ready" in status_text
-    assert 'Centers for labels element "blobs_labels" will be recalculated' in status_text
-    assert "Detected:" not in status_text
+    assert 'Centers for every labels element of table "table" will be recalculated' in status_text
+    # harpy's reason is the tooltip, not the visible text.
+    assert centers_status.reason not in status_text
 
 
 @pytest.mark.parametrize(
@@ -777,7 +747,7 @@ def test_spatial_query_shell_shapes_context_blocks_run(
     widget.apply_annotation_context(_context(sdata_blobs, dirty=dirty, create_new=create_new))
     _select_labels(widget)
 
-    assert widget.cache_report is not None
+    assert widget.centers_status is not None
     assert widget.run_button.isEnabled() is False
     assert expected_status in _status_text(widget.status_label)
 
@@ -788,14 +758,14 @@ def test_spatial_query_shell_coordinate_change_clears_valid_labels_without_reins
     sdata_blobs: SpatialData,
 ) -> None:
     inspection_calls = 0
-    real_inspect = widget_module.inspect_canonical_cache
+    real_status = widget_module.canonical_centers_status
 
     def record_inspection(*args, **kwargs):
         nonlocal inspection_calls
         inspection_calls += 1
-        return real_inspect(*args, **kwargs)
+        return real_status(*args, **kwargs)
 
-    monkeypatch.setattr(widget_module, "inspect_canonical_cache", record_inspection)
+    monkeypatch.setattr(widget_module, "canonical_centers_status", record_inspection)
     viewer = _Viewer()
     widget = SpatialQuery(viewer)
     qtbot.addWidget(widget)
@@ -817,7 +787,7 @@ def test_spatial_query_shell_coordinate_change_clears_valid_labels_without_reins
     assert widget.labels_combo.placeholderText() == "Choose a labels element"
     assert widget.selected_labels_name is None
     assert widget.selected_table_name is None
-    assert widget.cache_report is None
+    assert widget.centers_status is None
     assert widget.run_button.isEnabled() is False
     assert inspection_calls == 1
 
@@ -847,14 +817,14 @@ def test_spatial_query_shell_tracks_only_its_selected_primary_labels_layer(
         "global",
     )
     assert selected_layer is not None
-    cache_report = widget.cache_report
-    assert cache_report is not None
+    centers_status = widget.centers_status
+    assert centers_status is not None
 
     viewer.layers.remove(unrelated_result.layer)
     viewer.layers.events.removed.emit(unrelated_result.layer)
 
     assert widget.selected_labels_name == "blobs_labels"
-    assert widget.cache_report is cache_report
+    assert widget.centers_status is centers_status
     assert widget.run_button.isEnabled() is True
 
     viewer.layers.remove(selected_layer)
@@ -864,13 +834,151 @@ def test_spatial_query_shell_tracks_only_its_selected_primary_labels_layer(
     assert widget.labels_combo.placeholderText() == "Choose a labels element"
     assert widget.selected_labels_name is None
     assert widget.selected_table_name is None
-    assert widget.cache_report is None
+    assert widget.centers_status is None
     assert widget.run_button.isEnabled() is False
 
 
-def test_spatial_query_child_publishes_accepted_cache_update_once(
+def _centers_change(sdata: SpatialData) -> CanonicalCentersChangeResult:
+    """Calculate the table's canonical centers, as the centers job would, and describe the change."""
+    change_kind = compute_canonical_centers(sdata, table_name="table")
+    return CanonicalCentersChangeResult(
+        sdata=sdata,
+        table_name="table",
+        change_kind=change_kind,
+        regions=("blobs_labels",),
+        dirty_snapshot=None,
+    )
+
+
+def test_spatial_query_child_records_a_canonical_centers_change_once_as_a_mutation_when_unbacked(
     qtbot,
-    monkeypatch: pytest.MonkeyPatch,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget = SpatialQuery(_Viewer())
+    qtbot.addWidget(widget)
+    widget.apply_annotation_context(_context(sdata_blobs))
+    _select_labels(widget)
+    assert widget.centers_status is not None
+    assert widget.centers_status.state == "absent"
+    emitted_events: list[TableStateChangedEvent] = []
+    widget.app_state.table_state_changed.connect(emitted_events.append)
+
+    widget._on_canonical_centers_changed(_centers_change(sdata_blobs))
+
+    assert len(emitted_events) == 1
+    event = emitted_events[0]
+    assert event.sdata is sdata_blobs
+    assert event.table_name == "table"
+    assert event.paths == CANONICAL_CENTERS_PATHS
+    assert event.regions == ("blobs_labels",)
+    assert event.change_kind == "created"
+    assert event.source == CANONICAL_CENTERS_SOURCE
+    # Unbacked: nothing is on disk, so the change is an unsaved mutation.
+    assert widget.app_state.snapshot_table_dirty_state(sdata_blobs, "table").paths == CANONICAL_CENTERS_PATHS
+    assert widget.centers_status.state == "valid"
+
+
+def test_spatial_query_child_records_a_canonical_centers_change_as_persisted_when_backed(
+    qtbot,
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    widget = SpatialQuery(_Viewer())
+    qtbot.addWidget(widget)
+    widget.apply_annotation_context(_context(backed_sdata_blobs))
+    _select_labels(widget)
+    emitted_events: list[TableStateChangedEvent] = []
+    widget.app_state.table_state_changed.connect(emitted_events.append)
+
+    widget._on_canonical_centers_changed(_centers_change(backed_sdata_blobs))
+
+    assert [event.paths for event in emitted_events] == [CANONICAL_CENTERS_PATHS]
+    # harpy wrote the store, so nothing becomes dirty.
+    assert widget.app_state.is_table_dirty(backed_sdata_blobs, "table") is False
+
+
+def test_spatial_query_child_ignores_a_canonical_centers_change_of_another_spatialdata(
+    qtbot,
+    sdata_blobs: SpatialData,
+    sdata_blobs_multi_region: SpatialData,
+) -> None:
+    widget = SpatialQuery(_Viewer())
+    qtbot.addWidget(widget)
+    widget.apply_annotation_context(_context(sdata_blobs))
+    _select_labels(widget)
+    emitted_events: list[TableStateChangedEvent] = []
+    widget.app_state.table_state_changed.connect(emitted_events.append)
+
+    widget._on_canonical_centers_changed(
+        CanonicalCentersChangeResult(
+            sdata=sdata_blobs_multi_region,
+            table_name="table_multi",
+            change_kind="created",
+            regions=("blobs_labels", "blobs_labels_2"),
+            dirty_snapshot=None,
+        )
+    )
+
+    assert emitted_events == []
+
+
+class _DeferredCentersWorker(QObject):
+    returned = Signal(object)
+    errored = Signal(object)
+    finished = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.quit_called = False
+
+    def start(self) -> None:
+        pass
+
+    def quit(self) -> None:
+        self.quit_called = True
+
+
+def test_spatial_query_waits_for_a_detached_centers_job_before_a_new_run(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget = SpatialQuery(_Viewer())
+    qtbot.addWidget(widget)
+    centers_worker = _DeferredCentersWorker()
+    widget._controller._create_canonical_centers_worker = (  # type: ignore[method-assign]
+        lambda job: centers_worker
+    )
+    widget.apply_annotation_context(_context(sdata_blobs))
+    _select_labels(widget)
+    widget.new_column_edit.setText("reviewed_annotation")
+    widget.annotation_value_edit.setText("tumor")
+
+    qtbot.mouseClick(widget.run_button, Qt.MouseButton.LeftButton)
+    assert widget._controller.active_phase == "canonical_centers"
+    assert widget.app_state.is_table_busy(sdata_blobs, "table") is True
+
+    # Changing an input invalidates the Run; the centers job keeps writing.
+    widget.annotation_value_edit.setText("stroma")
+
+    assert widget._active_run_intent is None
+    assert centers_worker.quit_called is False
+    assert widget._controller.has_job_in_flight is True
+    assert widget.run_button.isEnabled() is False
+    assert "Waiting for the previous center calculation to finish writing." in _status_text(widget.status_label)
+
+    # The job ends: its change is recorded, and a new Run may start.
+    compute_canonical_centers(sdata_blobs, table_name="table")
+    centers_worker.returned.emit("created")
+    centers_worker.finished.emit()
+
+    assert widget.app_state.is_table_busy(sdata_blobs, "table") is False
+    assert widget.centers_status is not None
+    assert widget.centers_status.state == "valid"
+    assert widget.run_button.isEnabled() is True
+    assert "Spatial Query Ready" in _status_text(widget.status_label)
+
+
+def test_spatial_query_waits_while_another_job_keeps_the_selected_table_busy(
+    qtbot,
     sdata_blobs: SpatialData,
 ) -> None:
     widget = SpatialQuery(_Viewer())
@@ -879,40 +987,23 @@ def test_spatial_query_child_publishes_accepted_cache_update_once(
     _select_labels(widget)
     widget.new_column_edit.setText("reviewed_annotation")
     widget.annotation_value_edit.setText("tumor")
-    monkeypatch.setattr(widget._controller, "start_spatial_query", lambda *args, **kwargs: True)
-    emitted_events: list[TableStateChangedEvent] = []
-    widget.app_state.table_state_changed.connect(emitted_events.append)
+    assert widget.run_button.isEnabled() is True
+    assert widget.centers_status is not None
+    assert widget.centers_status.state == "absent"
 
-    qtbot.mouseClick(widget.run_button, Qt.MouseButton.LeftButton)
-    report = widget.cache_report
-    assert report is not None
-    centers = np.zeros((report.binding.n_obs, 3), dtype=np.float64)
-    payload = build_canonical_cache_update_payload(
-        binding=report.binding,
-        centers=centers,
-        source_signature=report.source_signature,
-    )
-    cache_update = apply_canonical_cache_update(sdata_blobs, payload)
-    result = CanonicalCentersResult(
-        source_signature=payload.source_signature,
-        binding=payload.binding,
-        centers=payload.centers,
-        cache_update=cache_update,
-    )
+    other_job = widget.app_state.mark_table_busy(sdata_blobs, "table", reason="Another job is still writing.")
 
-    widget._on_centers_ready(result)
+    assert widget.run_button.isEnabled() is False
+    assert "Table Busy" in _status_text(widget.status_label)
+    assert 'Table "table" is busy: Another job is still writing.' in _status_text(widget.status_label)
 
-    assert len(emitted_events) == 1
-    event = emitted_events[0]
-    assert event.sdata is sdata_blobs
-    assert event.table_name == "table"
-    assert event.paths == CANONICAL_CACHE_PATHS
-    assert event.regions == ("blobs_labels",)
-    assert event.change_kind == "created"
-    assert event.source == CANONICAL_CACHE_UPDATE_SOURCE
-    assert widget.app_state.snapshot_table_dirty_state(sdata_blobs, "table").paths == CANONICAL_CACHE_PATHS
-    assert widget.cache_report is not None
-    assert widget.cache_report.state is CanonicalCacheState.VALID
+    # The other job wrote the centers; they are checked again when it ends.
+    compute_canonical_centers(sdata_blobs, table_name="table")
+    widget.app_state.release_table_busy(other_job)
+
+    assert widget.run_button.isEnabled() is True
+    assert widget.centers_status.state == "valid"
+    assert "Spatial Query Ready" in _status_text(widget.status_label)
 
 
 def test_spatial_query_child_applies_new_annotation_and_publishes_exact_paths(
@@ -935,8 +1026,8 @@ def test_spatial_query_child_applies_new_annotation_and_publishes_exact_paths(
     qtbot.mouseClick(widget.run_button, Qt.MouseButton.LeftButton)
     widget._on_query_ready(query_result)
 
-    matched_rows = query_result.binding.row_positions[
-        np.isin(query_result.binding.instance_ids, query_result.matched_instance_ids)
+    matched_rows = query_result.canonical_centers.row_positions[
+        np.isin(query_result.canonical_centers.instance_ids, query_result.matched_instance_ids)
     ]
     assert table.obs["spatial_annotation"].iloc[matched_rows].tolist() == ["tumor", "tumor"]
     assert table.obs["spatial_annotation"].drop(table.obs.index[matched_rows]).isna().all()
@@ -981,8 +1072,8 @@ def test_spatial_query_child_removes_annotation_without_palette_event(
     qtbot.mouseClick(widget.run_button, Qt.MouseButton.LeftButton)
     widget._on_query_ready(query_result)
 
-    matched_rows = query_result.binding.row_positions[
-        np.isin(query_result.binding.instance_ids, query_result.matched_instance_ids)
+    matched_rows = query_result.canonical_centers.row_positions[
+        np.isin(query_result.canonical_centers.instance_ids, query_result.matched_instance_ids)
     ]
     assert table.obs["spatial_annotation"].iloc[matched_rows].isna().all()
     assert table.uns["spatial_annotation_colors"] == ["#ff0000"]
