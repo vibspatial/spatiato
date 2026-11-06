@@ -15,7 +15,12 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from spatiato._app_state import SpatiatoAppState, TableDirtyStateChangedEvent
+from spatiato._app_state import (
+    SpatiatoAppState,
+    TableBusyError,
+    TableBusyStateChangedEvent,
+    TableDirtyStateChangedEvent,
+)
 from spatiato.widgets.persistence.controller import PersistenceController
 from spatiato.widgets.shared_styles import (
     ACTION_BUTTON_STYLESHEET,
@@ -43,13 +48,17 @@ class TablePersistenceControls(QWidget):
     directly, acknowledge the persisted mutation tokens, and let the shared
     dirty-state event refresh every bound control.
 
+    While a background job writes the selected table, for example a Feature
+    Extraction calculation, the table is busy: Write and Reload are disabled,
+    with the reason as tooltip, and the shared busy-state event enables them
+    again when the job ends.
+
     Reload is also generic at this boundary. This component resolves Write /
     Discard / Cancel and then captures one immutable ``TableReloadRequest``.
     Before replacing any in-memory AnnData components,
     ``PersistenceController`` passes that request through ``SpatiatoAppState``.
-    App state first asks every registered workflow whether the reload must
-    wait (``table_reload_blocker()``), and stops with every reason if one does.
-    Otherwise it calls ``prepare_for_table_reload()`` on every workflow.
+    App state refuses a table that became busy meanwhile, and otherwise calls
+    ``prepare_for_table_reload()`` on every registered workflow.
     Unrelated workflows ignore the request; workflows using the selected table
     stop work that must not survive its replacement. For example, Object
     Classification freezes pending or running classifier work. Only then does
@@ -129,6 +138,7 @@ class TablePersistenceControls(QWidget):
         layout.addWidget(self.feedback_label)
 
         self._app_state.table_dirty_state_changed.connect(self._on_table_dirty_state_changed)
+        self._app_state.table_busy_state_changed.connect(self._on_table_busy_state_changed)
         self.refresh()
 
     @property
@@ -161,8 +171,9 @@ class TablePersistenceControls(QWidget):
         can_sync = self._controller.can_sync
         can_write = self._controller.can_write_table_state
         can_reload = self._controller.can_reload
-        self.write_button.setEnabled(can_write)
-        self.reload_button.setEnabled(can_reload)
+        busy_message = self._controller.table_busy_message
+        self.write_button.setEnabled(can_write and busy_message is None)
+        self.reload_button.setEnabled(can_reload and busy_message is None)
 
         if self._selected_spatialdata is None or self._selected_table_name is None:
             write_tooltip = (
@@ -185,6 +196,9 @@ class TablePersistenceControls(QWidget):
                 "The selected SpatialData dataset is not backed by zarr, so the table state cannot be reloaded "
                 "from disk."
             )
+        elif busy_message is not None:
+            write_tooltip = busy_message
+            reload_tooltip = busy_message
         else:
             table_store_path = self._controller.selected_table_store_path
             destination = self._selected_spatialdata.path if table_store_path is None else table_store_path
@@ -218,7 +232,7 @@ class TablePersistenceControls(QWidget):
         """Write captured dirty components and optionally present the outcome."""
         try:
             self._controller.write_table_state()
-        except ValueError as error:
+        except (ValueError, TableBusyError) as error:
             self.set_feedback(str(error), error=True)
             return False
 
@@ -365,6 +379,14 @@ class TablePersistenceControls(QWidget):
     def _on_table_dirty_state_changed(self, event: object) -> None:
         """Refresh Write readiness and Reload warnings after a dirty transition."""
         if not isinstance(event, TableDirtyStateChangedEvent):
+            return
+        if event.sdata is not self._selected_spatialdata or event.table_name != self._selected_table_name:
+            return
+        self.refresh()
+
+    def _on_table_busy_state_changed(self, event: object) -> None:
+        """Disable or enable Write and Reload after the table became busy or no longer busy."""
+        if not isinstance(event, TableBusyStateChangedEvent):
             return
         if event.sdata is not self._selected_spatialdata or event.table_name != self._selected_table_name:
             return
