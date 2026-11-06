@@ -144,44 +144,88 @@ class TableReloadRequest:
             raise ValueError("Table reload requests require a non-empty source.")
 
 
-class TableReloadBlockedError(RuntimeError):
-    """A reload participant asked the reload to wait; no participant has acted."""
+@dataclass(frozen=True)
+class TableBusyStateChangedEvent:
+    """Report that a table became busy, or is no longer busy.
+
+    A table is busy while a job writes it from a worker thread
+    (``SpatiatoAppState.mark_table_busy()``). Bound ``TablePersistenceControls``
+    use this event to disable or enable Write and Reload; the reasons are read
+    from ``SpatiatoAppState``.
+    """
+
+    sdata: SpatialData
+    table_name: str
+    is_busy: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.table_name, str) or not self.table_name:
+            raise ValueError("Table busy-state events require a non-empty table name.")
+        if not isinstance(self.is_busy, bool):
+            raise ValueError("Table busy-state events require a boolean busy state.")
+
+
+@dataclass(frozen=True, eq=False)
+class TableBusyMark:
+    """One job's mark that a table is busy, returned by ``mark_table_busy()``.
+
+    The job's owner keeps it and passes it to ``release_table_busy()`` when the
+    job ends. Marks compare by identity, so two jobs on one table hold two
+    marks.
+    """
+
+    sdata: SpatialData
+    table_name: str
+    reason: str
+
+
+class TableBusyMarker(Protocol):
+    """Mark a table busy while a job writes it, and release the mark when the job ends.
+
+    ``SpatiatoAppState`` implements it. The owner of such a job depends on this
+    protocol only, not on the whole app state.
+    """
+
+    def mark_table_busy(self, sdata: SpatialData, table_name: str, *, reason: str) -> TableBusyMark:
+        """Mark the table busy, with the reason shown to the user, and return the mark."""
+
+    def release_table_busy(self, mark: TableBusyMark) -> None:
+        """Release a mark returned by ``mark_table_busy()``."""
+
+
+class TableBusyError(RuntimeError):
+    """A table cannot be written or reloaded while a job writes it; nothing was written or reloaded."""
+
+
+def format_table_busy_message(table_name: str, reasons: tuple[str, ...]) -> str:
+    """Return the message shown when a busy table cannot be written or reloaded."""
+    return f'Table "{table_name}" is busy: ' + " ".join(reasons)
 
 
 class TableReloadParticipant(Protocol):
     """Prepare one table-consuming workflow before an accepted reload.
 
-    A class satisfies this structural protocol by implementing both methods;
-    inheritance is not required. Participants compare the immutable request
-    with the table they consume and ignore unrelated requests.
+    A class satisfies this structural protocol by implementing
+    ``prepare_for_table_reload()``; inheritance is not required. Participants
+    compare the immutable request with the table they consume and ignore
+    unrelated requests.
 
-    App state prepares a reload in two passes: it first asks every participant
-    for a blocker, and only when none gives one does it let every participant
-    invalidate its work. A blocked reload therefore changes nothing in any
-    participant, whatever the registration order.
+    A participant does not decide whether a reload may happen: a job that
+    writes the table marks it busy instead (``mark_table_busy()``), and app
+    state refuses to reload a busy table before any participant has acted.
+
+    The hook is a defense, not a necessity: a reload runs synchronously on the
+    main thread, so a worker's result can only arrive after the ``reloaded``
+    event, and every participant is expected to also invalidate its work when
+    it receives that event, as the Object Classification and Spatial Query
+    widgets currently do. The hook stays as an explicit point before the table
+    is replaced, so no participant depends on that ordering.
     """
-
-    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-        """Return whether the requested reload must wait, without side effects.
-
-        Block only for work that changes the table from a worker thread, in
-        memory or in its store, such as a harpy call: it can be neither
-        interrupted nor undone, and a reload would race with it. Work whose
-        result is applied on the main thread is invalidated in
-        ``prepare_for_table_reload()`` instead.
-
-        Returns
-        -------
-        str | None
-            Why the reload must wait, shown to the user; app state then stops
-            the reload before any participant has acted. ``None`` when this
-            participant does not block it.
-        """
 
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
         """Invalidate work that must not survive the requested table reload.
 
-        Called only after no participant blocked the reload.
+        Called only when the table is not busy, right before it is reloaded.
         """
 
 
@@ -386,11 +430,17 @@ class SpatiatoAppState(QObject):
 
     Publishing a table-state event alone never clears dirty state, and an
     unrelated or outdated operation cannot clear a component.
+
+    It also tracks which tables are busy: a job that writes a table from a
+    worker thread marks it busy until the job ends, and a busy table can be
+    neither written nor reloaded. ``table_busy_state_changed`` reports when a
+    table becomes busy or no longer busy.
     """
 
     sdata_changed = Signal(object)
     table_state_changed = Signal(object)
     table_dirty_state_changed = Signal(object)
+    table_busy_state_changed = Signal(object)
     shapes_element_written = Signal(object)
     shapes_element_reloaded = Signal(object)
     coordinate_system_changed = Signal(object)
@@ -403,6 +453,9 @@ class SpatiatoAppState(QObject):
         self.layer_bindings = LayerBindingRegistry()
         self.viewer_adapter = ViewerAdapter(viewer=viewer, layer_bindings=self.layer_bindings)
         self._dirty_table_tokens: dict[tuple[int, str], dict[TableComponentPath, _TableMutationToken]] = {}
+        # Not dropped when another SpatialData is loaded: a job keeps its
+        # SpatialData alive until it ends, so its release still finds the mark.
+        self._table_busy_marks: dict[tuple[int, str], list[TableBusyMark]] = {}
         self._coordinate_system_change_participant: CoordinateSystemChangeParticipant | None = None
         self._table_reload_participants: list[TableReloadParticipant] = []
 
@@ -560,6 +613,57 @@ class SpatiatoAppState(QObject):
                 return True
         return False
 
+    def mark_table_busy(self, sdata: SpatialData, table_name: str, *, reason: str) -> TableBusyMark:
+        """Mark a table busy while a job writes it from a worker thread.
+
+        Call it when the job launches, and pass the returned mark to
+        ``release_table_busy()`` when the job ends, on every path. While any
+        mark is held, the table can be neither written nor reloaded, and
+        ``reason`` is shown to the user, for example "Feature Extraction is
+        still writing its results. Try again once the calculation has
+        finished."
+        """
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("Table busy marks require a non-empty reason.")
+        selection_key = self._selection_key(sdata, table_name)
+        if selection_key is None:  # pragma: no cover - concrete arguments make this unreachable.
+            raise ValueError("Table busy marks require a SpatialData object and table name.")
+        mark = TableBusyMark(sdata=sdata, table_name=table_name, reason=reason)
+        was_busy = self.is_table_busy(sdata, table_name)
+        self._table_busy_marks.setdefault(selection_key, []).append(mark)
+        self._emit_table_busy_transition(sdata, table_name, was_busy=was_busy)
+        return mark
+
+    def release_table_busy(self, mark: TableBusyMark) -> None:
+        """Release a mark from ``mark_table_busy()``; releasing it again does nothing."""
+        selection_key = self._selection_key(mark.sdata, mark.table_name)
+        marks = self._table_busy_marks.get(selection_key, [])
+        if not any(current is mark for current in marks):
+            return
+        was_busy = self.is_table_busy(mark.sdata, mark.table_name)
+        marks[:] = [current for current in marks if current is not mark]
+        if not marks:
+            del self._table_busy_marks[selection_key]
+        self._emit_table_busy_transition(mark.sdata, mark.table_name, was_busy=was_busy)
+
+    def is_table_busy(self, sdata: SpatialData | None, table_name: str | None) -> bool:
+        """Return whether a job writes the table, so it can be neither written nor reloaded."""
+        selection_key = self._selection_key(sdata, table_name)
+        return selection_key is not None and bool(self._table_busy_marks.get(selection_key))
+
+    def table_busy_reasons(self, sdata: SpatialData | None, table_name: str | None) -> tuple[str, ...]:
+        """Return the reasons of every mark that keeps the table busy, oldest first."""
+        selection_key = self._selection_key(sdata, table_name)
+        if selection_key is None:
+            return ()
+        return tuple(mark.reason for mark in self._table_busy_marks.get(selection_key, []))
+
+    def require_table_not_busy(self, sdata: SpatialData, table_name: str) -> None:
+        """Raise ``TableBusyError``, with every reason, while the table is busy."""
+        reasons = self.table_busy_reasons(sdata, table_name)
+        if reasons:
+            raise TableBusyError(format_table_busy_message(table_name, reasons))
+
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
         """Notify table-consuming workflows before live components are reloaded.
 
@@ -570,23 +674,26 @@ class SpatiatoAppState(QObject):
         decides whether it consumes that SpatialData table. It runs in two
         passes:
 
-        1. every participant may block the reload, without side effects
-           (``table_reload_blocker()``);
-        2. only when none did, every participant invalidates pending or active
+        1. if a job still writes the table, it raises ``TableBusyError``
+           (``require_table_not_busy()``);
+        2. only otherwise, every participant invalidates pending or active
            work that captured the old table state
-           (``prepare_for_table_reload()``).
+           (``prepare_for_table_reload()``). This pass is a defense:
+           participants also invalidate that work on the ``reloaded`` event
+           (see ``TableReloadParticipant``). The first pass is not.
 
-        So a blocked reload changes nothing in any participant, whatever the
-        registration order.
+        So a refused reload changes nothing in any participant. The persistence
+        controls disable Reload while the table is busy; the first pass also
+        covers a job that starts while their Write / Discard / Cancel dialog is
+        open.
 
         This method does not reload the table or publish the post-reload event.
         The persistence controller performs those steps after every participant
         has prepared successfully.
 
-        Both passes loop over one copy of the participant list, taken before
-        the first pass. A participant registered or unregistered by a
-        callback meanwhile is then neither skipped nor visited twice, and
-        every participant that is prepared was also asked for a blocker.
+        The second pass loops over a copy of the participant list, so a
+        participant registered or unregistered by a callback meanwhile is
+        neither skipped nor visited twice.
 
         Parameters
         ----------
@@ -596,18 +703,11 @@ class SpatiatoAppState(QObject):
 
         Raises
         ------
-        TableReloadBlockedError
-            At least one participant gave a reason to wait; the message lists
-            every reason.
+        TableBusyError
+            A job still writes the table; the message lists every reason.
         """
+        self.require_table_not_busy(request.sdata, request.table_name)
         participants = tuple(self._table_reload_participants)
-        reasons = []
-        for participant in participants:
-            reason = participant.table_reload_blocker(request)
-            if reason is not None:
-                reasons.append(reason)
-        if reasons:
-            raise TableReloadBlockedError(" ".join(reasons))
         for participant in participants:
             participant.prepare_for_table_reload(request)
 
@@ -753,6 +853,25 @@ class SpatiatoAppState(QObject):
                 sdata=sdata,
                 table_name=table_name,
                 is_dirty=is_dirty,
+            )
+        )
+
+    def _emit_table_busy_transition(
+        self,
+        sdata: SpatialData,
+        table_name: str,
+        *,
+        was_busy: bool,
+    ) -> None:
+        """Notify bound controls only when the table became busy or no longer busy."""
+        is_busy = self.is_table_busy(sdata, table_name)
+        if is_busy == was_busy:
+            return
+        self.table_busy_state_changed.emit(
+            TableBusyStateChangedEvent(
+                sdata=sdata,
+                table_name=table_name,
+                is_busy=is_busy,
             )
         )
 
