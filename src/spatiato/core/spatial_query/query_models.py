@@ -79,7 +79,7 @@ class CanonicalCenterQueryResult:
     ``canonical_centers`` keeps the rows, instance IDs and centers the query
     used, not only the matches. The matched instance IDs are a geometric
     decision made from exactly these centers. Before the annotation is applied,
-    ``_require_current_query_provenance()`` in
+    ``_raise_if_query_outdated()`` in
     ``spatiato.core.spatial_query.annotation`` compares them with the table's
     current rows and centers, so an old query cannot annotate rows after the
     centers or the table rows changed.

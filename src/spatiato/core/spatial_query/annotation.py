@@ -51,13 +51,33 @@ class SpatialAnnotationQueryOutdatedError(ValueError):
 
 @dataclass(frozen=True)
 class SpatialAnnotationPreparation:
-    """Immutable table-row and target-column snapshot prepared for Apply."""
+    """Immutable table-row and target-column snapshot prepared for Apply.
+
+    Parameters
+    ----------
+    query_result
+        The accepted query: the rows, instance IDs and canonical centers it
+        evaluated, and the instance IDs it matched.
+    column_name
+        The ``obs`` column the annotation is written to.
+    column_mode
+        ``"existing"`` to annotate an existing column, ``"new"`` to create it
+        at Apply.
+    row_positions
+        Table row positions (for ``iloc``) of the matched instances, in the
+        order of ``query_result.matched_instance_ids``.
+    prepared_values
+        A copy of the column's values at ``row_positions``, taken when the
+        annotation was prepared; all missing for a new column. Used for the
+        summary counts, the value kind, and, at Apply, the check that the
+        column has not changed since.
+    """
 
     query_result: CanonicalCenterQueryResult
     column_name: str
     column_mode: SpatialAnnotationColumnMode
     row_positions: NDArray[np.intp] = field(repr=False, compare=False)
-    current_values: pd.Series = field(repr=False, compare=False)
+    prepared_values: pd.Series = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.query_result, CanonicalCenterQueryResult):
@@ -74,19 +94,19 @@ class SpatialAnnotationPreparation:
             raise ValueError("Spatial annotation row positions must be unique.")
         if len(row_positions) != self.query_result.matched_instance_count:
             raise ValueError("Spatial annotation row positions must match the queried instance count.")
-        if not isinstance(self.current_values, pd.Series):
-            raise TypeError("Spatial annotation current values must be a pandas Series.")
-        if len(self.current_values) != len(row_positions):
-            raise ValueError("Spatial annotation current values must match the queried instance count.")
+        if not isinstance(self.prepared_values, pd.Series):
+            raise TypeError("Spatial annotation prepared values must be a pandas Series.")
+        if len(self.prepared_values) != len(row_positions):
+            raise ValueError("Spatial annotation prepared values must match the queried instance count.")
         object.__setattr__(self, "row_positions", row_positions)
-        object.__setattr__(self, "current_values", self.current_values.copy(deep=True))
+        object.__setattr__(self, "prepared_values", self.prepared_values.copy(deep=True))
         _ = self.value_kind
 
     @property
     def value_kind(self) -> SpatialAnnotationValueKind:
         """Return the annotation kind represented by the captured column."""
         return validate_and_resolve_spatial_annotation_value_kind(
-            self.current_values,
+            self.prepared_values,
             column_name=self.column_name,
         )
 
@@ -226,7 +246,7 @@ def prepare_spatial_annotation(
 
     if column_mode == "existing":
         current_column = require_compatible_spatial_annotation_column(table, normalized_column_name)
-        current_values = current_column.iloc[row_positions].copy(deep=True)
+        prepared_values = current_column.iloc[row_positions].copy(deep=True)
     else:
         if normalized_column_name in _OBJECT_CLASSIFICATION_COLUMNS:
             raise ValueError(
@@ -235,7 +255,7 @@ def prepare_spatial_annotation(
             )
         if normalized_column_name in table.obs.columns:
             raise ValueError(f"New annotation column `{normalized_column_name}` already exists.")
-        current_values = pd.Series(
+        prepared_values = pd.Series(
             pd.Categorical([pd.NA] * len(row_positions), categories=[]),
             index=table.obs.index[row_positions],
             name=normalized_column_name,
@@ -246,7 +266,7 @@ def prepare_spatial_annotation(
         column_name=normalized_column_name,
         column_mode=column_mode,
         row_positions=row_positions,
-        current_values=current_values,
+        prepared_values=prepared_values,
     )
 
 
@@ -276,11 +296,11 @@ def summarize_spatial_annotation(
         else:  # pragma: no cover - guarded by SpatialAnnotationPreparation
             raise ValueError(f"Unsupported spatial annotation value kind: {preparation.value_kind!r}.")
 
-    missing = preparation.current_values.isna().to_numpy(dtype=bool)
+    missing = preparation.prepared_values.isna().to_numpy(dtype=bool)
     if normalized_value is None:
         equal = np.zeros(len(missing), dtype=bool)
     else:
-        equal = np.asarray(preparation.current_values == normalized_value, dtype=bool) & ~missing
+        equal = np.asarray(preparation.prepared_values == normalized_value, dtype=bool) & ~missing
     other = ~missing & ~equal
 
     return SpatialAnnotationSummary(
@@ -330,7 +350,7 @@ def apply_spatial_annotation(
     if expected_summary.is_removal and preparation.column_mode == "new":
         raise ValueError("Remove annotation is not available for a new column.")
 
-    _require_current_query_provenance(sdata, preparation)
+    _raise_if_query_outdated(sdata, preparation)
     table = get_table(sdata, preparation.canonical_centers.table_name)
     current_column: pd.Series | None = None
     if preparation.column_mode == "existing":
@@ -499,11 +519,11 @@ def _resolve_query_row_positions(
     return np.asarray(region.row_positions[sort_order[selected_positions]], dtype=np.intp)
 
 
-def _require_current_query_provenance(
+def _raise_if_query_outdated(
     sdata: SpatialData,
     preparation: SpatialAnnotationPreparation,
 ) -> None:
-    """Raise unless the table rows and canonical centers the query used are still current.
+    """Raise ``SpatialAnnotationQueryOutdatedError`` if the table rows or canonical centers changed since the query.
 
     Check again, immediately before the annotation is applied, that:
 
@@ -550,7 +570,7 @@ def _require_unchanged_existing_column(
     preparation: SpatialAnnotationPreparation,
     current_column: pd.Series,
 ) -> None:
-    prepared_values = preparation.current_values
+    prepared_values = preparation.prepared_values
     current_categories = tuple(current_column.cat.categories)
     prepared_categories = tuple(prepared_values.cat.categories)
     if current_categories != prepared_categories or current_column.cat.ordered != prepared_values.cat.ordered:

@@ -9,12 +9,12 @@ from spatiato.widgets.spatial_query.viewer_styling import (
     load_and_style_unannotated_spatial_annotation_labels,
 )
 from spatiato.widgets.spatial_query.widget import (
-    CANONICAL_CACHE_UPDATE_SOURCE,
+    CANONICAL_CENTERS_SOURCE,
     SpatialQuery,
 )
 
 __all__ = [
-    "CANONICAL_CACHE_UPDATE_SOURCE",
+    "CANONICAL_CENTERS_SOURCE",
     "SPATIAL_QUERY_IDLE_STATUS",
     "SpatialQueryController",
     "SpatialQuery",
