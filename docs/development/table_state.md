@@ -38,10 +38,10 @@ Extraction decides what to calculate
   passes the mark to `release_table_busy(mark)` when the job ends. A busy
   table can be neither written nor reloaded, and Feature Extraction and
   Spatial Query do not start on it. App state keeps the marks per SpatialData
-  object and table; two jobs on one table hold two marks. The job's owner sees
-  only these two methods and `table_busy_reasons(...)`, which it checks before
-  starting, through the `TableBusyMarker` protocol, which app state
-  implements.
+  object and table; the table stays busy until every mark is released. The
+  job's owner reaches app state only through the `TableBusyMarker` protocol:
+  `mark_table_busy`, `release_table_busy`, and `table_busy_reasons(...)`,
+  which it checks before starting.
 - **Reload:** replacing the in-memory components of one table with the ones in
   the store.
 - **Reload participant:** an object whose work depends on a table. Right
@@ -129,7 +129,7 @@ flowchart TB
     OCW --> OCC -- launches --> OCJ
     SQW --> SQC -- launches --> SQJ
     SQC -- launches --> SQJC -- writes --> T
-    OCW -- "writes annotation edits" --> T
+    OCW -- "writes annotation edits,<br/>feature-matrix metadata" --> T
     OCC -- "writes predictions" --> T
     SQW -- "applies annotations" --> T
     PC --> PCC -- "writes, reloads" --> T
@@ -190,8 +190,8 @@ where the change is:
 
 | The change is | Recorded with | Effect on dirty paths | Examples |
 |---|---|---|---|
-| only in memory | `record_table_mutation(event)` | each path becomes dirty, with a new token | Object Classification's annotation edits, predictions and configuration; Spatial Query's annotations; Feature Extraction and Spatial Query's canonical centers on unbacked SpatialData |
-| already in the store | `record_persisted_table_change(event, snapshot)` | none becomes dirty; a path that was dirty in the snapshot taken at launch and that harpy wrote becomes clean, unless it changed again since | Feature Extraction and Spatial Query's canonical centers on backed SpatialData |
+| only in memory | `record_table_mutation(event)` | each path becomes dirty, with a new token | Object Classification's annotation edits, predictions, configuration and feature-matrix registration; Spatial Query's annotations; Feature Extraction's feature matrices and Spatial Query's canonical centers, on unbacked SpatialData |
+| already in the store | `record_persisted_table_change(event, snapshot)` | none becomes dirty; a path that was dirty in the snapshot taken at launch and that harpy wrote becomes clean, unless it changed again since | Feature Extraction's feature matrices and Spatial Query's canonical centers, on backed SpatialData |
 
 Both publish the event on `table_state_changed`, and, when the table as a whole
 becomes dirty or clean, also `table_dirty_state_changed`. Consumers filter on
@@ -317,21 +317,22 @@ workflow.
 When adding a workflow: a job whose worker writes the table does not start
 while the table is busy, marks it busy at launch and releases the mark at
 every end of the job; its widget disables its start button while the table is
-busy. Work that depends on the
-table registers with `register_table_reload_participant()`, implements
-`prepare_for_table_reload()`, also invalidates its work on the `reloaded`
-event, and compares the request's SpatialData object (by identity) and table
-name with its own before acting.
+busy. Work that depends on the table registers with
+`register_table_reload_participant()`, implements `prepare_for_table_reload()`,
+also invalidates its work on the `reloaded` event, and compares the request's
+SpatialData object (by identity) and table name with its own before acting.
 
 ## Where to find it
 
-- App state: `TableStateChangedEvent`, `TableDirtySnapshot`,
-  `TableBusyMark`, `TableBusyMarker`, `TableBusyStateChangedEvent`,
-  `TableBusyError`, `TableReloadRequest`, `TableReloadParticipant`,
-  `record_table_mutation`, `record_persisted_table_change`,
-  `record_table_reload`, `acknowledge_table_write`, `mark_table_busy`,
+- App state: `TableStateChangedEvent`, `TableDirtyStateChangedEvent`,
+  `TableDirtySnapshot`, `TableBusyMark`, `TableBusyMarker`,
+  `TableBusyStateChangedEvent`, `TableBusyError`, `format_table_busy_message`,
+  `TableReloadRequest`, `TableReloadParticipant`, `record_table_mutation`,
+  `record_persisted_table_change`, `record_table_reload`,
+  `snapshot_table_dirty_state`, `acknowledge_table_write`, `mark_table_busy`,
   `release_table_busy`, `is_table_busy`, `table_busy_reasons`,
-  `require_table_not_busy` and `prepare_for_table_reload` in
+  `require_table_not_busy`, `register_table_reload_participant` and
+  `prepare_for_table_reload` in
   [`src/spatiato/_app_state.py`](../../src/spatiato/_app_state.py).
 - Persistence: `TablePersistenceControls` in
   [`src/spatiato/widgets/persistence/controls.py`](../../src/spatiato/widgets/persistence/controls.py),
