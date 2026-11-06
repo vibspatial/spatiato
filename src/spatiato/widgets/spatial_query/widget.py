@@ -656,6 +656,9 @@ class SpatialQuery(QWidget):
         not wait for it: it invalidates the Run here instead. The Run's result,
         computed from the table being replaced, is discarded and never written
         to the table.
+
+        This is a defense, see `TableReloadParticipant`: the widget also
+        invalidates the Run when it receives the `reloaded` event.
         """
         if request.sdata is not self.selected_spatialdata or request.table_name != self.selected_table_name:
             return
