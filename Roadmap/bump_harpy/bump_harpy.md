@@ -647,7 +647,11 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       still only calculate: they do not mark the table busy, and Train does not
       wait for a busy table. The risk accepted above, a job reading a key that
       Feature Extraction rewrites, stays accepted; it becomes a little more
-      likely, since the read moves into the worker.
+      likely, since the read moves into the worker. The code says so: the
+      `ClassifierJob` docstring states that this is accepted on purpose and how
+      each outcome is caught (a running job's result is discarded, a finished
+      job's predictions are flagged as stale, a failed read becomes an error
+      status), and `invalidate_for_feature_matrix_overwrite(...)` points to it.
    8. **An ineligible result from the worker** (point 3) needs
       `_apply_ineligible_state(...)` to take the worker's reason and counts,
       not only the job's summary.
