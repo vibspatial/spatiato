@@ -36,10 +36,12 @@ Extraction decides what to calculate
   memory or in its store. The job's owner marks it with
   `mark_table_busy(sdata, table_name, reason=...)`, which returns a mark, and
   passes the mark to `release_table_busy(mark)` when the job ends. A busy
-  table can be neither written nor reloaded. App state keeps the marks per
-  SpatialData object and table; two jobs on one table hold two marks. The
-  job's owner sees only these two methods, through the `TableBusyMarker`
-  protocol, which app state implements.
+  table can be neither written nor reloaded, and Feature Extraction and
+  Spatial Query do not start on it. App state keeps the marks per SpatialData
+  object and table; two jobs on one table hold two marks. The job's owner sees
+  only these two methods and `table_busy_reasons(...)`, which it checks before
+  starting, through the `TableBusyMarker` protocol, which app state
+  implements.
 - **Reload:** replacing the in-memory components of one table with the ones in
   the store.
 - **Reload participant:** an object whose work depends on a table. Right
@@ -75,7 +77,8 @@ Signals and calls, as the diagram labels them:
   or is no longer busy. It carries the table and `is_busy`; the reasons are
   read from app state (`table_busy_reasons(...)`). The persistence controls
   use it to disable Write and Reload while the table is busy, with the reason
-  as tooltip.
+  as tooltip, and the Feature Extraction and Spatial Query widgets to disable
+  Calculate and Run.
 - **Prepare:** before a reload, app state first refuses a busy table, with
   `TableBusyError`. Only otherwise does every participant's
   `prepare_for_table_reload()` invalidate its work that depends on the table.
@@ -145,6 +148,8 @@ flowchart TB
     AS -. "table_state_changed" .-> VW
     AS -. "table_dirty_state_changed" .-> PC
     AS -. "table_busy_state_changed" .-> PC
+    AS -. "table_busy_state_changed" .-> FEW
+    AS -. "table_busy_state_changed" .-> SQW
 ```
 
 Widgets never tell each other about table changes directly: everything they
@@ -256,6 +261,27 @@ A cancelled Spatial Query Run detaches its centers job instead of stopping it:
 the job keeps writing, still publishes its change, and keeps the table busy
 until it finishes. A new Run waits for it (`has_job_in_flight`).
 
+Feature Extraction and Spatial Query do not start on a busy table, so two of
+their jobs never write one table at the same time:
+
+- their widgets disable Calculate and Run while the table is busy, with the
+  reason, and refresh on `table_busy_state_changed`. When the table is no
+  longer busy, the Spatial Query widget checks the canonical centers again,
+  since the job may have written them;
+- their controllers check `table_busy_reasons(...)` again before starting
+  (`calculate()`, `start_spatial_query()`) and refuse, as a guard for callers
+  other than the buttons.
+
+This also covers a job of a closed widget: opening the widget again gives a
+new controller, whose own one-job limit does not see the old job, but the
+table is still busy.
+
+Not covered: a Spatial Query Run whose centers are already valid only queries,
+so it does not mark the table busy. Feature Extraction can start meanwhile,
+and the Run then applies its annotation on the main thread while that job
+writes. Jobs on different tables of one store are not serialized either,
+although both write the store's consolidated metadata.
+
 A workflow that only invalidates registers its widget as a reload participant
 and unregisters it when the widget is destroyed. It also invalidates its work
 when it receives the `reloaded` event. Since a reload runs synchronously on the
@@ -264,8 +290,10 @@ is a defense that does not rely on that ordering. Because the busy check runs
 before any participant prepares, a refused reload changes nothing in any
 workflow.
 
-When adding a workflow: a job whose worker writes the table marks it busy at
-launch and releases the mark at every end of the job. Work that depends on the
+When adding a workflow: a job whose worker writes the table does not start
+while the table is busy, marks it busy at launch and releases the mark at
+every end of the job; its widget disables its start button while the table is
+busy. Work that depends on the
 table registers with `register_table_reload_participant()`, implements
 `prepare_for_table_reload()`, also invalidates its work on the `reloaded`
 event, and compares the request's SpatialData object (by identity) and table
@@ -291,6 +319,11 @@ name with its own before acting.
   [`widgets/feature_extraction/controller.py`](../../src/spatiato/widgets/feature_extraction/controller.py),
   `start_spatial_query` and `_clear_centers_job` in
   [`widgets/spatial_query/controller.py`](../../src/spatiato/widgets/spatial_query/controller.py).
+  `calculate` and `start_spatial_query` also refuse to start on a busy table.
+- Start buttons: `_on_table_busy_state_changed` in
+  [`widgets/feature_extraction/widget.py`](../../src/spatiato/widgets/feature_extraction/widget.py)
+  and
+  [`widgets/spatial_query/widget.py`](../../src/spatiato/widgets/spatial_query/widget.py).
 - Participants: `prepare_for_table_reload` in
   [`widgets/object_classification/widget.py`](../../src/spatiato/widgets/object_classification/widget.py)
   and
