@@ -8,8 +8,7 @@ from shapely import affinity
 from spatialdata.transformations import get_transformation_between_coordinate_systems
 
 from spatiato.core.shapes_annotation import validate_existing_shapes_source_geodataframe
-from spatiato.core.spatial_query.canonical import build_canonical_source_signature
-from spatiato.core.spatial_query.canonical_models import CanonicalCentersResult
+from spatiato.core.spatial_query.canonical_centers import CanonicalCentersRegion, is_canonical_query_labels
 from spatiato.core.spatial_query.query_models import CanonicalCenterQueryRequest, CanonicalCenterQueryResult
 
 if TYPE_CHECKING:
@@ -21,11 +20,11 @@ def build_canonical_center_query_request(
     *,
     shapes_name: str,
     coordinate_system: str,
-    canonical_centers: CanonicalCentersResult,
+    canonical_centers: CanonicalCentersRegion,
 ) -> CanonicalCenterQueryRequest:
     """Validate and snapshot the current inputs for one containment query."""
-    if not isinstance(canonical_centers, CanonicalCentersResult):
-        raise TypeError("Canonical-center query construction requires a CanonicalCentersResult.")
+    if not isinstance(canonical_centers, CanonicalCentersRegion):
+        raise TypeError("Canonical-center query construction requires a CanonicalCentersRegion.")
     if not isinstance(shapes_name, str) or not shapes_name:
         raise ValueError("Query Shapes name must be a non-empty string.")
     if not isinstance(coordinate_system, str) or not coordinate_system:
@@ -34,11 +33,10 @@ def build_canonical_center_query_request(
         raise ValueError(f"Shapes element `{shapes_name}` is not available in the selected SpatialData object.")
 
     labels_name = canonical_centers.labels_name
-    if labels_name not in sdata.labels:
-        raise ValueError(f"Labels element `{labels_name}` is not available in the selected SpatialData object.")
-    if build_canonical_source_signature(sdata, labels_name) != canonical_centers.source_signature:
+    # The query compares the centers' y and x with 2-D shapes.
+    if not is_canonical_query_labels(sdata, labels_name):
         raise ValueError(
-            "Labels source changed after canonical centers were obtained; query construction was rejected."
+            f"Labels element `{labels_name}` is not a 2-D integer labels element of the selected SpatialData object."
         )
 
     shapes_element = validate_existing_shapes_source_geodataframe(sdata.shapes[shapes_name])
@@ -82,7 +80,7 @@ def evaluate_canonical_center_query(
     candidate_positions = np.flatnonzero(candidates)
 
     if len(candidate_positions) == 0:
-        matching_ids = request.canonical_centers.binding.instance_ids[:0]
+        matching_ids = request.canonical_centers.instance_ids[:0]
     else:
         shapely.prepare(region_in_labels)
         inside = np.asarray(
@@ -93,7 +91,7 @@ def evaluate_canonical_center_query(
             ),
             dtype=bool,
         )
-        matching_ids = np.sort(request.canonical_centers.binding.instance_ids[candidate_positions[inside]])
+        matching_ids = np.sort(request.canonical_centers.instance_ids[candidate_positions[inside]])
 
     return CanonicalCenterQueryResult(
         canonical_centers=request.canonical_centers,
