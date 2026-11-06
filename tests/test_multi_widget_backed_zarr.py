@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+from harpy.table.canonical_centers import CANONICAL_OBSM_KEY
 from matplotlib.colors import to_rgba
 from napari.layers import Labels
 from qtpy.QtCore import QObject, Qt, Signal
@@ -21,15 +22,12 @@ from spatiato.core.object_classification.annotation import (
     USER_CLASS_COLUMN,
 )
 from spatiato.core.persistence import TableComponentPath, write_table_components
-from spatiato.core.spatial_query import (
-    CANONICAL_CACHE_PATHS,
-    CANONICAL_OBSM_KEY,
-    CanonicalCacheState,
-    CanonicalCenterQueryResult,
-    apply_canonical_cache_update,
-    build_canonical_cache_update_payload,
-    inspect_canonical_cache,
-    read_canonical_centers_from_cache,
+from spatiato.core.spatial_query import CanonicalCenterQueryResult
+from spatiato.core.spatial_query.canonical_centers import (
+    CANONICAL_CENTERS_PATHS,
+    canonical_centers_status,
+    compute_canonical_centers,
+    read_canonical_centers_region,
 )
 from spatiato.viewer._styling import MISSING_CATEGORICAL_COLOR
 from spatiato.widgets.annotation.models import AnnotationContext, ShapesAnnotationTarget
@@ -143,34 +141,18 @@ def _configure_feature_extraction(widget: FeatureExtractionWidget, *, feature_ke
     assert widget.calculate_button.isEnabled()
 
 
-def _install_canonical_cache(sdata: SpatialData) -> None:
-    report = inspect_canonical_cache(
-        sdata,
-        table_name="table",
-        labels_name="blobs_labels",
-    )
-    if report.state is CanonicalCacheState.VALID:
-        return
-    payload = build_canonical_cache_update_payload(
-        binding=report.binding,
-        centers=np.zeros((report.binding.n_obs, 3), dtype=np.float64),
-        source_signature=report.source_signature,
-    )
-    apply_canonical_cache_update(sdata, payload)
+def _install_canonical_centers(sdata: SpatialData) -> None:
+    """Have harpy calculate the table's canonical centers; for backed SpatialData it also writes them."""
+    if canonical_centers_status(sdata, table_name="table").state != "valid":
+        compute_canonical_centers(sdata, table_name="table")
 
 
 def _canonical_query_result(sdata: SpatialData) -> CanonicalCenterQueryResult:
-    _install_canonical_cache(sdata)
-    report = inspect_canonical_cache(
-        sdata,
-        table_name="table",
-        labels_name="blobs_labels",
-    )
-    assert report.state is CanonicalCacheState.VALID
-    centers = read_canonical_centers_from_cache(sdata, report)
+    _install_canonical_centers(sdata)
+    region = read_canonical_centers_region(sdata, table_name="table", labels_name="blobs_labels")
     return CanonicalCenterQueryResult(
-        canonical_centers=centers,
-        matched_instance_ids=np.sort(centers.binding.instance_ids)[:2],
+        canonical_centers=region,
+        matched_instance_ids=np.sort(region.instance_ids)[:2],
     )
 
 
@@ -229,15 +211,18 @@ def test_mixed_table_mutations_share_dirty_controls_and_round_trip_declared_comp
     table.obsm["untracked_local"] = np.full((table.n_obs, 1), 99.0)
     table.uns["untracked_local"] = {"value": 99}
 
-    _install_canonical_cache(backed_sdata_blobs)
-    app_state.record_table_mutation(
+    # harpy writes canonical centers itself, so they are a persisted change and
+    # no part of the shared Write below.
+    _install_canonical_centers(backed_sdata_blobs)
+    app_state.record_persisted_table_change(
         _table_event(
             backed_sdata_blobs,
-            paths=CANONICAL_CACHE_PATHS,
-            source="spatial_query_canonical_cache",
+            paths=CANONICAL_CENTERS_PATHS,
+            source="spatial_query_canonical_centers",
             change_kind="created",
         )
     )
+    assert not app_state.is_table_dirty(backed_sdata_blobs, "table")
 
     table.obs[USER_CLASS_COLUMN] = pd.Categorical(
         [1 if index % 2 == 0 else pd.NA for index in range(table.n_obs)],
@@ -371,7 +356,7 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
     monkeypatch: pytest.MonkeyPatch,
     backed_sdata_blobs: SpatialData,
 ) -> None:
-    """One reload request prepares all workflows, respects Feature Extraction, and publishes once."""
+    """A reload waits for Feature Extraction's job, then prepares every workflow once and publishes one ``reloaded`` event."""
     viewer = _Viewer()
     app_state = get_or_create_app_state(viewer)
     app_state.set_sdata(backed_sdata_blobs)
@@ -386,6 +371,21 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
     _select_object_classification_labels(object_classification)
     _configure_feature_extraction(feature_extraction, feature_key="features_1")
 
+    # Give Spatial Query an accepted Run, so the test can check that a refused
+    # reload keeps it and an accepted reload invalidates it. The stubbed
+    # controller accepts without starting a worker, so the Run stays attached.
+    # Start it before Feature Extraction's job: while that job keeps the table
+    # busy, Spatial Query's Run button is disabled.
+    spatial_query.new_column_edit.setText("late_annotation")
+    spatial_query.annotation_value_edit.setText("tumor")
+    monkeypatch.setattr(
+        spatial_query._controller,
+        "start_spatial_query",
+        lambda *args, **kwargs: True,
+    )
+    qtbot.mouseClick(spatial_query.run_button, Qt.MouseButton.LeftButton)
+    assert spatial_query._active_run_intent is not None
+
     worker = _DeferredWorker()
     monkeypatch.setattr(
         feature_extraction._feature_extraction_controller,
@@ -396,16 +396,7 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
     monkeypatch.setattr(feature_extraction, "_confirm_full_replacement", lambda *_args: True)
     feature_extraction.calculate_button.click()
     assert worker.started
-
-    spatial_query.new_column_edit.setText("late_annotation")
-    spatial_query.annotation_value_edit.setText("tumor")
-    monkeypatch.setattr(
-        spatial_query._controller,
-        "start_spatial_query",
-        lambda *args, **kwargs: True,
-    )
-    qtbot.mouseClick(spatial_query.run_button, Qt.MouseButton.LeftButton)
-    assert spatial_query._active_run_intent is not None
+    assert not spatial_query.run_button.isEnabled()
 
     freeze_calls: list[str] = []
     real_freeze = object_classification._classifier_controller.freeze_for_reload
@@ -421,14 +412,14 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
     )
 
     table = backed_sdata_blobs.tables["table"]
-    _install_canonical_cache(backed_sdata_blobs)
+    # harpy writes canonical centers to the store, so the reload keeps them.
+    _install_canonical_centers(backed_sdata_blobs)
     table.obs["temporary_annotation"] = pd.Categorical(["temporary"] * table.n_obs)
     del table.obsm["features_1"]
     dirty_event = _table_event(
         backed_sdata_blobs,
         paths=frozenset(
             {
-                *CANONICAL_CACHE_PATHS,
                 TableComponentPath("obs", ("temporary_annotation",)),
                 TableComponentPath("obsm", ("features_1",)),
             }
@@ -465,11 +456,11 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
     assert len(reload_events) == 1
     assert spatial_query._active_run_intent is None
     assert freeze_calls == ["freeze"]
-    assert CANONICAL_OBSM_KEY not in table.obsm
+    assert CANONICAL_OBSM_KEY in table.obsm
     assert "temporary_annotation" not in table.obs
     assert "features_1" in table.obsm
-    assert spatial_query.cache_report is not None
-    assert spatial_query.cache_report.state is CanonicalCacheState.ABSENT
+    assert spatial_query.centers_status is not None
+    assert spatial_query.centers_status.state == "valid"
     assert object_classification.selected_table_name == "table"
     assert feature_extraction.selected_table_name == "table"
     assert feature_extraction.selected_feature_key == "features_1"
