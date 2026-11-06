@@ -15,6 +15,7 @@ from spatiato._app_state import (
     ShapesElementWrittenEvent,
     SpatiatoAppState,
     TableDirtyStateChangedEvent,
+    TableReloadBlockedError,
     TableReloadRequest,
     TableStateChangedEvent,
     get_or_create_app_state,
@@ -385,18 +386,16 @@ def test_spatiato_app_state_prepares_registered_table_reload_participants_by_ide
         def __init__(self, name: str) -> None:
             self.name = name
 
+        def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
+            del request
+            return None
+
         def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
             calls.append((self.name, request))
 
     first = Participant("first")
     second = Participant("second")
-    request = TableReloadRequest(
-        sdata=sdata_blobs,
-        table_name="table",
-        paths=frozenset({TableComponentPath("obs", ("user_class",))}),
-        region_name="blobs_labels",
-        source="test",
-    )
+    request = _table_reload_request(sdata_blobs)
 
     state.register_table_reload_participant(first)
     state.register_table_reload_participant(first)
@@ -411,6 +410,62 @@ def test_spatiato_app_state_prepares_registered_table_reload_participants_by_ide
     state.prepare_for_table_reload(request)
 
     assert calls == [("second", request)]
+
+
+class _RecordingReloadParticipant:
+    """Reload participant that blocks with `reason`, if given, and records every call."""
+
+    def __init__(self, calls: list[str], name: str, reason: str | None = None) -> None:
+        self._calls = calls
+        self._name = name
+        self._reason = reason
+
+    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
+        del request
+        self._calls.append(f"{self._name}: blocker")
+        return self._reason
+
+    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
+        del request
+        self._calls.append(f"{self._name}: prepare")
+
+
+@pytest.mark.parametrize("blocking_first", [True, False], ids=["blocking_first", "blocking_last"])
+def test_spatiato_app_state_blocked_table_reload_prepares_no_participant(sdata_blobs, blocking_first: bool) -> None:
+    state = SpatiatoAppState()
+    calls: list[str] = []
+    blocking = _RecordingReloadParticipant(calls, "blocking", reason="Still writing.")
+    other = _RecordingReloadParticipant(calls, "other")
+    for participant in (blocking, other) if blocking_first else (other, blocking):
+        state.register_table_reload_participant(participant)
+
+    with pytest.raises(TableReloadBlockedError, match="Still writing."):
+        state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+
+    # Every participant is asked, and none prepares.
+    assert sorted(calls) == ["blocking: blocker", "other: blocker"]
+
+
+def test_spatiato_app_state_blocked_table_reload_lists_every_reason(sdata_blobs) -> None:
+    state = SpatiatoAppState()
+    calls: list[str] = []
+    state.register_table_reload_participant(_RecordingReloadParticipant(calls, "first", reason="First is writing."))
+    state.register_table_reload_participant(_RecordingReloadParticipant(calls, "second", reason="Second is writing."))
+
+    with pytest.raises(TableReloadBlockedError) as error:
+        state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+
+    assert str(error.value) == "First is writing. Second is writing."
+
+
+def _table_reload_request(sdata) -> TableReloadRequest:
+    return TableReloadRequest(
+        sdata=sdata,
+        table_name="table",
+        paths=frozenset({TableComponentPath("obs", ("user_class",))}),
+        region_name="blobs_labels",
+        source="test",
+    )
 
 
 def test_spatiato_app_state_set_coordinate_system_emits_event_and_prunes_layers(
