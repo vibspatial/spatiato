@@ -520,16 +520,18 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
    | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | implemented on 2026-10-30 (`feature_matrix_n_features(...)`); an `object`-dtype matrix is now rejected as not numeric, and a DataFrame feature matrix is rejected (harpy never writes one), so `core/table_matrix.py` no longer supports DataFrames either |
    | 3c.2a | Spatial Query's canonical centers through harpy (P8), additive: a new `core/spatial_query/canonical_centers.py` with the centers status (`validate_canonical_centers(...)`), the calculation (`hp.tb.add_canonical_centers(..., overwrite=True)`), a labels element's centers from the table annotation and `read_matrix_rows(...)`, and the 2-D labels check; unit tests on unbacked and backed SpatialData, including a version-1 record and a table harpy cannot compute | implemented on 2026-11-05: `canonical_centers_status(...)` (`CanonicalCentersStatus`), `compute_canonical_centers(...)` (returns `"created"` or `"rebuilt"`), `read_canonical_centers_region(...)` (`CanonicalCentersRegion`) and `is_canonical_query_labels(...)`; not re-exported until 3c.2c; `tests/test_spatial_query_canonical_centers.py` |
-   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2 and 8 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | ready, after 3c.2a and 3c.5 |
+   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2 and 8 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | ready, after 3c.2a, 3c.5 and 3c.6 |
    | 3c.2c | Cleanup: delete `canonical.py`, `canonical_models.py`, `centroids.py`, their re-exports and their two test modules (28 tests of Spatiato's own cache logic), and the obsolete persistence tests (design point 5); docs and plan | ready, after 3c.2b |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
    | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
-   | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules | ready; before 3c.2b |
+   | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants | ready; before 3c.2b |
+   | 3c.6 | Write and Reload wait for jobs that write the table (P11), extending 3c.5: the participant method becomes `table_persistence_blocker(sdata, table_name)`, with a message that fits both; app state gets `table_persistence_blockers(sdata, table_name)`, which returns every reason and is also the first pass of a reload. Write asks it first and refuses with every reason (`TablePersistenceBlockedError`, renamed from `TableReloadBlockedError`), and the persistence controls show it. Reload asks it before the Write / Discard / Cancel dialog, and again in its first pass. Tests: Write is refused while Feature Extraction writes the table; a blocked reload never shows the dialog; the 3c.5 tests follow the rename. `docs/development/table_state.md` follows | planned on 2026-11-06, readiness check pending; after 3c.5, before 3c.2b |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
-   3c.1-3c.5 are committed separately, 3c.2 in its three parts (a, b, c, in
-   that order), with 3c.5 between 3c.2a and 3c.2b: design point 8 relies on
-   its two-pass contract. 3c.1 comes first, because the classifier summary in 3d relies
+   3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
+   that order), with 3c.5 and then 3c.6 between 3c.2a and 3c.2b: design
+   point 8 relies on their contract, and 3c.2b adds a second job that writes
+   the table. 3c.1 comes first, because the classifier summary in 3d relies
    on its shape-only check. 3c.4 comes before 3c.2, because a feature-matrix
    record under a reserved key would make `add_canonical_centers` reject the
    table. 3c.2 comes next: until it lands, Spatial Query rewrites harpy 0.5.3's
@@ -685,11 +687,11 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       release, publishing for detached jobs) is a follow-up, once both
       controllers exist and are known to stay identical.
    8. **Reload participants** (settled on 2026-11-05, from the readiness check
-      for 3c.2b; relies on 3c.5). The controller blocks a reload of the table
-      while its centers job can still write it, as Feature Extraction's
-      controller does: it is a reload participant of its own, whose blocker
-      reports the job, and it is released only after its job finishes, also
-      when the widget closes first. The widget stays a participant too, to
+      for 3c.2b; relies on 3c.5 and 3c.6). The controller blocks Write and
+      Reload of the table while its centers job can still write it, as Feature
+      Extraction's controller does: it is a participant of its own, whose
+      blocker reports the job, and it is released only after its job finishes,
+      also when the widget closes first. The widget stays a participant too, to
       invalidate a run in its query phase. With 3c.5's two passes, a blocked
       reload changes nothing, in Spatial Query or elsewhere, whatever the
       registration order, so the widget does not need to consult the
@@ -709,6 +711,9 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    - three tests change on purpose: the controller test that expects `quit()`
      on cancel, and the two multi-widget tests that treat canonical centers on
      backed SpatialData as a dirty mutation that Spatiato writes;
+   - `docs/development/table_state.md` follows: Spatial Query's controller
+     joins the participants as a blocker, and its canonical centers become a
+     persisted change on backed SpatialData, installed by harpy in the worker;
    - accepted cost: the status check runs on the main thread when the labels
      element or table changes, after a reload, on every Run and at Apply. For a
      lazy backed matrix each check reads all centers (24 bytes per row).
@@ -1051,11 +1056,8 @@ Direction:
   `("obsm", key)` -> `("obsm", key)`, `("uns", *keys)` -> `("uns", *keys)`;
 - pass `obs_identity` for obs-aligned writes; keep including `_colors` palette
   paths explicitly, as widgets already do;
-- block table writes while a feature extraction on the same table is still
-  writing, as reloads already are (`prepare_for_table_reload(...)` in
-  `widgets/feature_extraction/controller.py`). Today Write is not blocked, so
-  Spatiato's own writer and harpy's can run on the same store at once, which
-  harpy does not protect against (see P7, step 2 design, point 7).
+- blocking table writes while a job writes the same table through harpy is
+  done earlier, as 3c.6 (P11), with the blocker that already guards reloads.
 
 Additional reason (harpy 0.5.1+, anndata 0.13): anndata 0.13 shards zarr v3
 arrays by default (`ad.settings.auto_shard_zarr_v3` is `True` in anndata 0.13.4,
@@ -1720,9 +1722,48 @@ result computed from the replaced table would be wrong to apply anyway;
 blocking would only make the user wait for a result that has to be dropped.
 These widgets return `None` and keep their invalidation.
 
-Not included: running the check before the persistence controls ask Write /
-Discard / Cancel. The dialog lets other events run, so the check would have to
-run again anyway.
+Not included in 3c.5: running the check before the persistence controls ask
+Write / Discard / Cancel, and blocking Write itself. Both follow in 3c.6
+(P11).
+
+### P11. Write is not blocked while a job writes the table
+
+Status: found on 2026-11-06, while reviewing the reload flow after 3c.5.
+Implemented as 3c.6 of the "Migration Plan", after 3c.5 and before 3c.2b. It
+replaces the write block planned under P5.
+
+Since 3c.5, a reload waits for a job whose worker writes the table. Write does
+not, which leaves two problems:
+
+1. **Two writers on one store.** A Write while Feature Extraction's harpy call
+   writes the same table runs Spatiato's writer and harpy's at the same time.
+   They write different components, since Feature Extraction refuses to launch
+   while its key's paths are dirty, but they share the table's group in the
+   store, and both rewrite the store's consolidated metadata. harpy does not
+   protect against a second writer.
+2. **A question before a refusal.** A reload of a dirty table first asks
+   Write / Discard / Cancel, and only then asks the blockers. A user who
+   chooses Write writes, and is then told the reload is blocked.
+
+3c.2b adds a second job that writes the table (Spatial Query's centers job),
+which needs the same guard.
+
+Decision: a job whose worker writes a table blocks both Write and Reload of
+that table.
+
+1. The participant method becomes `table_persistence_blocker(sdata,
+   table_name)`: a reason or `None`, without side effects, with a message that
+   fits both actions (for example 'Feature Extraction is still writing table
+   "T". Wait for it to finish and try again.').
+2. App state gets one check, `table_persistence_blockers(sdata, table_name)`,
+   which returns every reason. It is also the first pass of a reload.
+3. Write asks it first and refuses with every reason
+   (`TablePersistenceBlockedError`, renamed from `TableReloadBlockedError`).
+   The persistence controls show the error; on Write they catch only
+   `ValueError` today.
+4. Reload asks it before the Write / Discard / Cancel dialog, so a blocked
+   reload never asks the question. The first pass asks again, because the
+   dialog lets other events run.
 
 ## Tests to Add
 
@@ -1747,6 +1788,10 @@ run again anyway.
   participant's work untouched, whatever the registration order; the error
   lists every blocker's reason; an unblocked reload invalidates every
   affected participant once;
+- Write and Reload wait for jobs that write the table (P11): Write is refused
+  with the blocker's reason while Feature Extraction writes the table, and
+  succeeds after the job finishes; a blocked reload of a dirty table never
+  shows Write / Discard / Cancel;
 - backed `zarr.Array` / `CSRDataset` consumers (P3);
 - reload keeps `obsm` lazy (P4);
 - persistence through harpy's API: write, delete, rollback on failure,
@@ -1815,6 +1860,12 @@ Settled on 2026-11-05:
 - P10: reload preparation in two passes (3c.5, before 3c.2b). First every
   participant may block the reload, without side effects; only then do they
   invalidate their work.
+
+Settled on 2026-11-06:
+
+- P11: a job whose worker writes a table blocks both Write and Reload of that
+  table (3c.6, after 3c.5 and before 3c.2b); a blocked reload never asks Write
+  / Discard / Cancel.
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
