@@ -520,7 +520,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
    | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | implemented on 2026-10-30 (`feature_matrix_n_features(...)`); an `object`-dtype matrix is now rejected as not numeric, and a DataFrame feature matrix is rejected (harpy never writes one), so `core/table_matrix.py` no longer supports DataFrames either |
    | 3c.2a | Spatial Query's canonical centers through harpy (P8), additive: a new `core/spatial_query/canonical_centers.py` with the centers status (`validate_canonical_centers(...)`), the calculation (`hp.tb.add_canonical_centers(..., overwrite=True)`), a labels element's centers from the table annotation and `read_matrix_rows(...)`, and the 2-D labels check; unit tests on unbacked and backed SpatialData, including a version-1 record and a table harpy cannot compute | implemented on 2026-11-05: `canonical_centers_status(...)` (`CanonicalCentersStatus`), `compute_canonical_centers(...)` (returns `"created"` or `"rebuilt"`), `read_canonical_centers_region(...)` (`CanonicalCentersRegion`) and `is_canonical_query_labels(...)`; not re-exported until 3c.2c; `tests/test_spatial_query_canonical_centers.py` |
-   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2 and 8 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | ready, after 3c.2a, 3c.5 and 3c.6 |
+   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2, 8 and 9 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | ready (second readiness check on 2026-11-06, which added design point 9), after 3c.2a, 3c.5 and 3c.6 |
    | 3c.2c | Cleanup: delete `canonical.py`, `canonical_models.py`, `centroids.py`, their re-exports and their two test modules (28 tests of Spatiato's own cache logic), and the obsolete persistence tests (design point 5); docs and plan | ready, after 3c.2b |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
    | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
@@ -667,8 +667,8 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       harpy: the harpy call installs (and writes the store) in the worker, one
       job per controller, detaching instead of `quit()`, publishing for
       detached jobs, the busy mark released when the worker finishes,
-      persisted change against mutation with the launch snapshot. Three differences are
-      intentional:
+      persisted change against mutation with the launch snapshot. Four
+      differences are intentional:
       - no confirmation dialog and no unsaved-changes block: Feature Extraction
         protects values that cannot be recomputed (other labels elements'
         features, unsaved edits harpy's store-based merge would drop), while
@@ -679,14 +679,18 @@ Spatiato's own table I/O code, is the core of this bump. Order:
         Classification only invalidates its classifier on it, and no consumer
         depends on `"updated"` for canonical centers;
       - the event's regions are every labels element of the table, since
-        harpy recomputes all of them, not only the ones the job targeted.
+        harpy recomputes all of them, not only the ones the job targeted;
+      - detachment is explicit, on cancel, without reattachment (added on
+        2026-11-06): Feature Extraction derives detachment from the selection
+        and reattaches when the inputs come back, while a Spatial Query Run is
+        a one-shot action that never comes back once invalidated.
 
       The job contract is mirrored in Spatial Query's controller, not shared:
       3c.2b is already the large part, and changing Feature Extraction's
       controller inside it adds risk. Extracting a shared "table-writing job"
-      helper (job slot, derived detachment, busy mark, publishing for
-      detached jobs) is a follow-up, once both
-      controllers exist and are known to stay identical.
+      helper (job slot, busy mark, publishing for detached jobs; detachment
+      itself differs, see above) is a follow-up, once both controllers exist
+      and are known to stay identical.
    8. **Reload participants** (settled on 2026-11-05, from the readiness check
       for 3c.2b; revised on 2026-11-06 for 3c.6's busy state). The controller
       marks the table busy while its centers job can still write it, and
@@ -696,6 +700,24 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       participant. The widget stays a participant, to invalidate a run in its
       query phase. With 3c.5's two passes, whose first pass is the busy check,
       a blocked reload changes nothing, in Spatial Query or elsewhere.
+   9. **An attached operation against a job in flight** (settled on
+      2026-11-06, from the second readiness check for 3c.2b). Today the
+      controller has one slot (`_active`), and `is_running` means "an
+      operation the widget is attached to". The widget relies on that:
+      `_on_controller_state_changed(...)` raises when the controller runs
+      while no status card is set, and Run is enabled only when the controller
+      is not running. A cancelled centers job is detached but keeps writing,
+      and `_invalidate_run()` clears the status card, so both meanings are
+      needed, as in Feature Extraction (`has_job_in_flight`):
+      - `is_running` keeps meaning an attached operation, so the status-card
+        invariants hold;
+      - a new `has_job_in_flight` means a centers job is still writing,
+        attached or detached;
+      - Run is enabled only when neither holds (one centers job at a time,
+        point 1);
+      - without a Run, the configuration status says "Waiting for the previous
+        center calculation to finish writing." until the job finishes, and the
+        controller's state callback after `finished` refreshes it.
 
    Also part of 3c.2b (found in its readiness check on 2026-11-05):
    - the two canonical component paths (`obsm/spatial_canonical` and
@@ -718,6 +740,25 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    - accepted cost: the status check runs on the main thread when the labels
      element or table changes, after a reload, on every Run and at Apply. For a
      lazy backed matrix each check reads all centers (24 bytes per row).
+
+   Also part of 3c.2b (found in its second readiness check on 2026-11-06,
+   after 3c.5 and 3c.6):
+   - the controller takes a required `table_busy_marker=` keyword
+     (`TableBusyMarker`), as Feature Extraction's controller does; its seven
+     unit tests construct it through a helper that passes a throwaway app
+     state;
+   - `shutdown()` splits by phase: a centers job detaches and keeps its busy
+     mark until `finished`, without `quit()`; a query worker may still be
+     quit, since it only calculates. Today `_cancel_active_worker()` quits
+     both;
+   - the widget's separate "inspection error" state may go:
+     `canonical_centers_status(...)` already maps harpy's errors to
+     `"invalid"` with the reason, and the other sources (a table that does not
+     annotate the labels element, labels that are not 2-D) are filtered out
+     by the choice lists. Decided during implementation: the state is dropped
+     if nothing produces it;
+   - design point 9 (an attached operation against a job in flight) and the
+     fourth intentional difference of point 7 (explicit detachment).
 
    3c.2b is the large part: the types flow from the controller through the
    query to annotation, so the switch cannot be split further without
@@ -1907,6 +1948,10 @@ Settled on 2026-11-06:
   the busy state per table, as it tracks the dirty state; the persistence
   controls disable Write and Reload with the reason; the job's owner marks and
   releases; reload participants keep only `prepare_for_table_reload`.
+- 3c.2 design point 9 (see "Migration Plan", step 3): Spatial Query's
+  controller separates an attached operation (`is_running`) from a centers job
+  still writing (`has_job_in_flight`); Run waits for both, and a detached job
+  is detached explicitly on cancel, without reattachment.
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
