@@ -25,7 +25,9 @@ from qtpy.QtWidgets import (
 
 from spatiato._app_state import (
     SpatiatoAppState,
+    TableBusyStateChangedEvent,
     TableStateChangedEvent,
+    format_table_busy_message,
     get_or_create_app_state,
 )
 from spatiato.core.persistence import TableComponentPath
@@ -659,6 +661,7 @@ class FeatureExtractionWidget(QWidget):
 
         self._app_state.sdata_changed.connect(self._on_sdata_changed)
         self._app_state.table_state_changed.connect(self._on_table_state_changed)
+        self._app_state.table_busy_state_changed.connect(self._on_table_busy_state_changed)
         # Widget teardown while a job is still running:
         #
         #     widget destroyed
@@ -2485,6 +2488,13 @@ class FeatureExtractionWidget(QWidget):
         if not self._feature_extraction_controller.can_calculate:
             return self._feature_extraction_controller.status_message
 
+        # Another job, for example a Spatial Query center calculation, writes
+        # the table (`table_busy_state_changed` refreshes this).
+        binding = self._feature_extraction_controller.binding_state
+        busy_reasons = self._app_state.table_busy_reasons(binding.sdata, binding.table_name)
+        if busy_reasons and binding.table_name is not None:
+            return format_table_busy_message(binding.table_name, busy_reasons)
+
         return None
 
     def _update_calculate_controls(self) -> None:
@@ -2498,6 +2508,15 @@ class FeatureExtractionWidget(QWidget):
 
     def _on_controller_state_changed(self) -> None:
         self._update_feature_extraction_feedback()
+        self._update_calculate_controls()
+
+    def _on_table_busy_state_changed(self, value: object) -> None:
+        """Disable or enable Calculate while a job writes the bound table."""
+        if not isinstance(value, TableBusyStateChangedEvent):
+            return
+        binding = self._feature_extraction_controller.binding_state
+        if value.sdata is not binding.sdata or value.table_name != binding.table_name:
+            return
         self._update_calculate_controls()
 
     def _on_controller_table_selection_refresh_required(self, result: FeatureExtractionResult) -> None:
