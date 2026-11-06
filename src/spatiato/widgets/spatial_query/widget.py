@@ -20,9 +20,10 @@ from qtpy.QtWidgets import (
 from spatiato._app_state import (
     ShapesElementReloadedEvent,
     SpatiatoAppState,
-    TableChangeKind,
+    TableBusyStateChangedEvent,
     TableReloadRequest,
     TableStateChangedEvent,
+    format_table_busy_message,
     get_or_create_app_state,
 )
 from spatiato.core.object_classification.annotation import USER_CLASS_COLUMN
@@ -32,24 +33,21 @@ from spatiato.core.object_classification.classifier import (
 )
 from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatial_query import (
-    CANONICAL_CACHE_PATHS,
-    CANONICAL_OBSM_KEY,
-    SPATIAL_COORDINATES_KEY,
-    CanonicalCacheReport,
-    CanonicalCacheUpdateAction,
     CanonicalCenterQueryResult,
-    CanonicalCentersResult,
     SpatialAnnotationValue,
     SpatialAnnotationValueKind,
     apply_spatial_annotation,
-    build_canonical_source_signature,
     get_compatible_spatial_annotation_column_names,
-    inspect_canonical_cache,
-    parse_canonical_metadata,
     prepare_spatial_annotation,
     require_compatible_spatial_annotation_column,
     summarize_spatial_annotation,
     validate_and_resolve_spatial_annotation_value_kind,
+)
+from spatiato.core.spatial_query.canonical_centers import (
+    CANONICAL_CENTERS_PATHS,
+    CanonicalCentersStatus,
+    canonical_centers_status,
+    is_canonical_query_labels,
 )
 from spatiato.core.spatialdata import (
     get_annotating_table_names,
@@ -67,7 +65,7 @@ from spatiato.widgets.shared_styles import (
     format_tooltip,
     set_status_card,
 )
-from spatiato.widgets.spatial_query.controller import SpatialQueryController
+from spatiato.widgets.spatial_query.controller import CanonicalCentersChangeResult, SpatialQueryController
 from spatiato.widgets.spatial_query.status_card import (
     _SpatialQueryStatusCardSpec,
     build_spatial_annotation_failure_status_card_spec,
@@ -204,14 +202,8 @@ _PREFERRED_ANNOTATION_COLUMN_NAME = "spatial_annotation"
 _OBJECT_CLASSIFICATION_COLUMNS = frozenset((USER_CLASS_COLUMN, PRED_CLASS_COLUMN, PRED_CONFIDENCE_COLUMN))
 _INPUT_CONTROL_STYLESHEET = build_input_control_stylesheet("QComboBox, QLineEdit, QSpinBox")
 _FIELD_MIN_WIDTH = 180
-CANONICAL_CACHE_UPDATE_SOURCE = "spatial_query_canonical_centers"
+CANONICAL_CENTERS_SOURCE = "spatial_query_canonical_centers"
 SPATIAL_QUERY_ANNOTATION_SOURCE = "spatial_query_annotation"
-_CACHE_UPDATE_CHANGE_KINDS: dict[CanonicalCacheUpdateAction, TableChangeKind] = {
-    CanonicalCacheUpdateAction.CREATE: "created",
-    CanonicalCacheUpdateAction.EXTEND: "updated",
-    CanonicalCacheUpdateAction.REFRESH: "updated",
-    CanonicalCacheUpdateAction.REBUILD: "rebuilt",
-}
 
 
 class SpatialQuery(QWidget):
@@ -220,35 +212,29 @@ class SpatialQuery(QWidget):
     The widget finds Labels instances whose canonical centers are contained by
     the selected Shapes geometry. It selects the relevant SpatialData, Shapes,
     Labels, table, and annotation-column inputs and orchestrates the
-    mutation-free center-calculation and containment-query work.
+    center-calculation and containment-query work.
 
     As a child of ``AnnotationWidget``, this independently embeddable widget
     receives coordinate-system and Shapes state only through
     ``apply_annotation_context()``. Apply Annotation captures one immutable
     column, action, and value intent and delegates sequential center
-    calculation and containment work to its controller. The child owns cache
-    and annotation event publication and applies the captured annotation
-    immediately after a non-empty accepted query result.
+    calculation and containment work to its controller. The child records the
+    canonical-centers and annotation table changes and applies the captured
+    annotation immediately after a non-empty accepted query result.
 
-    CanonicalCacheReport lifecycle
-    ------------------------------
-    configuration-time CanonicalCacheReport
-    (Labels selection change, table selection change, or selected-table reload)
-        → produced by ``_inspect_canonical_centers_cache()``
+    Canonical centers status lifecycle
+    ----------------------------------
+    configuration-time status
+    (Labels selection change, table selection change, selected-table reload,
+    or canonical centers calculated for the selected table)
+        → produced by ``_check_canonical_centers_status()``
         → stored on the widget for status-card information
         → not trusted to start later work
 
-    Run-time CanonicalCacheReport
-        → produced by ``_run_spatial_query()``
-        → authoritative operation starting state
-        → passed directly to ``SpatialQueryController.start_spatial_query()``
-        → performed for every accepted Run
-
-    post-calculation CanonicalCacheReport
-        → produced inside ``apply_canonical_cache_update()``
-        → only when centers were calculated
-        → verifies that the source and table binding did not change
-        → guards cache installation
+    Run-time status
+        → checked again by ``_run_spatial_query()`` for every accepted Run
+        → passed directly to ``SpatialQueryController.start_spatial_query()``,
+          which calculates the centers first when they are not valid
 
     Table reload lifecycle
     ----------------------
@@ -257,7 +243,8 @@ class SpatialQuery(QWidget):
         → happens before in-memory table components are replaced from disk
 
     post-reload ``TableStateChangedEvent``
-        → refreshes compatible columns and canonical-cache state
+        → invalidates the Run again, as a defense
+        → refreshes compatible columns and the canonical centers status
         → reapplies Existing-column or neutral New-column Labels styling
     """
 
@@ -272,14 +259,14 @@ class SpatialQuery(QWidget):
             shapes_target=None,
             has_unsaved_shapes_changes=False,
         )
-        self._canonical_cache_report: CanonicalCacheReport | None = None
-        self._canonical_input_inspection_error: str | None = None
+        self._canonical_centers_status: CanonicalCentersStatus | None = None
         self._layer_styling_error: str | None = None
         self._active_run_intent: _SpatialQueryRunIntent | None = None
         self._status_card_spec: _SpatialQueryStatusCardSpec | None = None
         self._controller = SpatialQueryController(
+            table_busy_marker=self._app_state,
             on_state_changed=self._on_controller_state_changed,
-            on_centers_ready=self._on_centers_ready,
+            on_canonical_centers_changed=self._on_canonical_centers_changed,
             on_query_ready=self._on_query_ready,
         )
 
@@ -393,7 +380,7 @@ class SpatialQuery(QWidget):
         root_layout.addWidget(self.run_button)
         self.persistence_controls = TablePersistenceControls(
             self._app_state,
-            write_content_description="canonical centers and spatial annotations",
+            write_content_description="spatial annotations",
             reload_source="spatial_query",
             parent=self,
         )
@@ -410,6 +397,7 @@ class SpatialQuery(QWidget):
         self.run_button.clicked.connect(self._run_spatial_query)
         self._app_state.viewer_adapter.primary_labels_layers_changed.connect(self._on_primary_labels_layers_changed)
         self._app_state.table_state_changed.connect(self._on_table_state_changed)
+        self._app_state.table_busy_state_changed.connect(self._on_table_busy_state_changed)
         self._app_state.shapes_element_reloaded.connect(self._on_shapes_element_reloaded)
         self.destroyed.connect(self._controller.shutdown)
 
@@ -486,9 +474,9 @@ class SpatialQuery(QWidget):
         return mutation_resolution.value if mutation_resolution.is_ready else None
 
     @property
-    def cache_report(self) -> CanonicalCacheReport | None:
-        """Return the report captured for the current labels/table selection."""
-        return self._canonical_cache_report
+    def centers_status(self) -> CanonicalCentersStatus | None:
+        """Return the canonical centers status checked for the current labels/table selection."""
+        return self._canonical_centers_status
 
     def apply_annotation_context(self, context: AnnotationContext) -> None:
         """Adopt parent context, refreshing selectors only when their dependencies change.
@@ -496,7 +484,7 @@ class SpatialQuery(QWidget):
         SpatialData identity and coordinate-system changes clear the labels
         selection and its complete dependent state. Shapes-target and
         dirty-state changes affect Run readiness only and therefore reuse the
-        current selections and report.
+        current selections and canonical centers status.
         """
         if not isinstance(context, AnnotationContext):
             raise TypeError("Spatial Query requires an AnnotationContext.")
@@ -527,8 +515,8 @@ class SpatialQuery(QWidget):
 
         # Changes to the selected Shapes target or its dirty state may enable
         # or disable Run, but they do not affect the selected Labels, table, or
-        # captured cache report. Refresh only the controls and status to avoid
-        # recalculating the table instance-set digest.
+        # canonical centers status. Refresh only the controls and status to
+        # avoid checking the centers again, which reads the whole matrix.
         self._refresh_controls_and_status()
 
     def _create_combo(self, object_name: str, tooltip: str) -> CompactComboBox:
@@ -550,13 +538,10 @@ class SpatialQuery(QWidget):
                 coordinate_system=coordinate_system,
             )
             for option in candidates:
-                # Expose only labels sources accepted by the canonical-centers
-                # contract; this currently excludes 3D labels.
-                try:
-                    build_canonical_source_signature(sdata, option.labels_name)
-                except (KeyError, TypeError, ValueError):
-                    continue
-                options.append(option)
+                # Expose only 2-D integer labels: the query compares the
+                # centers' y and x with 2-D shapes.
+                if is_canonical_query_labels(sdata, option.labels_name):
+                    options.append(option)
 
         with QSignalBlocker(self.labels_combo):
             self.labels_combo.clear()
@@ -566,7 +551,7 @@ class SpatialQuery(QWidget):
             self.labels_combo.setEnabled(bool(options))
 
     def _clear_labels_selection_and_dependents(self) -> None:
-        """Clear labels-owned UI state without inspecting or mutating the cache."""
+        """Clear labels-owned UI state without checking or changing the canonical centers."""
         with QSignalBlocker(self.labels_combo):
             self.labels_combo.setCurrentIndex(-1)
         self._refresh_tables(preferred_table=None)
@@ -575,8 +560,7 @@ class SpatialQuery(QWidget):
             preferred_existing_column=None,
             preferred_new_column="",
         )
-        self._canonical_cache_report = None
-        self._canonical_input_inspection_error = None
+        self._canonical_centers_status = None
         self._layer_styling_error = None
         self._bind_persistence_controls()
 
@@ -604,9 +588,8 @@ class SpatialQuery(QWidget):
         """Adopt restored table components after one successful shared reload."""
         if not isinstance(value, TableStateChangedEvent):
             return
-        # Ordinary mutation events emitted by `_on_centers_ready()` and
-        # `_on_query_ready()` follow their own cache-installation and
-        # annotation-Apply provenance contracts. Only a successful
+        # Ordinary change events recorded by `_on_canonical_centers_changed()`
+        # and `_on_query_ready()` need no adoption here. Only a successful
         # `change_kind="reloaded"` event reaches the post-reload adoption
         # logic below.
         if value.change_kind != "reloaded":
@@ -626,7 +609,7 @@ class SpatialQuery(QWidget):
             preferred_existing_column=previous_existing_column,
             preferred_new_column=previous_new_column,
         )
-        self._inspect_canonical_centers_cache()
+        self._check_canonical_centers_status()
         self._layer_styling_error = None
         self._apply_explicit_labels_styling()
         self._refresh_controls_and_status()
@@ -651,11 +634,12 @@ class SpatialQuery(QWidget):
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
         """Invalidate Spatial Query work before its selected table is reloaded.
 
-        A Run only computes in a worker; its annotation is written to the table
-        on the main thread. So it never makes the table busy, and a reload does
-        not wait for it: it invalidates the Run here instead. The Run's result,
-        computed from the table being replaced, is discarded and never written
-        to the table.
+        While a Run's centers job writes the table, the controller keeps the
+        table busy, so no reload gets here. The query only computes in a
+        worker; its annotation is written to the table on the main thread. So
+        a reload does not wait for the query: it invalidates the Run here
+        instead. The Run's result, computed from the table being replaced, is
+        discarded and never written to the table.
 
         This is a defense, see `TableReloadParticipant`: the widget also
         invalidates the Run when it receives the `reloaded` event.
@@ -735,23 +719,26 @@ class SpatialQuery(QWidget):
         self._set_column_control_visibility()
         self._reset_annotation_input_for_target()
 
-    def _inspect_canonical_centers_cache(self) -> None:
-        self._canonical_cache_report = None
-        self._canonical_input_inspection_error = None
+    def _on_table_busy_state_changed(self, value: object) -> None:
+        """Disable or enable Run while a job writes the selected table."""
+        if not isinstance(value, TableBusyStateChangedEvent):
+            return
+        if value.sdata is not self.selected_spatialdata or value.table_name != self.selected_table_name:
+            return
+        if not value.is_busy:
+            # The job that wrote the table may have changed its canonical centers.
+            self._check_canonical_centers_status()
+        self._refresh_controls_and_status()
+
+    def _check_canonical_centers_status(self) -> None:
+        """Check the selected table's canonical centers, for the status card; this reads the whole matrix."""
+        self._canonical_centers_status = None
         sdata = self.selected_spatialdata
         labels_name = self.selected_labels_name
         table_name = self.selected_table_name
         if sdata is None or labels_name is None or table_name is None:
             return
-
-        try:
-            self._canonical_cache_report = inspect_canonical_cache(
-                sdata,
-                table_name=table_name,
-                labels_name=labels_name,
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            self._canonical_input_inspection_error = str(error)
+        self._canonical_centers_status = canonical_centers_status(sdata, table_name=table_name)
 
     def _on_labels_changed(self, index: int) -> None:
         del index
@@ -771,7 +758,7 @@ class SpatialQuery(QWidget):
             preferred_new_column=previous_new_column if same_table_context else "",
         )
         self._bind_persistence_controls()
-        self._inspect_canonical_centers_cache()
+        self._check_canonical_centers_status()
         self._apply_explicit_labels_styling()
         self._refresh_controls_and_status()
 
@@ -785,7 +772,7 @@ class SpatialQuery(QWidget):
             preferred_new_column="",
         )
         self._bind_persistence_controls()
-        self._inspect_canonical_centers_cache()
+        self._check_canonical_centers_status()
         # This callback represents an explicit user table choice. Programmatic
         # table refreshes block the combo signal and therefore do not reclaim
         # the shared primary layer's presentation.
@@ -834,13 +821,14 @@ class SpatialQuery(QWidget):
 
         Validate the current UI selections
             ↓
-        perform a fresh canonical-cache inspection
+        check the canonical centers status again
             ↓
         capture the accepted selections in a frozen Run-intent record
             ↓
         ask the controller to start the query
         """
-        if self._controller.is_running:
+        # One centers job at a time: a detached one still writing blocks a new Run.
+        if self._controller.is_running or self._controller.has_job_in_flight:
             return
 
         self._status_card_spec = None
@@ -867,24 +855,11 @@ class SpatialQuery(QWidget):
             self._refresh_controls_and_status()
             return
 
-        # The cache or table binding may have changed since the configuration
-        # report was captured. Do not start work from that display report;
-        # inspect the current state again for this Run.
-        try:
-            report = inspect_canonical_cache(
-                sdata,
-                table_name=table_name,
-                labels_name=labels_name,
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            self._canonical_cache_report = None
-            self._canonical_input_inspection_error = str(error)
-            self._status_card_spec = None
-            self._refresh_controls_and_status()
-            return
-
-        self._canonical_cache_report = report
-        self._canonical_input_inspection_error = None
+        # The canonical centers may have changed since the configuration status
+        # was checked. Do not start work from that displayed status; check it
+        # again for this Run.
+        centers_status = canonical_centers_status(sdata, table_name=table_name)
+        self._canonical_centers_status = centers_status
         self._active_run_intent = _SpatialQueryRunIntent(
             sdata=sdata,
             shapes_name=shapes_name,
@@ -903,9 +878,12 @@ class SpatialQuery(QWidget):
         )
         operation_accepted = self._controller.start_spatial_query(
             sdata,
-            report,
+            centers_status,
+            labels_name=labels_name,
             shapes_name=shapes_name,
             coordinate_system=coordinate_system,
+            # Returned with a centers change, to record it as persisted.
+            dirty_snapshot=self._app_state.snapshot_table_dirty_state(sdata, table_name),
         )
         if operation_accepted:
             return
@@ -914,39 +892,39 @@ class SpatialQuery(QWidget):
         self._status_card_spec = None
         self._refresh_controls_and_status()
 
-    def _on_centers_ready(self, result: CanonicalCentersResult) -> None:
-        """Publish an accepted cache mutation before annotation Apply."""
-        intent = self._active_run_intent
-        if intent is None or not self._run_intent_matches_current_selection(intent):
-            self._invalidate_run()
+    def _on_canonical_centers_changed(self, result: CanonicalCentersChangeResult) -> None:
+        """Record canonical centers that harpy calculated, also for a detached job.
+
+        Recorded while the job's SpatialData is still selected, as Feature
+        Extraction does.
+        """
+        sdata = self.selected_spatialdata
+        if result.sdata is not sdata:
             return
 
-        cache_update = result.cache_update
-        if cache_update is None:
-            # Reused centers did not mutate the canonical cache, so there is
-            # no table-state change to publish or mark as dirty.
-            return
         event = TableStateChangedEvent(
-            sdata=intent.sdata,
+            sdata=sdata,
             table_name=result.table_name,
-            paths=CANONICAL_CACHE_PATHS,
-            regions=(result.labels_name,),
-            change_kind=_CACHE_UPDATE_CHANGE_KINDS[cache_update.action],
-            source=CANONICAL_CACHE_UPDATE_SOURCE,
+            paths=CANONICAL_CENTERS_PATHS,
+            regions=result.regions,
+            change_kind=result.change_kind,
+            source=CANONICAL_CENTERS_SOURCE,
         )
-        self._app_state.record_table_mutation(event)
+        if sdata.is_backed():
+            # harpy has already written the centers to the store, so memory and
+            # store agree. Record the change as persisted: this marks nothing
+            # dirty. With the launch snapshot, it also clears a canonical path
+            # that was dirty at launch and has not changed since. That is rare:
+            # for example, centers recorded as unsaved before the SpatialData
+            # was written to a store.
+            self._app_state.record_persisted_table_change(event, result.dirty_snapshot)
+        else:
+            # Without a store, the centers exist only in memory. Record the
+            # change as an unsaved mutation: this marks its paths dirty.
+            self._app_state.record_table_mutation(event)
 
-        # Keep the configuration-time status snapshot in line with the cache
-        # just installed without repeating the instance-set digest. Every
-        # future Run still performs its own fresh authoritative inspection.
-        stored_metadata = parse_canonical_metadata(
-            intent.sdata.tables[result.table_name].uns[SPATIAL_COORDINATES_KEY][CANONICAL_OBSM_KEY]
-        )
-        self._canonical_cache_report = CanonicalCacheReport(
-            stored_metadata=stored_metadata,
-            source_signature=result.source_signature,
-            binding=result.binding,
-        )
+        if result.table_name == self.selected_table_name:
+            self._check_canonical_centers_status()
 
     def _on_query_ready(self, result: CanonicalCenterQueryResult) -> None:
         """Apply the captured annotation intent to one accepted query result."""
@@ -1348,30 +1326,36 @@ class SpatialQuery(QWidget):
         self.annotation_value_stack.setEnabled(show_value)
 
     def _refresh_controls_and_status(self) -> None:
-        """Refresh Run readiness and status without reinspecting the cache."""
+        """Refresh Run readiness and status without checking the canonical centers again."""
         if (
             self.selected_labels_name is not None
             and self.selected_table_name is not None
-            and self._canonical_cache_report is None
-            and self._canonical_input_inspection_error is None
+            and self._canonical_centers_status is None
         ):
-            raise RuntimeError(
-                "Canonical cache inspection produced neither a report nor an error "
-                "for the complete Spatial Query selection."
-            )
+            raise RuntimeError("The complete Spatial Query selection has no canonical centers status.")
 
         column_resolution = self._resolve_annotation_column()
         self._sync_annotation_input_controls(column_resolution)
         mutation_resolution = self._resolve_annotation_mutation(column_resolution)
-        has_report = self._canonical_cache_report is not None
+        # A detached centers job still writing blocks a new Run, without a Run
+        # the widget is attached to: the status says why.
+        waiting_for_centers_job = self._controller.has_job_in_flight and not self._controller.is_running
+        # Another job, for example Feature Extraction, writes the selected
+        # table: a Run waits for it (`table_busy_state_changed` refreshes this).
+        table_name = self.selected_table_name
+        busy_reasons = self._app_state.table_busy_reasons(self.selected_spatialdata, table_name)
+        table_busy_message = (
+            format_table_busy_message(table_name, busy_reasons) if busy_reasons and table_name is not None else None
+        )
         self.run_button.setEnabled(
-            has_report
-            and self._canonical_input_inspection_error is None
+            self._canonical_centers_status is not None
             and self._annotation_context.saved_shapes_name is not None
             and not self._annotation_context.has_unsaved_shapes_changes
             and column_resolution.is_ready
             and mutation_resolution.is_ready
             and not self._controller.is_running
+            and not self._controller.has_job_in_flight
+            and table_busy_message is None
         )
 
         status_spec = self._status_card_spec
@@ -1383,13 +1367,14 @@ class SpatialQuery(QWidget):
                 has_unsaved_shapes_changes=self._annotation_context.has_unsaved_shapes_changes,
                 labels_name=self.selected_labels_name,
                 table_name=self.selected_table_name,
-                cache_report=self._canonical_cache_report,
-                canonical_input_inspection_error=self._canonical_input_inspection_error,
+                centers_status=self._canonical_centers_status,
                 annotation_column_error=column_resolution.error,
                 annotation_column_description=column_resolution.description,
                 annotation_mutation_error=mutation_resolution.error if column_resolution.is_ready else None,
                 annotation_mutation_description=mutation_resolution.description,
                 layer_styling_error=self._layer_styling_error,
+                waiting_for_centers_job=waiting_for_centers_job,
+                table_busy_message=table_busy_message,
             )
         self._apply_status_card_spec(self.status_label, status_spec)
 
