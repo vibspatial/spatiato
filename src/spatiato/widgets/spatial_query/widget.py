@@ -606,8 +606,7 @@ class SpatialQuery(QWidget):
             return
         # Ordinary mutation events emitted by `_on_centers_ready()` and
         # `_on_query_ready()` follow their own cache-installation and
-        # annotation-Apply provenance contracts. Pre-reload Run invalidation
-        # happens through `prepare_for_table_reload()`. Only a successful
+        # annotation-Apply provenance contracts. Only a successful
         # `change_kind="reloaded"` event reaches the post-reload adoption
         # logic below.
         if value.change_kind != "reloaded":
@@ -615,6 +614,10 @@ class SpatialQuery(QWidget):
         if value.sdata is not self.selected_spatialdata or value.table_name != self.selected_table_name:
             return
 
+        # `prepare_for_table_reload()` already invalidated the Run before the
+        # reload. Invalidating it again here does not rely on that hook: a
+        # late result from the old table is discarded either way.
+        self._invalidate_run()
         previous_mode = self.selected_column_mode
         previous_existing_column = self._selected_existing_column_name()
         previous_new_column = self.new_column_edit.text()
@@ -645,20 +648,15 @@ class SpatialQuery(QWidget):
         self._invalidate_run()
         self._refresh_controls_and_status()
 
-    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-        """Return `None`: Spatial Query never blocks a reload.
+    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
+        """Invalidate Spatial Query work before its selected table is reloaded.
 
         A Run only computes in a worker; its annotation is written to the table
-        on the main thread. So a reload does not have to wait for it:
-        `prepare_for_table_reload()` invalidates the Run instead. Its result,
+        on the main thread. So it never makes the table busy, and a reload does
+        not wait for it: it invalidates the Run here instead. The Run's result,
         computed from the table being replaced, is discarded and never written
         to the table.
         """
-        del request
-        return None
-
-    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Invalidate Spatial Query work before its selected table is reloaded."""
         if request.sdata is not self.selected_spatialdata or request.table_name != self.selected_table_name:
             return
         self._invalidate_run()
