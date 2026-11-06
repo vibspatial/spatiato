@@ -14,8 +14,9 @@ from spatiato._app_state import (
     CoordinateSystemChangeRequest,
     ShapesElementWrittenEvent,
     SpatiatoAppState,
+    TableBusyError,
+    TableBusyStateChangedEvent,
     TableDirtyStateChangedEvent,
-    TableReloadBlockedError,
     TableReloadRequest,
     TableStateChangedEvent,
     get_or_create_app_state,
@@ -386,10 +387,6 @@ def test_spatiato_app_state_prepares_registered_table_reload_participants_by_ide
         def __init__(self, name: str) -> None:
             self.name = name
 
-        def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-            del request
-            return None
-
         def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
             calls.append((self.name, request))
 
@@ -412,50 +409,61 @@ def test_spatiato_app_state_prepares_registered_table_reload_participants_by_ide
     assert calls == [("second", request)]
 
 
-class _RecordingReloadParticipant:
-    """Reload participant that blocks with `reason`, if given, and records every call."""
-
-    def __init__(self, calls: list[str], name: str, reason: str | None = None) -> None:
-        self._calls = calls
-        self._name = name
-        self._reason = reason
-
-    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-        del request
-        self._calls.append(f"{self._name}: blocker")
-        return self._reason
-
-    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        del request
-        self._calls.append(f"{self._name}: prepare")
-
-
-@pytest.mark.parametrize("blocking_first", [True, False], ids=["blocking_first", "blocking_last"])
-def test_spatiato_app_state_blocked_table_reload_prepares_no_participant(sdata_blobs, blocking_first: bool) -> None:
+def test_spatiato_app_state_reload_prepares_participants_only_once_the_table_is_no_longer_busy(sdata_blobs) -> None:
     state = SpatiatoAppState()
     calls: list[str] = []
-    blocking = _RecordingReloadParticipant(calls, "blocking", reason="Still writing.")
-    other = _RecordingReloadParticipant(calls, "other")
-    for participant in (blocking, other) if blocking_first else (other, blocking):
-        state.register_table_reload_participant(participant)
 
-    with pytest.raises(TableReloadBlockedError, match="Still writing."):
+    class Participant:
+        def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
+            del request
+            calls.append("prepare")
+
+    state.register_table_reload_participant(Participant())
+    first = state.mark_table_busy(sdata_blobs, "table", reason="First is writing.")
+    second = state.mark_table_busy(sdata_blobs, "table", reason="Second is writing.")
+
+    with pytest.raises(TableBusyError) as error:
         state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
 
-    # Every participant is asked, and none prepares.
-    assert sorted(calls) == ["blocking: blocker", "other: blocker"]
+    assert str(error.value) == 'Table "table" is busy: First is writing. Second is writing.'
+    assert calls == []
+
+    state.release_table_busy(first)
+    with pytest.raises(TableBusyError, match="Second is writing."):
+        state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+    assert calls == []
+
+    state.release_table_busy(second)
+    state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+    assert calls == ["prepare"]
 
 
-def test_spatiato_app_state_blocked_table_reload_lists_every_reason(sdata_blobs) -> None:
+def test_spatiato_app_state_table_is_busy_until_every_mark_is_released(sdata_blobs, sdata_blobs_multi_region) -> None:
     state = SpatiatoAppState()
-    calls: list[str] = []
-    state.register_table_reload_participant(_RecordingReloadParticipant(calls, "first", reason="First is writing."))
-    state.register_table_reload_participant(_RecordingReloadParticipant(calls, "second", reason="Second is writing."))
+    events: list[TableBusyStateChangedEvent] = []
+    state.table_busy_state_changed.connect(events.append)
 
-    with pytest.raises(TableReloadBlockedError) as error:
-        state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+    first = state.mark_table_busy(sdata_blobs, "table", reason="First is writing.")
+    second = state.mark_table_busy(sdata_blobs, "table", reason="Second is writing.")
 
-    assert str(error.value) == "First is writing. Second is writing."
+    assert state.is_table_busy(sdata_blobs, "table") is True
+    assert state.table_busy_reasons(sdata_blobs, "table") == ("First is writing.", "Second is writing.")
+    # Marks are per SpatialData object and table.
+    assert state.is_table_busy(sdata_blobs, "other_table") is False
+    assert state.is_table_busy(sdata_blobs_multi_region, "table") is False
+
+    state.release_table_busy(first)
+    assert state.is_table_busy(sdata_blobs, "table") is True
+
+    state.release_table_busy(second)
+    state.release_table_busy(second)  # Releasing again does nothing.
+    assert state.is_table_busy(sdata_blobs, "table") is False
+
+    # One event when the table became busy, one when it no longer was.
+    assert [(event.sdata, event.table_name, event.is_busy) for event in events] == [
+        (sdata_blobs, "table", True),
+        (sdata_blobs, "table", False),
+    ]
 
 
 def _table_reload_request(sdata) -> TableReloadRequest:
