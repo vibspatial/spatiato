@@ -183,7 +183,13 @@ def test_spatial_query_prepares_only_for_selected_table_and_ignores_late_query_r
     monkeypatch: pytest.MonkeyPatch,
     sdata_blobs: SpatialData,
 ) -> None:
-    """Preserve a Run for another-table reloads, but reject its late result after the selected table reloads."""
+    """The participant hook alone invalidates a Run of the selected table, and a late query result is rejected.
+
+    A reload of another table preserves the Run. This is one of two paths that
+    each invalidate a Run on their own; the other is the `reloaded` event
+    (`test_spatial_query_reloaded_event_alone_invalidates_a_run_of_the_selected_table`).
+    Together they show that the hook is a defense (see `TableReloadParticipant`).
+    """
     widget = SpatialQuery(_Viewer())
     qtbot.addWidget(widget)
     widget.apply_annotation_context(_context(sdata_blobs))
@@ -212,6 +218,50 @@ def test_spatial_query_prepares_only_for_selected_table_and_ignores_late_query_r
         source="test",
     )
     widget.prepare_for_table_reload(matching_request)
+    assert widget._active_run_intent is None
+
+    widget._on_query_ready(_query_result(sdata_blobs))
+
+    assert "reviewed_annotation" not in sdata_blobs.tables["table"].obs
+
+
+def test_spatial_query_reloaded_event_alone_invalidates_a_run_of_the_selected_table(
+    qtbot,
+    monkeypatch: pytest.MonkeyPatch,
+    sdata_blobs: SpatialData,
+) -> None:
+    """The `reloaded` event alone invalidates a Run of the selected table, and a late query result is rejected.
+
+    No reload happens and `prepare_for_table_reload()` is never called. This is
+    one of two paths that each invalidate a Run on their own; the other is the
+    participant hook
+    (`test_spatial_query_prepares_only_for_selected_table_and_ignores_late_query_result`).
+    Together they show that the hook is a defense (see `TableReloadParticipant`).
+    """
+    widget = SpatialQuery(_Viewer())
+    qtbot.addWidget(widget)
+    widget.apply_annotation_context(_context(sdata_blobs))
+    _select_labels(widget)
+    widget.new_column_edit.setText("reviewed_annotation")
+    widget.annotation_value_edit.setText("tumor")
+    monkeypatch.setattr(widget._controller, "start_spatial_query", lambda *args, **kwargs: True)
+    qtbot.mouseClick(widget.run_button, Qt.MouseButton.LeftButton)
+    assert widget._active_run_intent is not None
+
+    def reloaded_event(table_name: str) -> TableStateChangedEvent:
+        return TableStateChangedEvent(
+            sdata=sdata_blobs,
+            table_name=table_name,
+            paths=frozenset({TableComponentPath("uns", ("unrelated_metadata",))}),
+            regions=(),
+            change_kind="reloaded",
+            source="test",
+        )
+
+    widget.app_state.record_table_reload(reloaded_event("other_table"))
+    assert widget._active_run_intent is not None
+
+    widget.app_state.record_table_reload(reloaded_event("table"))
     assert widget._active_run_intent is None
 
     widget._on_query_ready(_query_result(sdata_blobs))

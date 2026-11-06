@@ -10,6 +10,7 @@ from spatialdata import SpatialData, read_zarr
 from spatialdata.models import TableModel
 
 import spatiato.core.persistence as persistence_module
+import spatiato.widgets.persistence.controller as persistence_controller_module
 from spatiato._app_state import SpatiatoAppState, TableStateChangedEvent
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND, register_feature_matrix_metadata
 from spatiato.core.object_classification.annotation import USER_CLASS_COLORS_KEY, USER_CLASS_COLUMN
@@ -80,6 +81,23 @@ def test_persistence_controller_requires_backed_spatialdata(sdata_blobs: Spatial
 
     with pytest.raises(ValueError, match="not backed by zarr"):
         controller.write_table_state()
+
+
+def test_persistence_controller_write_of_a_clean_table_writes_nothing(
+    backed_sdata_blobs: SpatialData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("A table without unsaved changes must not be written.")
+
+    monkeypatch.setattr(persistence_controller_module, "write_table_components", fail_if_called)
+
+    assert controller.write_table_state() == "tables/table"
+    assert app_state.is_table_dirty(backed_sdata_blobs, "table") is False
 
 
 def test_canonical_cache_update_round_trips_as_one_dirty_consistency_unit(

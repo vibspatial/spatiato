@@ -446,13 +446,12 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
         lambda event: reload_events.append(event) if event.change_kind == "reloaded" else None
     )
 
+    # Feature Extraction's job is still writing (its `_DeferredWorker` has not
+    # finished), so the table is busy: Reload is disabled, the click does
+    # nothing, and no workflow has invalidated its work.
+    assert not spatial_query.persistence_controls.reload_button.isEnabled()
     spatial_query.persistence_controls.reload_button.click()
 
-    # Feature Extraction's job is still writing (its `_DeferredWorker` has not
-    # finished), so it blocks the reload and no workflow has invalidated its
-    # work. Spatial Query and Object Classification are registered before
-    # Feature Extraction, so this also checks that every blocker is asked
-    # before any participant prepares.
     assert reload_events == []
     assert spatial_query._active_run_intent is not None
     assert freeze_calls == []
