@@ -155,26 +155,6 @@ _DEFAULT_FEATURE_MATRIX_KEY = "features"
 _DEFAULT_NEW_TABLE_NAME = "features_table"
 
 
-def _shutdown_feature_extraction_controller(
-    app_state: SpatiatoAppState,
-    controller: FeatureExtractionController,
-) -> None:
-    """Detach the destroyed widget without opening a table-reload race.
-
-    Requesting worker cancellation prevents late results from reaching the
-    widget, but an already-running ``hp.tb.add_feature_matrix()`` call may
-    continue writing its table. Keep the controller registered as an app-state
-    table-reload participant until that Harpy call has finished:
-
-    widget destroyed while Harpy is writing
-        → detach widget callbacks
-        → retain the controller's matching-table reload guard
-        → unregister the controller after the worker finishes
-    """
-    controller.shutdown()
-    controller.release_reload_participant_when_safe(lambda: app_state.unregister_table_reload_participant(controller))
-
-
 def _quoted_names(names: Sequence[str]) -> str:
     return ", ".join(f'"{name}"' for name in names)
 
@@ -422,6 +402,7 @@ class FeatureExtractionWidget(QWidget):
             on_state_changed=self._on_controller_state_changed,
             on_table_selection_refresh_required=self._on_controller_table_selection_refresh_required,
             on_feature_matrix_changed=self._on_controller_feature_matrix_changed,
+            table_busy_marker=self._app_state,
         )
 
         self._label_options: list[SpatialDataLabelsOption] = []
@@ -678,18 +659,14 @@ class FeatureExtractionWidget(QWidget):
 
         self._app_state.sdata_changed.connect(self._on_sdata_changed)
         self._app_state.table_state_changed.connect(self._on_table_state_changed)
-        # Feature Extraction writes through Harpy from its worker. Register the
-        # controller—not this QWidget—so exact-table reload protection can
-        # safely outlive Qt teardown until every non-cooperative call finishes.
-        self._app_state.register_table_reload_participant(self._feature_extraction_controller)
-        app_state = self._app_state
-        controller = self._feature_extraction_controller
-        self.destroyed.connect(
-            lambda *_args, app_state=app_state, controller=controller: _shutdown_feature_extraction_controller(
-                app_state,
-                controller,
-            )
-        )
+        # Widget teardown while a job is still running:
+        #
+        #     widget destroyed
+        #       → controller.shutdown(): detached from the widget, worker asked to quit
+        #       ... harpy keeps writing; the table stays busy ...
+        #     worker finished
+        #       → controller._on_worker_finished() → _clear_job(): busy mark released
+        self.destroyed.connect(self._feature_extraction_controller.shutdown)
         self._update_intensity_features_hint()
         self.refresh_from_sdata(self._app_state.sdata)
 
