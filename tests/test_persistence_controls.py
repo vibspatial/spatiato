@@ -94,6 +94,11 @@ def test_reload_request_prepares_participants_before_execution(
     calls: list[str] = []
 
     class Participant:
+        def table_reload_blocker(self, current_request: TableReloadRequest) -> str | None:
+            assert current_request is request
+            calls.append("blocker")
+            return None
+
         def prepare_for_table_reload(self, current_request: TableReloadRequest) -> None:
             assert current_request is request
             calls.append("prepare")
@@ -112,7 +117,7 @@ def test_reload_request_prepares_participants_before_execution(
 
     controls.reload_button.click()
 
-    assert calls == ["prepare", "reload"]
+    assert calls == ["blocker", "prepare", "reload"]
 
 
 def test_participant_failure_stops_reload_and_reports_feedback(
@@ -134,6 +139,11 @@ def test_participant_failure_stops_reload_and_reports_feedback(
     reload_calls: list[TableReloadRequest] = []
 
     class FailingParticipant:
+        def table_reload_blocker(self, current_request: TableReloadRequest) -> str | None:
+            # Does not block, so the reload reaches `prepare_for_table_reload()`, which fails.
+            del current_request
+            return None
+
         def prepare_for_table_reload(self, current_request: TableReloadRequest) -> None:
             del current_request
             raise RuntimeError("injected preparation failure")
