@@ -1462,10 +1462,10 @@ def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_
         source="test",
     )
 
+    still_writing = "Feature Extraction is still writing it"
     assert controller.calculate() is True
-    controller.prepare_for_table_reload(unrelated_request)
-    with pytest.raises(RuntimeError, match="Feature Extraction is still writing it"):
-        controller.prepare_for_table_reload(matching_request)
+    assert controller.table_reload_blocker(unrelated_request) is None
+    assert still_writing in controller.table_reload_blocker(matching_request)
 
     controller.bind(
         sdata_blobs,
@@ -1477,8 +1477,7 @@ def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_
         "feature_matrix_2",
     )
     assert controller.has_job_in_flight is True
-    with pytest.raises(RuntimeError, match="Feature Extraction is still writing it"):
-        controller.prepare_for_table_reload(matching_request)
+    assert still_writing in controller.table_reload_blocker(matching_request)
 
     # harpy does not protect concurrent writers, so the next launch waits too.
     waiting_status = "Feature extraction: waiting for the previous calculation to finish writing."
@@ -1495,7 +1494,7 @@ def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_
     assert state_changes, "the widget must learn that Calculate is available again"
     assert controller.can_calculate is True
     assert controller.status_message == "Feature extraction: ready to calculate."
-    controller.prepare_for_table_reload(matching_request)
+    assert controller.table_reload_blocker(matching_request) is None
 
     assert controller.calculate() is True
     assert len(workers) == 2
