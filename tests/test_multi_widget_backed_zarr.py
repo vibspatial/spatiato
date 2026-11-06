@@ -448,9 +448,14 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
 
     spatial_query.persistence_controls.reload_button.click()
 
+    # Feature Extraction's job is still writing (its `_DeferredWorker` has not
+    # finished), so it blocks the reload and no workflow has invalidated its
+    # work. Spatial Query and Object Classification are registered before
+    # Feature Extraction, so this also checks that every blocker is asked
+    # before any participant prepares.
     assert reload_events == []
-    assert spatial_query._active_run_intent is None
-    assert freeze_calls == ["freeze"]
+    assert spatial_query._active_run_intent is not None
+    assert freeze_calls == []
     assert CANONICAL_OBSM_KEY in table.obsm
     assert "temporary_annotation" in table.obs
     assert "features_1" not in table.obsm
@@ -459,7 +464,8 @@ def test_shared_reload_is_guarded_then_adopted_once_by_all_bound_workflows(
     spatial_query.persistence_controls.reload_button.click()
 
     assert len(reload_events) == 1
-    assert freeze_calls == ["freeze", "freeze"]
+    assert spatial_query._active_run_intent is None
+    assert freeze_calls == ["freeze"]
     assert CANONICAL_OBSM_KEY not in table.obsm
     assert "temporary_annotation" not in table.obs
     assert "features_1" in table.obsm
