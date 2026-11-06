@@ -88,12 +88,11 @@ class SpatialAnnotationPreparation:
             raise ValueError("Spatial annotation column name must not be empty.")
         row_positions = np.array(self.row_positions, dtype=np.intp, copy=True)
         row_positions.flags.writeable = False
-        if row_positions.ndim != 1 or np.any(row_positions < 0):
-            raise ValueError("Spatial annotation row positions must be a one-dimensional non-negative array.")
-        if len(np.unique(row_positions)) != len(row_positions):
-            raise ValueError("Spatial annotation row positions must be unique.")
-        if len(row_positions) != self.query_result.matched_instance_count:
-            raise ValueError("Spatial annotation row positions must match the queried instance count.")
+        # The query result determines the rows: each matched instance ID's row
+        # in the queried region. This also makes them unique and non-negative.
+        expected_row_positions = _resolve_query_row_positions(self.query_result, self.query_result.canonical_centers)
+        if not np.array_equal(row_positions, expected_row_positions):
+            raise ValueError("Spatial annotation row positions must be the table rows of the matched instance IDs.")
         if not isinstance(self.prepared_values, pd.Series):
             raise TypeError("Spatial annotation prepared values must be a pandas Series.")
         if len(self.prepared_values) != len(row_positions):
@@ -530,7 +529,8 @@ def _raise_if_query_outdated(
     - the table's canonical centers are still valid
       (``canonical_centers_status(...)``);
     - the queried labels element's rows and instance IDs are unchanged, read
-      from the table annotation, and still resolve to the prepared rows;
+      from the table annotation, so the matched instances still resolve to the
+      prepared rows;
     - its canonical centers are unchanged.
 
     Otherwise, raise ``SpatialAnnotationQueryOutdatedError`` and require a new
@@ -553,13 +553,13 @@ def _raise_if_query_outdated(
     if status.state != "valid":
         raise SpatialAnnotationQueryOutdatedError("The canonical centers of the table are no longer valid.")
     current = _read_current_canonical_centers_region(sdata, queried)
+    # Unchanged rows and instance IDs also mean the matched instances still
+    # resolve to the prepared rows: `SpatialAnnotationPreparation` requires
+    # them to be the rows of the matched IDs in the queried region.
     if not _canonical_centers_region_rows_match(current, queried):
         raise SpatialAnnotationQueryOutdatedError(
             "The table rows of the selected labels element changed after annotation preparation."
         )
-    current_row_positions = _resolve_query_row_positions(preparation.query_result, current)
-    if not np.array_equal(current_row_positions, preparation.row_positions):
-        raise SpatialAnnotationQueryOutdatedError("The queried instances no longer resolve to the prepared table rows.")
     if not np.array_equal(current.centers, queried.centers):
         raise SpatialAnnotationQueryOutdatedError(
             "The canonical centers of the selected labels element changed after the query."

@@ -5,18 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from spatiato.core.spatial_query import (
-    CanonicalCacheReport,
-    CanonicalCacheState,
-    SpatialAnnotationSummary,
-)
+from spatiato.core.spatial_query import SpatialAnnotationSummary
+from spatiato.core.spatial_query.canonical_centers import CanonicalCentersStatus
 from spatiato.widgets.shared_styles import StatusCardKind, validate_status_card_kind
 
-_FIRST_CALCULATION_TOOLTIP = (
-    "Centers will first be calculated for the selected labels element before the spatial query runs."
-)
 _CENTER_CALCULATION_TOOLTIP = (
-    "Centers will be calculated for the selected labels element before the spatial query runs."
+    "Canonical centers are calculated for every labels element the table annotates, "
+    "and the table is busy until the calculation has finished."
 )
 
 type _StatusCardSource = Literal["configuration", "controller", "annotation_outcome"]
@@ -131,15 +126,21 @@ def build_spatial_query_status_card_spec(
     has_unsaved_shapes_changes: bool,
     labels_name: str | None,
     table_name: str | None,
-    cache_report: CanonicalCacheReport | None,
-    canonical_input_inspection_error: str | None,
+    centers_status: CanonicalCentersStatus | None,
     annotation_column_error: str | None,
     annotation_column_description: str | None,
     annotation_mutation_error: str | None,
     annotation_mutation_description: str | None,
     layer_styling_error: str | None,
+    waiting_for_centers_job: bool = False,
+    table_busy_message: str | None = None,
 ) -> _SpatialQueryStatusCardSpec:
-    """Build the unified Spatial Query status from already-derived child state."""
+    """Build the unified Spatial Query status from already-derived child state.
+
+    `waiting_for_centers_job` is set while a detached centers job still
+    writes, without a Run: a new Run waits for it. `table_busy_message` is set
+    while another job writes the selected table: a new Run waits for it too.
+    """
     if not has_spatialdata:
         return _SpatialQueryStatusCardSpec(
             title="No SpatialData Loaded",
@@ -176,19 +177,8 @@ def build_spatial_query_status_card_spec(
             lines=(f'No linked table is selected for "{labels_name}".',),
             kind="warning",
         )
-    if cache_report is None:
-        if canonical_input_inspection_error is None:
-            raise ValueError("A missing canonical cache report requires a canonical input inspection error.")
-        return _SpatialQueryStatusCardSpec(
-            title="Labels or Table Validation Failed",
-            lines=(
-                canonical_input_inspection_error,
-                "Spatial Query cannot calculate centers until this issue is resolved.",
-            ),
-            kind="error",
-        )
-    if canonical_input_inspection_error is not None:
-        raise ValueError("A canonical cache report and canonical input inspection error cannot be supplied together.")
+    if centers_status is None:
+        raise ValueError("A complete labels and table selection requires the canonical centers status.")
     if annotation_column_error is not None:
         return _SpatialQueryStatusCardSpec(
             title="Annotation Column Not Ready",
@@ -201,6 +191,18 @@ def build_spatial_query_status_card_spec(
             lines=(annotation_mutation_error,),
             kind="warning",
         )
+    if waiting_for_centers_job:
+        return _SpatialQueryStatusCardSpec(
+            title="Center Calculation Still Writing",
+            lines=("Waiting for the previous center calculation to finish writing.",),
+            kind="info",
+        )
+    if table_busy_message is not None:
+        return _SpatialQueryStatusCardSpec(
+            title="Table Busy",
+            lines=(table_busy_message,),
+            kind="info",
+        )
     if layer_styling_error is not None:
         return _SpatialQueryStatusCardSpec(
             title="Layer Styling Warning",
@@ -208,9 +210,10 @@ def build_spatial_query_status_card_spec(
             kind="warning",
         )
 
-    cache_line, kind, tooltip_message = _build_ready_cache_status(
-        cache_report,
+    centers_line, kind, tooltip_message = _build_ready_centers_status(
+        centers_status,
         labels_name,
+        table_name,
     )
     return _SpatialQueryStatusCardSpec(
         title="Spatial Query Ready",
@@ -218,46 +221,32 @@ def build_spatial_query_status_card_spec(
             f'Shapes "{saved_shapes_name}" will query labels "{labels_name}".',
             f"Target: {annotation_column_description or 'unknown annotation column'}.",
             annotation_mutation_description or "Annotation action is not configured.",
-            cache_line,
+            centers_line,
         ),
         kind=kind,
         tooltip_message=tooltip_message,
     )
 
 
-def _build_ready_cache_status(
-    report: CanonicalCacheReport,
+def _build_ready_centers_status(
+    status: CanonicalCentersStatus,
     labels_name: str,
+    table_name: str,
 ) -> tuple[str, StatusCardKind, str | None]:
-    if report.state is CanonicalCacheState.VALID:
-        return f'Cached centers for "{labels_name}" will be reused.', "success", None
-    if report.state is CanonicalCacheState.ABSENT:
+    if status.state == "valid":
+        return f'Centers for "{labels_name}" will be reused.', "success", None
+    if status.state == "absent":
         return (
-            f'Centers for labels element "{labels_name}" will be calculated before querying.',
-            "info",
-            _FIRST_CALCULATION_TOOLTIP,
-        )
-    if report.state is CanonicalCacheState.PARTIAL:
-        return (
-            f'Centers for labels element "{labels_name}" will be calculated before querying.',
+            f'Centers for every labels element of table "{table_name}" will be calculated before querying.',
             "info",
             _CENTER_CALCULATION_TOOLTIP,
         )
-    if report.state is CanonicalCacheState.STALE:
-        return (
-            f'Centers for labels element "{labels_name}" will be refreshed before querying.',
-            "warning",
-            _CENTER_CALCULATION_TOOLTIP,
-        )
-    if report.state is CanonicalCacheState.INVALID:
-        mismatch = report.mismatches[0]
-        return (
-            f'Centers for labels element "{labels_name}" will be recalculated before querying.',
-            "info",
-            mismatch.detail or _CENTER_CALCULATION_TOOLTIP,
-        )
-
-    raise ValueError(f"Unsupported canonical cache state `{report.state}`.")
+    # Invalid: harpy's reason, also for an older record, explains why.
+    return (
+        f'Centers for every labels element of table "{table_name}" will be recalculated before querying.',
+        "info",
+        status.reason,
+    )
 
 
 def _format_annotation_value(value: object) -> str:
