@@ -150,8 +150,9 @@ class TableBusyStateChangedEvent:
 
     A table is busy while a job writes it from a worker thread
     (``SpatiatoAppState.mark_table_busy()``). Bound ``TablePersistenceControls``
-    use this event to disable or enable Write and Reload; the reasons are read
-    from ``SpatiatoAppState``.
+    use this event to disable or enable Write and Reload, and the Spatial Query
+    and Feature Extraction widgets to disable or enable starting a new job; the
+    reasons are read from ``SpatiatoAppState``.
     """
 
     sdata: SpatialData
@@ -183,7 +184,9 @@ class TableBusyMarker(Protocol):
     """Mark a table busy while a job writes it, and release the mark when the job ends.
 
     ``SpatiatoAppState`` implements it. The owner of such a job depends on this
-    protocol only, not on the whole app state.
+    protocol only, not on the whole app state. Before it starts a job, the
+    owner reads ``table_busy_reasons()``: a job does not start on a table that
+    another job writes.
     """
 
     def mark_table_busy(self, sdata: SpatialData, table_name: str, *, reason: str) -> TableBusyMark:
@@ -191,6 +194,9 @@ class TableBusyMarker(Protocol):
 
     def release_table_busy(self, mark: TableBusyMark) -> None:
         """Release a mark returned by ``mark_table_busy()``."""
+
+    def table_busy_reasons(self, sdata: SpatialData | None, table_name: str | None) -> tuple[str, ...]:
+        """Return the reasons of every mark that keeps the table busy; empty when it is not busy."""
 
 
 class TableBusyError(RuntimeError):
@@ -618,10 +624,10 @@ class SpatiatoAppState(QObject):
 
         Call it when the job launches, and pass the returned mark to
         ``release_table_busy()`` when the job ends, on every path. While any
-        mark is held, the table can be neither written nor reloaded, and
-        ``reason`` is shown to the user, for example "Feature Extraction is
-        still writing its results. Try again once the calculation has
-        finished."
+        mark is held, the table can be neither written nor reloaded, no other
+        job starts on it, and ``reason`` is shown to the user, for example
+        "Feature Extraction is still writing its results. Try again once the
+        calculation has finished."
         """
         if not isinstance(reason, str) or not reason:
             raise ValueError("Table busy marks require a non-empty reason.")
