@@ -15,15 +15,6 @@ from spatiato._app_state import SpatiatoAppState, TableStateChangedEvent
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND, register_feature_matrix_metadata
 from spatiato.core.object_classification.annotation import USER_CLASS_COLORS_KEY, USER_CLASS_COLUMN
 from spatiato.core.persistence import TableComponentPath
-from spatiato.core.spatial_query import (
-    CANONICAL_CACHE_PATHS,
-    CANONICAL_OBSM_KEY,
-    CanonicalCacheState,
-    CanonicalCentersResult,
-    apply_canonical_cache_update,
-    build_canonical_cache_update_payload,
-    inspect_canonical_cache,
-)
 from spatiato.core.spatialdata import get_table, get_table_metadata
 from spatiato.widgets.object_classification.controller import (
     CLASSIFIER_CONFIG_KEY,
@@ -57,24 +48,6 @@ def _record_mutation(
     )
 
 
-def _apply_canonical_cache(sdata: SpatialData) -> CanonicalCentersResult:
-    report = inspect_canonical_cache(sdata, table_name="table", labels_name="blobs_labels")
-    centers = np.zeros((report.binding.n_obs, 3), dtype=np.float64)
-    centers[:, 1:] = np.arange(report.binding.n_obs * 2, dtype=np.float64).reshape(-1, 2)
-    payload = build_canonical_cache_update_payload(
-        binding=report.binding,
-        centers=centers,
-        source_signature=report.source_signature,
-    )
-    cache_update = apply_canonical_cache_update(sdata, payload)
-    return CanonicalCentersResult(
-        source_signature=payload.source_signature,
-        binding=payload.binding,
-        centers=payload.centers,
-        cache_update=cache_update,
-    )
-
-
 def test_persistence_controller_requires_backed_spatialdata(sdata_blobs: SpatialData) -> None:
     controller = PersistenceController()
     controller.bind(sdata_blobs, "table")
@@ -100,66 +73,42 @@ def test_persistence_controller_write_of_a_clean_table_writes_nothing(
     assert app_state.is_table_dirty(backed_sdata_blobs, "table") is False
 
 
-def test_canonical_cache_update_round_trips_as_one_dirty_consistency_unit(
-    backed_sdata_blobs: SpatialData,
-) -> None:
-    app_state = SpatiatoAppState()
-    controller = PersistenceController(app_state)
-    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
-    _apply_canonical_cache(backed_sdata_blobs)
-
-    _record_mutation(app_state, backed_sdata_blobs, *CANONICAL_CACHE_PATHS)
-
-    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == CANONICAL_CACHE_PATHS
-
-    controller.write_table_state()
-    reopened = read_zarr(backed_sdata_blobs.path)
-
-    assert controller.has_unsynced_table_changes is False
-    assert (
-        inspect_canonical_cache(reopened, table_name="table", labels_name="blobs_labels").state
-        is CanonicalCacheState.VALID
-    )
-
-
-def test_failed_second_canonical_write_acknowledges_neither_path(
+def test_failed_write_acknowledges_none_of_its_paths(
     backed_sdata_blobs: SpatialData,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app_state = SpatiatoAppState()
     controller = PersistenceController(app_state)
     controller.bind(backed_sdata_blobs, "table", "blobs_labels")
-    _apply_canonical_cache(backed_sdata_blobs)
-    _record_mutation(app_state, backed_sdata_blobs, *CANONICAL_CACHE_PATHS)
+    table = backed_sdata_blobs["table"]
+    obsm_path = TableComponentPath("obsm", ("features_1",))
+    uns_path = TableComponentPath("uns", ("extension_metadata", "result"))
+    table.obsm["features_1"] = np.zeros_like(np.asarray(table.obsm["features_1"]))
+    table.uns["extension_metadata"] = {"result": {"version": 1}}
+    _record_mutation(app_state, backed_sdata_blobs, obsm_path, uns_path)
     real_write_elem = persistence_module.ad.io.write_elem
-    canonical_write_count = 0
 
-    def fail_second_canonical_write(group, key, value, *args, **kwargs):
-        nonlocal canonical_write_count
-        if key == CANONICAL_OBSM_KEY:
-            canonical_write_count += 1
-            if canonical_write_count == 2:
-                raise RuntimeError("injected canonical metadata write failure")
+    def fail_uns_write(group, key, value, *args, **kwargs):
+        if key == "result":
+            raise RuntimeError("injected uns write failure")
         return real_write_elem(group, key, value, *args, **kwargs)
 
-    monkeypatch.setattr(persistence_module.ad.io, "write_elem", fail_second_canonical_write)
-
-    with pytest.raises(RuntimeError, match="injected canonical metadata write failure"):
+    # The obsm entry is written first; the uns entry then fails.
+    monkeypatch.setattr(persistence_module.ad.io, "write_elem", fail_uns_write)
+    with pytest.raises(RuntimeError, match="injected uns write failure"):
         controller.write_table_state()
 
-    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == CANONICAL_CACHE_PATHS
+    # Neither path is acknowledged, also the obsm entry that was written.
+    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == {obsm_path, uns_path}
 
-    controller.reload_table_state()
+    # So Write can be retried.
+    monkeypatch.setattr(persistence_module.ad.io, "write_elem", real_write_elem)
+    controller.write_table_state()
 
+    reread = read_zarr(backed_sdata_blobs.path)["table"]
     assert controller.has_unsynced_table_changes is False
-    assert (
-        inspect_canonical_cache(
-            backed_sdata_blobs,
-            table_name="table",
-            labels_name="blobs_labels",
-        ).state
-        is CanonicalCacheState.INVALID
-    )
+    np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), 0)
+    assert reread.uns["extension_metadata"]["result"]["version"] == 1
 
 
 def test_persistence_controller_tracks_dirty_state_per_selected_table(
