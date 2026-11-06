@@ -594,7 +594,14 @@ class ObjectClassificationWidget(QWidget):
         self._update_selection_status()
 
     def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-        """Never block a reload: classifier jobs only compute, so a reload invalidates them instead."""
+        """Return `None`: Object Classification never blocks a reload.
+
+        Its classifier jobs only compute in a worker; their results are written
+        to the table on the main thread. So a reload does not have to wait for
+        them: `prepare_for_table_reload()` cancels them instead. A cancelled
+        job's result, computed from the table being replaced, is discarded and
+        never written to the table.
+        """
         del request
         return None
 

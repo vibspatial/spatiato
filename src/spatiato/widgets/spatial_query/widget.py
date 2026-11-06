@@ -105,9 +105,7 @@ class _AnnotationColumnResolution:
 
         if self.error is None:
             if self.mode is None or self.column_name is None or self.value_kind is None:
-                raise ValueError(
-                    "A ready annotation column resolution requires a mode, column name, and value kind."
-                )
+                raise ValueError("A ready annotation column resolution requires a mode, column name, and value kind.")
             if not self.column_name:
                 raise ValueError("Annotation column name must not be empty.")
             return
@@ -646,6 +644,18 @@ class SpatialQuery(QWidget):
 
         self._invalidate_run()
         self._refresh_controls_and_status()
+
+    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
+        """Return `None`: Spatial Query never blocks a reload.
+
+        A Run only computes in a worker; its annotation is written to the table
+        on the main thread. So a reload does not have to wait for it:
+        `prepare_for_table_reload()` invalidates the Run instead. Its result,
+        computed from the table being replaced, is discarded and never written
+        to the table.
+        """
+        del request
+        return None
 
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
         """Invalidate Spatial Query work before its selected table is reloaded."""
