@@ -2001,6 +2001,29 @@ def _ready_widget(qtbot, sdata: SpatialData, feature_key: str) -> FeatureExtract
     return widget
 
 
+def test_feature_extraction_widget_disables_calculate_while_another_job_keeps_the_table_busy(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    widget = _ready_widget(qtbot, sdata_blobs, "features_new")
+    app_state = widget._app_state
+
+    other_job = app_state.mark_table_busy(
+        sdata_blobs,
+        "table",
+        reason="Spatial Query is still writing canonical centers.",
+    )
+
+    assert widget.calculate_button.isEnabled() is False
+    assert 'Table "table" is busy: Spatial Query is still writing canonical centers.' in _tooltip_text(
+        widget.calculate_button
+    )
+
+    app_state.release_table_busy(other_job)
+
+    assert widget.calculate_button.isEnabled() is True
+
+
 def test_feature_extraction_widget_launches_new_key_without_dialog(qtbot, sdata_blobs: SpatialData) -> None:
     widget = _ready_widget(qtbot, sdata_blobs, "features_new")
     recorder = _record_launches(widget)

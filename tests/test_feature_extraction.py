@@ -1499,6 +1499,33 @@ def test_feature_extraction_controller_keeps_its_table_busy_and_blocks_new_launc
     assert len(workers) == 2
 
 
+def test_feature_extraction_controller_refuses_to_launch_while_another_job_keeps_the_table_busy(
+    sdata_blobs: SpatialData,
+) -> None:
+    app_state = SpatiatoAppState()
+    controller = _controller(table_busy_marker=app_state)
+    controller.bind(
+        sdata_blobs,
+        "blobs_labels",
+        None,
+        "table",
+        "global",
+        ["area"],
+        "feature_matrix_1",
+    )
+    controller._create_feature_extraction_worker = (  # type: ignore[method-assign]
+        lambda job: pytest.fail("A busy table must not start a feature-extraction job.")
+    )
+    app_state.mark_table_busy(sdata_blobs, "table", reason="Spatial Query is still writing canonical centers.")
+
+    assert controller.calculate() is False
+    assert controller.has_job_in_flight is False
+    assert controller.status_kind == "warning"
+    assert controller.status_message == 'Table "table" is busy: Spatial Query is still writing canonical centers.'
+    # Only the other job's mark keeps the table busy.
+    assert app_state.table_busy_reasons(sdata_blobs, "table") == ("Spatial Query is still writing canonical centers.",)
+
+
 class _FailingStartWorker(_DeferredWorker):
     def start(self) -> None:
         raise RuntimeError("injected start failure")
