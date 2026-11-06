@@ -2547,18 +2547,18 @@ class FeatureExtractionWidget(QWidget):
             source="feature_extraction",
         )
         if sdata.is_backed():
-            # harpy wrote the change to the store before this callback runs:
-            # `hp.tb.add_feature_matrix()` wrote `obsm/<key>` and
+            # harpy has already written the change to the store, so memory and
+            # store agree: `hp.tb.add_feature_matrix()` wrote `obsm/<key>` and
             # `uns/feature_matrices/<key>`, or, for a "removed" result,
-            # `hp.tb.io.remove_table_components()` deleted them. So the event is
-            # recorded as persisted, not as an unsaved mutation:
-            # - a path that was dirty at launch (`result.dirty_snapshot`) and that
-            #   harpy wrote becomes clean, unless it changed again since launch;
-            # - every other dirty path stays dirty.
-            # The first case does not normally occur, because Calculate refuses to
-            # launch while the key's paths have unsaved changes. A new table has
-            # no snapshot.
+            # `hp.tb.io.remove_table_components()` deleted them. Record the
+            # change as persisted: this marks nothing dirty. With the launch
+            # snapshot, it also clears the key's paths if they were dirty at
+            # launch and have not changed since; other dirty paths stay dirty.
+            # That does not normally happen: Calculate refuses to launch while
+            # the key's paths have unsaved changes. A job that creates a new
+            # table has no launch snapshot, so it clears nothing.
             self._app_state.record_persisted_table_change(event, result.dirty_snapshot)
         else:
-            # Nothing is on disk, so the change is an unsaved mutation.
+            # Without a store, the change exists only in memory. Record it as
+            # an unsaved mutation: this marks its paths dirty.
             self._app_state.record_table_mutation(event)
