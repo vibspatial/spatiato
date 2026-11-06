@@ -520,19 +520,20 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3b | Coloring by `X` var through the column helper, for the rows of the labels element only (P2) | implemented on 2026-10-30; fixes P2 |
    | 3c.1 | Shape and dtype without loading: `inspect_feature_matrix_metadata(...)` and `register_feature_matrix_metadata(...)` (`core/feature_matrix_metadata.py`), and the column check `_validate_current_feature_matrix_matches_columns(...)` (`core/object_classification/classifier.py`). Same checks as today (2-D, row count, numeric dtype); registration records `backend` with `is_sparse_matrix(...)` | implemented on 2026-10-30 (`feature_matrix_n_features(...)`); an `object`-dtype matrix is now rejected as not numeric, and a DataFrame feature matrix is rejected (harpy never writes one), so `core/table_matrix.py` no longer supports DataFrames either |
    | 3c.2a | Spatial Query's canonical centers through harpy (P8), additive: a new `core/spatial_query/canonical_centers.py` with the centers status (`validate_canonical_centers(...)`), the calculation (`hp.tb.add_canonical_centers(..., overwrite=True)`), a labels element's centers from the table annotation and `read_matrix_rows(...)`, and the 2-D labels check; unit tests on unbacked and backed SpatialData, including a version-1 record and a table harpy cannot compute | implemented on 2026-11-05: `canonical_centers_status(...)` (`CanonicalCentersStatus`), `compute_canonical_centers(...)` (returns `"created"` or `"rebuilt"`), `read_canonical_centers_region(...)` (`CanonicalCentersRegion`) and `is_canonical_query_labels(...)`; not re-exported until 3c.2c; `tests/test_spatial_query_canonical_centers.py` |
-   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2, 8 and 9 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | ready (second readiness check on 2026-11-06, which added design point 9), after 3c.2a, 3c.5 and 3c.6 |
+   | 3c.2b | The switch: the query and its models, annotation, controller (design points 1-2, 8 and 9 below), widget and status card use 3c.2a; the tests that keep their behavior are re-expressed (about 35, in the query, annotation, controller, widget, status-card, multi-widget and annotation-widget modules) | implemented on 2026-11-06, after 3c.2a, 3c.5 and 3c.6: `CANONICAL_CENTERS_PATHS` in `canonical_centers.py`; the query and annotation take `CanonicalCentersRegion`, and the provenance check at Apply follows design point 4; the controller's centers job calls harpy in the worker, marks the table busy (`table_busy_marker=`), publishes its change also when detached (`on_canonical_centers_changed`), and is detached, not quit, on cancel and shutdown; `is_running` and `has_job_in_flight` (design point 9), with the waiting status; the widget records the change as persisted (backed) or as a mutation (unbacked); the status card has three states; the separate "inspection error" state is dropped, since `canonical_centers_status(...)` never raises; `docs/development/table_state.md` follows. The old modules stay until 3c.2c |
    | 3c.2c | Cleanup: delete `canonical.py`, `canonical_models.py`, `centroids.py`, their re-exports and their two test modules (28 tests of Spatiato's own cache logic), and the obsolete persistence tests (design point 5); docs and plan | ready, after 3c.2b |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
    | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
-   | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants. 3c.6 replaces the participants' blocker with app state's busy state | ready; before 3c.2b |
+   | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants. 3c.6 replaces the participants' blocker with app state's busy state | implemented on 2026-11-06, before 3c.6 and 3c.2b; 3c.6 then replaced the participants' blockers with the busy state, and the first pass became the busy check |
    | 3c.6 | A table is busy while a job writes it (P11), extending 3c.5: app state tracks busy marks per table (`mark_table_busy(...)` returning a token, `release_table_busy(token)`, `table_busy_reasons(...)`) and emits `table_busy_state_changed`. The persistence controls disable Write and Reload while the table is busy, with the reason as tooltip. `write_table_state()` and the first pass of `prepare_for_table_reload()` raise `TableBusyError` as guards, and the controls show it. The reload participant protocol goes back to `prepare_for_table_reload(request)` only: the blocker methods and `check_table_persistence(...)` go. Feature Extraction's controller marks the table busy in `calculate()` and releases it in `_clear_job()`; it stops being a reload participant, so its deferred release and the widget's pending unregister go. Details from the readiness check: the controller gets a required `table_busy_marker=` keyword typed as a narrow `TableBusyMarker` protocol (`mark_table_busy`, `release_table_busy`), which app state implements, so the controller does not depend on app state; required, unlike the callbacks, because a controller without it would silently drop the guard (the widget passes app state; the unit tests construct the controller through a helper that passes a throwaway app state); app state also offers `is_table_busy(...)` and `require_table_not_busy(...)`, which formats 'Table "T" is busy: …' in one place for both guards and the tooltip; busy marks survive loading another SpatialData (the job keeps the old object alive, so its release still finds the mark); Reload needs no check before its dialog, since the button is disabled while busy and the first pass guards a job that starts meanwhile. After the widget closes, superqt keeps the running worker alive, and its signal connections keep the controller alive until `finished`, so the release is reached. Tests: busy marks and the signal in app state; buttons disabled with the reason, and enabled again on release; the guards; Feature Extraction releases the mark when its job returns, errors, or finishes after the widget closed; the 3c.5 tests without the blocker. `docs/development/table_state.md` follows | implemented on 2026-11-06 (busy state instead of polled blockers), after 3c.5. Also in 3c.6: the Spatial Query widget invalidates its Run on the `reloaded` event too, so every participant's hook is a defense (`TableReloadParticipant`); `PersistenceController.write_table_state()` leaves a table without unsaved changes as it is instead of raising `ValueError` |
+   | 3c.7 | No job starts on a busy table (P11, point 6): `TableBusyMarker` gains `table_busy_reasons(...)`; Feature Extraction's `calculate()` and Spatial Query's `start_spatial_query()` refuse while another job keeps the table busy; their widgets disable Calculate and Run with 'Table "T" is busy: …' and refresh on `table_busy_state_changed`; the Spatial Query widget checks the centers again when the table is no longer busy. Tests in the controller, widget and status-card modules; the multi-widget reload test accepts Spatial Query's Run before Feature Extraction's job starts. `docs/development/table_state.md` follows | implemented on 2026-11-06, after 3c.2b. Not covered: a query-only Run does not mark the table busy, and jobs on different tables of one store are not serialized (design point 6) |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
    that order), with 3c.5 and then 3c.6 between 3c.2a and 3c.2b: design
    point 8 relies on their contract, and 3c.2b adds a second job that writes
-   the table. 3c.1 comes first, because the classifier summary in 3d relies
-   on its shape-only check. 3c.4 comes before 3c.2, because a feature-matrix
+   the table; 3c.7 follows 3c.2b. 3c.1 comes first, because the classifier
+   summary in 3d relies on its shape-only check. 3c.4 comes before 3c.2, because a feature-matrix
    record under a reserved key would make `add_canonical_centers` reject the
    table. 3c.2 comes next: until it lands, Spatial Query rewrites harpy 0.5.3's
    version-2 canonical centers as version-1 records, which harpy rejects. 3c.3
@@ -662,6 +663,13 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       the same store stay unprotected for now, as Feature Extraction already
       accepts across controllers: 3c.6's busy state makes Spatiato's Write and
       Reload wait for a job, but does not stop another job from launching.
+      Revised on 2026-11-06 by 3c.7: neither starts a job on a busy table, so
+      two jobs no longer write one table at the same time. Still unprotected:
+      jobs on different tables of one store, which share the store's
+      consolidated metadata, and a Run whose centers are already valid, which
+      only queries and does not mark the table busy, so Feature Extraction can
+      start meanwhile and the Run then applies its annotation on the main
+      thread while that job writes.
    7. **In line with Feature Extraction** (agreed on 2026-11-05). Points 1, 2
       and 6 copy Feature Extraction's contract for writing a table through
       harpy: the harpy call installs (and writes the store) in the worker, one
@@ -1830,6 +1838,14 @@ participants.
    releases it in `_clear_job()`; a detached job still reaches
    `_clear_job()` through its worker's `finished` signal after the widget
    closes.
+6. **Jobs** (added on 2026-11-06, after 3c.2b, as 3c.7). Feature Extraction
+   and Spatial Query do not start on a busy table either. Their controllers
+   read `table_busy_reasons(...)` through `TableBusyMarker` and refuse; their
+   widgets disable Calculate and Run with the reason, and refresh on
+   `table_busy_state_changed`. Without it, a Spatial Query centers job and a
+   Feature Extraction job could write one table at the same time, and a
+   widget closed mid-job and opened again gets a new controller, whose
+   one-job limit does not see the old job.
 
 This replaces a first, pull-based implementation of the same day, in which
 app state asked every participant's `table_persistence_blocker(...)` before a
@@ -1871,7 +1887,9 @@ and no running jobs; Shapes saves write a different element of the store.
   on a change; Write and Reload are disabled with the reason while busy, and
   enabled again on release; the guards raise for a busy table; Feature
   Extraction releases its mark when its job returns, errors, or finishes after
-  the widget closed;
+  the widget closed; Feature Extraction and Spatial Query refuse to start on a
+  busy table, and their widgets disable Calculate and Run with the reason
+  until it is released;
 - backed `zarr.Array` / `CSRDataset` consumers (P3);
 - reload keeps `obsm` lazy (P4);
 - persistence through harpy's API: write, delete, rollback on failure,
@@ -1948,6 +1966,10 @@ Settled on 2026-11-06:
   the busy state per table, as it tracks the dirty state; the persistence
   controls disable Write and Reload with the reason; the job's owner marks and
   releases; reload participants keep only `prepare_for_table_reload`.
+- P11, point 6 (3c.7, after 3c.2b): Feature Extraction and Spatial Query do
+  not start on a busy table; their widgets disable Calculate and Run with the
+  reason. Jobs on different tables of one store, and a Spatial Query Run that
+  only queries, stay unprotected (3c.2 design point 6).
 - 3c.2 design point 9 (see "Migration Plan", step 3): Spatial Query's
   controller separates an attached operation (`is_running`) from a centers job
   still writing (`has_job_in_flight`); Run waits for both, and a detached job
