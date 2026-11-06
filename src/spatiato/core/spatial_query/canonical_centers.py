@@ -19,6 +19,7 @@ import numpy as np
 from harpy.image import get_dataarray
 from harpy.table.canonical_centers import CANONICAL_OBSM_KEY, SPATIAL_COORDINATES_KEY, validate_canonical_centers
 
+from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatialdata import get_table, get_table_metadata
 from spatiato.core.table_matrix import read_matrix_rows
 
@@ -27,6 +28,15 @@ if TYPE_CHECKING:
 
 CanonicalCentersState = Literal["absent", "valid", "invalid"]
 CanonicalCentersChange = Literal["created", "rebuilt"]
+
+# The table components harpy writes for canonical centers: the matrix and its
+# record.
+CANONICAL_CENTERS_PATHS = frozenset(
+    {
+        TableComponentPath("obsm", (CANONICAL_OBSM_KEY,)),
+        TableComponentPath("uns", (SPATIAL_COORDINATES_KEY, CANONICAL_OBSM_KEY)),
+    }
+)
 
 
 @dataclass(frozen=True)
