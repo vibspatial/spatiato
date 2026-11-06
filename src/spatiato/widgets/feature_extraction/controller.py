@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
-from spatiato._app_state import TableBusyMark, TableBusyMarker, TableDirtySnapshot
+from spatiato._app_state import TableBusyMark, TableBusyMarker, TableDirtySnapshot, format_table_busy_message
 from spatiato.core.feature_extraction import (
     ExistingFeatureMatrix,
     ExistingFeatureMatrixKind,
@@ -287,14 +287,15 @@ class FeatureExtractionController:
         #   choices are refreshed, but the status and selection follow the
         #   current inputs.
         # - Until `finished`, the job's table is busy (`_busy_mark`), so it can be
-        #   neither written nor reloaded, also when the job is detached or the
-        #   widget closed. After the widget closes, superqt keeps the running
-        #   worker alive, and its signal connections keep this controller alive,
-        #   so `_on_worker_finished()` still releases the mark.
-        # The limit holds per controller: closing the widget mid-run and opening
-        # a new one gives a second controller, which may start a second job.
-        # Accepted: rare, and a guard across widgets would need shared state in
-        # `SpatiatoAppState`.
+        #   neither written nor reloaded, and no other job starts on it, also
+        #   when the job is detached or the widget closed. After the widget
+        #   closes, superqt keeps the running worker alive, and its signal
+        #   connections keep this controller alive, so `_on_worker_finished()`
+        #   still releases the mark.
+        # The one-job limit holds per controller: closing the widget mid-run and
+        # opening a new one gives a second controller. That controller does not
+        # start a job on the busy table, but may start one on another table of
+        # the same store. Accepted: rare.
         self._job: FeatureExtractionJob | None = None
         self._worker: Any | None = None
         self._busy_mark: TableBusyMark | None = None
@@ -557,6 +558,13 @@ class FeatureExtractionController:
         )
         if job is None:
             return False
+        # Another job writes the table, for example a Spatial Query center
+        # calculation: harpy does not protect concurrent writers. The widget
+        # disables Calculate and says why.
+        busy_reasons = self._table_busy_marker.table_busy_reasons(job.sdata, job.table_name)
+        if busy_reasons:
+            self._set_status(format_table_busy_message(job.table_name, busy_reasons), kind="warning")
+            return False
 
         if self._job is not None:  # pragma: no cover - the checks above return first
             raise RuntimeError("Feature extraction can only run one job at a time.")
@@ -587,7 +595,11 @@ class FeatureExtractionController:
             return
 
         self._is_shutdown = True
-        # A job still running when the widget closes loses its table event.
+        # `quit()` cannot stop a running harpy call; it only suppresses
+        # `returned`. The job keeps writing the table, but its change is no
+        # longer published (the callbacks are cleared below), so app state does
+        # not record it. `finished` still fires, so the job still releases its
+        # busy mark.
         if self._worker is not None:
             self._worker.quit()
         self._on_state_changed = None
