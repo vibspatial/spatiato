@@ -21,7 +21,8 @@ Extraction decides what to calculate
   path also everything nested below it.
 - **Dirty path:** a component path changed in memory and not yet written. App
   state keeps the dirty paths per SpatialData object and table, each with a
-  token that identifies its latest change.
+  token that identifies its latest change. Unbacked SpatialData has dirty
+  paths too, but cannot write them.
 - **Mutation:** a change that exists only in memory. A widget records it with
   `record_table_mutation(event)`, which makes its paths dirty.
 - **Persisted change:** a change that is already in the store when it is
@@ -53,8 +54,8 @@ Signals and calls, as the diagram labels them:
   (the source). Widgets use it to adapt to the new contents.
 - **`table_dirty_state_changed`:** app state's signal that a table became
   dirty (it now has unsaved changes) or clean again (it has none left). It
-  carries only `is_dirty`, and is emitted only at that moment, not on every
-  change. It reflects Spatiato's records, not a comparison with the store: a
+  carries the table and `is_dirty`, nothing about what changed, and is
+  emitted only at that moment, not on every change. It reflects Spatiato's records, not a comparison with the store: a
   change made outside the widgets, for example from the napari console, is not
   seen. The persistence controls use it for the Write button and the Reload
   warning.
@@ -75,6 +76,9 @@ Signals and calls, as the diagram labels them:
 | Widgets and their controllers | `widgets/<workflow>/` | Change the table, record each change in app state, and adopt changes made by others. |
 | Workers | threads started by the controllers | Calculate. Only a harpy call changes the table from a worker. |
 
+The Spatial Query widget is not a napari widget of its own: it is part of the
+Annotation widget, below Shapes Annotation.
+
 ## How they connect
 
 Solid arrows are calls, dotted arrows are signals and callbacks from app
@@ -87,7 +91,7 @@ flowchart TB
         FEC["Feature Extraction controller"]
         OCW["Object Classification widget"]
         OCC["Object Classification controller"]
-        SQW["Spatial Query widget"]
+        SQW["Spatial Query widget<br/>(in the Annotation widget)"]
         SQC["Spatial Query controller"]
         VW["Viewer widget"]
         PC["TablePersistenceControls<br/>(in the OC and SQ widgets)"]
@@ -125,8 +129,9 @@ flowchart TB
     AS -. "table_dirty_state_changed" .-> PC
 ```
 
-Widgets never call each other: everything they need to know about another
-widget's change arrives through app state.
+Widgets never tell each other about table changes directly: everything they
+need to know about another widget's change to a table arrives through app
+state.
 
 ## Changing a table
 
@@ -142,11 +147,11 @@ where the change is:
 | already in the store | `record_persisted_table_change(event, snapshot)` | none becomes dirty; a path that was dirty in the snapshot taken at launch and that harpy wrote becomes clean, unless it changed again since | Feature Extraction on backed SpatialData |
 
 Both publish the event on `table_state_changed`, and, when the table as a whole
-becomes dirty or clean, also `table_dirty_state_changed`. Consumers filter on the SpatialData object, the
-table, the source and the change kind. For example, Object Classification
-refreshes its feature-matrix choices on a `feature_extraction` event, and every
-workflow adopts a `reloaded` event. Publishing an event never makes a path
-clean by itself.
+becomes dirty or clean, also `table_dirty_state_changed`. Consumers filter on
+the SpatialData object, the table, the source and the change kind. For example,
+Object Classification refreshes its feature-matrix choices on a
+`feature_extraction` event, and every workflow adopts a `reloaded` event.
+Publishing an event never makes a path clean by itself.
 
 ## Write
 
@@ -170,12 +175,16 @@ clean by itself.
    of the participant list:
    1. every participant's `table_reload_blocker(request)` returns a reason, or
       `None`, without side effects. If any participant gives a reason, app
-      state raises `TableReloadBlockedError` with every reason, the controls
-      show it, and nothing has changed;
+      state raises `TableReloadBlockedError` with every reason and the
+      controls show it: no participant has acted and the table is not
+      reloaded. If the user chose Write in step 1, that write has already
+      happened and is not undone: the changes are in the store, and the
+      table is clean;
    2. otherwise every participant's `prepare_for_table_reload(request)`
       invalidates its work that depends on the old table.
 4. The components are read from the store and replaced in memory. A failure
-   while reading or validating restores the previous components.
+   while reading changes nothing; a failure while validating the replaced
+   components restores the previous ones.
 5. `record_table_reload(event)` makes every reloaded path clean and publishes
    the event with change kind `reloaded`. Each workflow adopts it: it refreshes
    its choices from the reloaded table and binds them again.
