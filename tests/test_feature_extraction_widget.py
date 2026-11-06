@@ -178,12 +178,12 @@ def test_feature_extraction_widget_can_be_instantiated(qtbot) -> None:
     )
 
 
-def test_feature_extraction_widget_destruction_retains_reload_guard_until_worker_finishes(
+def test_feature_extraction_widget_destruction_keeps_the_table_busy_until_worker_finishes(
     qtbot,
     monkeypatch: pytest.MonkeyPatch,
     sdata_blobs: SpatialData,
 ) -> None:
-    """A deleted QWidget must not expose a table still targeted by its Harpy worker to Reload."""
+    """A deleted QWidget must keep a table still targeted by its Harpy worker busy."""
     viewer = make_viewer_with_shared_sdata(sdata_blobs)
     app_state = get_or_create_app_state(viewer)
     widget = FeatureExtractionWidget(viewer)
@@ -195,23 +195,23 @@ def test_feature_extraction_widget_destruction_retains_reload_guard_until_worker
     select_segmentation(widget, "global", 0)
     widget.findChild(QCheckBox, "feature_checkbox_area").setChecked(True)
 
-    assert controller in app_state._table_reload_participants
+    assert app_state.is_table_busy(sdata_blobs, "table") is False
     assert widget.calculate_button.isEnabled()
 
     widget.calculate_button.click()
     widget.deleteLater()
     qtbot.waitUntil(lambda: worker.quit_called)
 
-    assert controller in app_state._table_reload_participants
+    assert app_state.is_table_busy(sdata_blobs, "table") is True
     assert controller.has_job_in_flight is True
 
     worker.finished.emit()
-    qtbot.waitUntil(lambda: controller not in app_state._table_reload_participants)
+    qtbot.waitUntil(lambda: not app_state.is_table_busy(sdata_blobs, "table"))
 
     assert controller.has_job_in_flight is False
 
 
-def test_feature_extraction_widget_blocks_matching_shared_reload_with_user_feedback(
+def test_feature_extraction_widget_disables_write_and_reload_of_its_table_with_the_reason(
     qtbot,
     monkeypatch: pytest.MonkeyPatch,
     backed_sdata_blobs: SpatialData,
@@ -234,13 +234,16 @@ def test_feature_extraction_widget_blocks_matching_shared_reload_with_user_feedb
     )
 
     widget.calculate_button.click()
-    controls.reload_button.click()
 
-    assert reload_events == []
-    assert "Feature Extraction is still writing it" in unescape(controls.feedback_label.text())
-    assert "Wait for Feature Extraction to finish" in unescape(controls.feedback_label.text())
+    assert not controls.reload_button.isEnabled()
+    assert not controls.write_button.isEnabled()
+    reason = 'Table "table" is busy: Feature Extraction is still writing its results.'
+    assert reason in unescape(controls.reload_button.toolTip())
+    assert reason in unescape(controls.write_button.toolTip())
 
     worker.finished.emit()
+
+    assert controls.reload_button.isEnabled()
     controls.reload_button.click()
 
     assert len(reload_events) == 1

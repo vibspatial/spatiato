@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from typing import Any
+
 import harpy as hp
 import numpy as np
 import pytest
 from qtpy.QtCore import QObject, Signal
 from spatialdata import SpatialData
 
-from spatiato._app_state import TableDirtySnapshot, TableReloadRequest
+from spatiato._app_state import SpatiatoAppState, TableDirtySnapshot
 from spatiato.core.feature_extraction import (
     ExistingFeatureMatrix,
     FeatureMatrixCalculation,
@@ -25,6 +27,12 @@ from spatiato.widgets.feature_extraction.controller import (
     FeatureExtractionTriplet,
     _run_feature_extraction_job,
 )
+
+
+def _controller(**kwargs: Any) -> FeatureExtractionController:
+    """Return a controller whose busy marks go to a throwaway app state, unless the test passes its own."""
+    kwargs.setdefault("table_busy_marker", SpatiatoAppState())
+    return FeatureExtractionController(**kwargs)
 
 
 class _DeferredWorker(QObject):
@@ -60,7 +68,7 @@ class _DeferredWorker(QObject):
 
 
 def test_feature_extraction_controller_starts_idle() -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     assert controller.status_message == FEATURE_EXTRACTION_IDLE_STATUS
     assert controller.status_kind == "warning"
@@ -144,7 +152,7 @@ def test_feature_extraction_binding_state_rejects_empty_table_name() -> None:
 def test_feature_extraction_controller_bind_is_passive_and_ready_for_existing_table(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     context_changed = controller.bind(
         sdata_blobs,
@@ -166,7 +174,7 @@ def test_feature_extraction_controller_bind_is_passive_and_ready_for_existing_ta
 def test_feature_extraction_controller_rejects_spatialdata_invalid_feature_key(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -190,7 +198,7 @@ def test_feature_extraction_controller_rejects_a_reserved_feature_key(
     sdata_blobs: SpatialData,
     feature_key: str,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], feature_key)
 
@@ -203,7 +211,7 @@ def test_feature_extraction_controller_rejects_a_reserved_feature_key(
 
 
 def test_feature_extraction_controller_blocks_when_no_table_is_selected(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -226,7 +234,7 @@ def test_feature_extraction_controller_blocks_when_no_table_is_selected(sdata_bl
 def test_feature_extraction_controller_bind_is_ready_for_create_table(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     context_changed = controller.bind(
         sdata_blobs,
@@ -256,7 +264,7 @@ def test_feature_extraction_controller_bind_is_ready_for_create_table(
 def test_feature_extraction_controller_blocks_create_table_name_collision(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -298,7 +306,7 @@ def test_feature_extraction_controller_blocks_create_table_name_collision(
 def test_feature_extraction_controller_blocks_invalid_create_table_name(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -321,7 +329,7 @@ def test_feature_extraction_controller_blocks_invalid_create_table_name(
 def test_feature_extraction_controller_blocks_create_table_feature_key_overwrite_override(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -343,7 +351,7 @@ def test_feature_extraction_controller_blocks_create_table_feature_key_overwrite
 
 
 def test_feature_extraction_controller_requires_image_for_intensity_features(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -363,7 +371,7 @@ def test_feature_extraction_controller_requires_image_for_intensity_features(sda
 def test_feature_extraction_controller_requires_selected_channels_for_intensity_features(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -386,7 +394,7 @@ def test_feature_extraction_controller_requires_selected_channels_for_intensity_
 
 
 def test_feature_extraction_controller_requires_coordinate_system(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -405,7 +413,7 @@ def test_feature_extraction_controller_requires_coordinate_system(sdata_blobs: S
 
 
 def test_feature_extraction_controller_requires_segmentation_mask(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind(
         sdata_blobs,
@@ -424,7 +432,7 @@ def test_feature_extraction_controller_requires_segmentation_mask(sdata_blobs: S
 
 
 def test_feature_extraction_controller_bind_returns_false_for_unchanged_context(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     first_changed = controller.bind(
         sdata_blobs,
@@ -450,7 +458,7 @@ def test_feature_extraction_controller_bind_returns_false_for_unchanged_context(
 
 
 def test_feature_extraction_controller_prepares_immutable_job_payload(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -485,7 +493,7 @@ def test_feature_extraction_controller_prepares_immutable_job_payload(sdata_blob
 
 
 def test_feature_extraction_controller_bind_stores_selected_channels_in_job(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -504,7 +512,7 @@ def test_feature_extraction_controller_bind_stores_selected_channels_in_job(sdat
 
 
 def test_feature_extraction_controller_bind_rejects_duplicate_selected_channels(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     with pytest.raises(ValueError, match="Duplicate channel selection is not allowed"):
         controller.bind(
@@ -520,7 +528,7 @@ def test_feature_extraction_controller_bind_rejects_duplicate_selected_channels(
 
 
 def test_feature_extraction_controller_morphology_only_job_keeps_channels_none(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -542,7 +550,7 @@ def test_feature_extraction_controller_morphology_only_job_keeps_channels_none(s
 def test_feature_extraction_controller_bind_batch_is_ready_for_multi_target_request(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     context_changed = controller.bind_batch(
         sdata_blobs,
@@ -572,7 +580,7 @@ def test_feature_extraction_controller_bind_batch_is_ready_for_multi_target_requ
 def test_feature_extraction_controller_exposes_binding_state_snapshot(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     triplets = (
         FeatureExtractionTriplet(
             coordinate_system="global",
@@ -602,7 +610,7 @@ def test_feature_extraction_controller_exposes_binding_state_snapshot(
 def test_feature_extraction_controller_bind_batch_rejects_mixed_channel_selections_for_intensity_features(
     sdata_blobs: SpatialData,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
 
     controller.bind_batch(
         sdata_blobs,
@@ -646,7 +654,7 @@ def test_feature_extraction_controller_requests_table_selection_refresh_on_succe
     )
     deferred_worker = _DeferredWorker(result)
 
-    controller = FeatureExtractionController(
+    controller = _controller(
         on_table_selection_refresh_required=refresh_requests.append,
     )
     controller.bind(
@@ -690,7 +698,7 @@ def test_feature_extraction_controller_notifies_feature_matrix_change_on_success
     )
     deferred_worker = _DeferredWorker(result)
 
-    controller = FeatureExtractionController(
+    controller = _controller(
         on_feature_matrix_changed=changed_results.append,
     )
     controller.bind(
@@ -727,7 +735,7 @@ def test_feature_extraction_controller_calculate_accepts_one_shot_overwrite_over
         )
     )
 
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -764,7 +772,7 @@ def test_feature_extraction_controller_calculate_launches_job_with_selected_chan
         )
     )
 
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -792,7 +800,7 @@ def test_feature_extraction_controller_calculate_passes_confirmed_entry_and_dirt
     sdata_blobs: SpatialData,
 ) -> None:
     captured_jobs: list[FeatureExtractionJob] = []
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
     dirty_snapshot = TableDirtySnapshot(sdata=sdata_blobs, table_name="table", captured_path_tokens=())
 
@@ -816,7 +824,7 @@ def test_feature_extraction_controller_calculate_passes_confirmed_entry_and_dirt
 
 
 def test_feature_extraction_controller_checks_existing_feature_matrix(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
 
     existing = controller.check_existing_feature_matrix(dirty_paths=())
@@ -826,7 +834,7 @@ def test_feature_extraction_controller_checks_existing_feature_matrix(sdata_blob
 
 
 def test_feature_extraction_controller_reports_check_errors_in_its_status(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
     table = sdata_blobs["table"]
     instance_key = get_table_metadata(sdata_blobs, "table").instance_key
@@ -851,7 +859,7 @@ def test_feature_extraction_controller_blocks_unsaved_changes_to_the_key_when_ba
     backed_sdata_blobs: SpatialData,
     dirty_path: TableComponentPath,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(backed_sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
 
     assert controller.check_existing_feature_matrix(dirty_paths={dirty_path}) is None
@@ -872,7 +880,7 @@ def test_feature_extraction_controller_allows_unsaved_changes_elsewhere_when_bac
     backed_sdata_blobs: SpatialData,
     dirty_path: TableComponentPath,
 ) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(backed_sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
 
     existing = controller.check_existing_feature_matrix(dirty_paths={dirty_path})
@@ -882,7 +890,7 @@ def test_feature_extraction_controller_allows_unsaved_changes_elsewhere_when_bac
 
 
 def test_feature_extraction_controller_ignores_unsaved_changes_when_unbacked(sdata_blobs: SpatialData) -> None:
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
 
     # Unbacked, harpy merges with the matrix in memory, so nothing is dropped; and
@@ -1152,7 +1160,7 @@ def test_feature_extraction_controller_propagates_worker_errors(sdata_blobs: Spa
     refresh_requests: list[str] = []
     deferred_worker = _DeferredWorker()
 
-    controller = FeatureExtractionController(
+    controller = _controller(
         on_table_selection_refresh_required=lambda result: refresh_requests.append(result.table_name),
     )
     controller.bind(
@@ -1191,7 +1199,7 @@ def test_feature_extraction_controller_requests_selection_refresh_before_feature
     )
     deferred_worker = _DeferredWorker(result)
 
-    controller = FeatureExtractionController(
+    controller = _controller(
         on_table_selection_refresh_required=lambda table_result: notification_order.append(
             f"table:{table_result.table_name}"
         ),
@@ -1235,7 +1243,7 @@ def test_feature_extraction_controller_publishes_detached_job_result_without_sta
     )
     deferred_worker = _DeferredWorker(result)
 
-    controller = FeatureExtractionController(
+    controller = _controller(
         on_table_selection_refresh_required=lambda result: refresh_requests.append(result.table_name),
         on_feature_matrix_changed=changed_results.append,
     )
@@ -1285,7 +1293,7 @@ def test_feature_extraction_controller_reattaches_job_when_the_inputs_change_bac
             regions=("blobs_labels",),
         )
     )
-    controller = FeatureExtractionController()
+    controller = _controller()
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
     controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
 
@@ -1320,7 +1328,7 @@ def test_feature_extraction_controller_ignores_detached_job_of_another_spatialda
             regions=("blobs_labels",),
         )
     )
-    controller = FeatureExtractionController(on_feature_matrix_changed=changed_results.append)
+    controller = _controller(on_feature_matrix_changed=changed_results.append)
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
     controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
 
@@ -1340,7 +1348,7 @@ def test_feature_extraction_controller_publishes_removal_when_extraction_fails_a
     refresh_requests: list[str] = []
     changed_results: list[FeatureExtractionResult] = []
     deferred_worker = _DeferredWorker()
-    controller = FeatureExtractionController(
+    controller = _controller(
         on_table_selection_refresh_required=lambda result: refresh_requests.append(result.table_name),
         on_feature_matrix_changed=changed_results.append,
     )
@@ -1405,7 +1413,7 @@ def test_feature_extraction_controller_reports_detached_job_failure_as_event_onl
 ) -> None:
     changed_results: list[FeatureExtractionResult] = []
     deferred_worker = _DeferredWorker()
-    controller = FeatureExtractionController(on_feature_matrix_changed=changed_results.append)
+    controller = _controller(on_feature_matrix_changed=changed_results.append)
     controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
     controller._create_feature_extraction_worker = lambda job: deferred_worker  # type: ignore[method-assign]
 
@@ -1417,11 +1425,15 @@ def test_feature_extraction_controller_reports_detached_job_failure_as_event_onl
     assert controller.status_message == "Feature extraction: ready to calculate."
 
 
-def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_detached_worker_finishes(
+def test_feature_extraction_controller_keeps_its_table_busy_and_blocks_new_launches_until_the_detached_worker_finishes(
     sdata_blobs: SpatialData,
 ) -> None:
     state_changes: list[str] = []
-    controller = FeatureExtractionController(on_state_changed=lambda: state_changes.append("changed"))
+    app_state = SpatiatoAppState()
+    controller = _controller(
+        on_state_changed=lambda: state_changes.append("changed"),
+        table_busy_marker=app_state,
+    )
     controller.bind(
         sdata_blobs,
         "blobs_labels",
@@ -1447,25 +1459,12 @@ def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_
         return worker
 
     controller._create_feature_extraction_worker = create_worker  # type: ignore[method-assign]
-    matching_request = TableReloadRequest(
-        sdata=sdata_blobs,
-        table_name="table",
-        paths=frozenset({TableComponentPath("obsm", ("feature_matrix_1",))}),
-        region_name="blobs_labels",
-        source="test",
-    )
-    unrelated_request = TableReloadRequest(
-        sdata=sdata_blobs,
-        table_name="other_table",
-        paths=frozenset({TableComponentPath("obs", ("annotation",))}),
-        region_name=None,
-        source="test",
-    )
 
-    still_writing = "Feature Extraction is still writing it"
     assert controller.calculate() is True
-    assert controller.table_reload_blocker(unrelated_request) is None
-    assert still_writing in controller.table_reload_blocker(matching_request)
+    assert app_state.table_busy_reasons(sdata_blobs, "table") == (
+        "Feature Extraction is still writing its results. Try again once the calculation has finished.",
+    )
+    assert app_state.is_table_busy(sdata_blobs, "other_table") is False
 
     controller.bind(
         sdata_blobs,
@@ -1477,7 +1476,7 @@ def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_
         "feature_matrix_2",
     )
     assert controller.has_job_in_flight is True
-    assert still_writing in controller.table_reload_blocker(matching_request)
+    assert app_state.is_table_busy(sdata_blobs, "table") is True
 
     # harpy does not protect concurrent writers, so the next launch waits too.
     waiting_status = "Feature extraction: waiting for the previous calculation to finish writing."
@@ -1494,39 +1493,61 @@ def test_feature_extraction_controller_blocks_reload_and_new_launches_until_the_
     assert state_changes, "the widget must learn that Calculate is available again"
     assert controller.can_calculate is True
     assert controller.status_message == "Feature extraction: ready to calculate."
-    assert controller.table_reload_blocker(matching_request) is None
+    assert app_state.is_table_busy(sdata_blobs, "table") is False
 
     assert controller.calculate() is True
     assert len(workers) == 2
 
 
-def test_feature_extraction_controller_defers_reload_participant_release_until_workers_finish(
+class _FailingStartWorker(_DeferredWorker):
+    def start(self) -> None:
+        raise RuntimeError("injected start failure")
+
+
+@pytest.mark.parametrize("job_end", ["returned", "errored", "finished_after_shutdown", "start_failed"])
+def test_feature_extraction_controller_releases_the_busy_mark_on_every_end_of_its_job(
     sdata_blobs: SpatialData,
+    job_end: str,
 ) -> None:
-    controller = FeatureExtractionController()
-    controller.bind(
-        sdata_blobs,
-        "blobs_labels",
-        None,
-        "table",
-        "global",
-        ["area"],
-        "feature_matrix_1",
-    )
-    worker = _DeferredWorker()
-    controller._create_feature_extraction_worker = lambda _job: worker  # type: ignore[method-assign]
+    app_state = SpatiatoAppState()
+    controller = _controller(table_busy_marker=app_state)
+    controller.bind(sdata_blobs, "blobs_labels", None, "table", "global", ["area"], "feature_matrix_1")
+    worker_type = _FailingStartWorker if job_end == "start_failed" else _DeferredWorker
+
+    def create_worker(job: FeatureExtractionJob) -> _DeferredWorker:
+        return worker_type(
+            FeatureExtractionResult(
+                job_id=job.job_id,
+                labels_names=job.labels_names,
+                table_name=job.table_name,
+                feature_key=job.feature_key,
+                regions=job.labels_names,
+            )
+        )
+
+    controller._create_feature_extraction_worker = create_worker  # type: ignore[method-assign]
+
+    if job_end == "start_failed":
+        with pytest.raises(RuntimeError, match="injected start failure"):
+            controller.calculate()
+        assert app_state.is_table_busy(sdata_blobs, "table") is False
+        return
 
     assert controller.calculate() is True
+    worker = controller._worker
+    assert app_state.is_table_busy(sdata_blobs, "table") is True
 
-    released: list[str] = []
-    controller.shutdown()
-    controller.release_reload_participant_when_safe(lambda: released.append("released"))
-
-    assert worker.quit_called is True
-    assert controller.has_job_in_flight is True
-    assert released == []
-
-    worker.emit_finished()
+    if job_end == "returned":
+        worker.emit_returned()
+    elif job_end == "errored":
+        worker.emit_errored(RuntimeError("injected harpy failure"))
+    else:
+        # The widget closed while harpy was writing: the table stays busy until
+        # the worker finishes.
+        controller.shutdown()
+        assert worker.quit_called is True
+        assert app_state.is_table_busy(sdata_blobs, "table") is True
+        worker.emit_finished()
 
     assert controller.has_job_in_flight is False
-    assert released == ["released"]
+    assert app_state.is_table_busy(sdata_blobs, "table") is False
