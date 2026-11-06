@@ -524,8 +524,8 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3c.2c | Cleanup: delete `canonical.py`, `canonical_models.py`, `centroids.py`, their re-exports and their two test modules (28 tests of Spatiato's own cache logic), and the obsolete persistence tests (design point 5); docs and plan | ready, after 3c.2b |
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
    | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
-   | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants | ready; before 3c.2b |
-   | 3c.6 | Write and Reload wait for jobs that write the table (P11), extending 3c.5: the participant method becomes `table_persistence_blocker(sdata, table_name)`, with a reason that fits both; app state gets `check_table_persistence(sdata, table_name, *, action)`, which raises `TablePersistenceBlockedError` (renamed from `TableReloadBlockedError`) naming the action and every reason, and is also the first pass of a reload. Write calls it first, and the persistence controls show the error (they caught only `ValueError` on Write). Reload calls it before the Write / Discard / Cancel dialog, and again in its first pass. Tests: Write is refused while a participant blocks, and succeeds once it no longer does; a blocked reload never shows the dialog; the 3c.5 tests follow the rename. `docs/development/table_state.md` follows | ready (readiness check on 2026-11-06); after 3c.5, before 3c.2b |
+   | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants. 3c.6 replaces the participants' blocker with app state's busy state | ready; before 3c.2b |
+   | 3c.6 | A table is busy while a job writes it (P11), extending 3c.5: app state tracks busy marks per table (`mark_table_busy(...)` returning a token, `release_table_busy(token)`, `table_busy_reasons(...)`) and emits `table_busy_state_changed`. The persistence controls disable Write and Reload while the table is busy, with the reason as tooltip. `write_table_state()` and the first pass of `prepare_for_table_reload()` raise `TableBusyError` as guards, and the controls show it. The reload participant protocol goes back to `prepare_for_table_reload(request)` only: the blocker methods and `check_table_persistence(...)` go. Feature Extraction's controller marks the table busy in `calculate()` and releases it in `_clear_job()`; it stops being a reload participant, so its deferred release and the widget's pending unregister go. Tests: busy marks and the signal in app state; buttons disabled with the reason, and enabled again on release; the guards; Feature Extraction releases the mark when its job returns, errors, or finishes after the widget closed; the 3c.5 tests without the blocker. `docs/development/table_state.md` follows | revised on 2026-11-06 (busy state instead of polled blockers); readiness check pending; after 3c.5, before 3c.2b |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
@@ -637,9 +637,9 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       (decisions 9 and P7 step 2, points 7-9): one centers job at a time; a
       cancel detaches the job instead of calling `quit()`; a detached or late
       job still publishes its table change when the same SpatialData is still
-      selected; reloads of the table are blocked until the job finishes, also
-      after the widget closes (a deferred release of the reload participant,
-      as in Feature Extraction).
+      selected; the table is busy, so Write and Reload wait, until the job
+      finishes, also after the widget closes (3c.6's busy mark, as in Feature
+      Extraction).
    2. **Events and persistence:** `"created"` when the table had no canonical
       centers at launch, `"rebuilt"` otherwise; the regions are every labels
       element of the table, since harpy recomputes all of them; backed
@@ -659,14 +659,15 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       generic nested-`uns` persistence they exercised stays covered (Spatial
       Query's palette paths, Object Classification's config).
    6. **Concurrent harpy writes** of Feature Extraction and Spatial Query to
-      the same store stay unprotected for now (the shared write guard noted
-      under P5), as Feature Extraction already accepts across controllers.
+      the same store stay unprotected for now, as Feature Extraction already
+      accepts across controllers: 3c.6's busy state makes Spatiato's Write and
+      Reload wait for a job, but does not stop another job from launching.
    7. **In line with Feature Extraction** (agreed on 2026-11-05). Points 1, 2
       and 6 copy Feature Extraction's contract for writing a table through
       harpy: the harpy call installs (and writes the store) in the worker, one
       job per controller, detaching instead of `quit()`, publishing for
-      detached jobs, the reload guard with a deferred release, persisted
-      change against mutation with the launch snapshot. Three differences are
+      detached jobs, the busy mark released when the worker finishes,
+      persisted change against mutation with the launch snapshot. Three differences are
       intentional:
       - no confirmation dialog and no unsaved-changes block: Feature Extraction
         protects values that cannot be recomputed (other labels elements'
@@ -683,19 +684,18 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       The job contract is mirrored in Spatial Query's controller, not shared:
       3c.2b is already the large part, and changing Feature Extraction's
       controller inside it adds risk. Extracting a shared "table-writing job"
-      helper (job slot, derived detachment, reload guard with deferred
-      release, publishing for detached jobs) is a follow-up, once both
+      helper (job slot, derived detachment, busy mark, publishing for
+      detached jobs) is a follow-up, once both
       controllers exist and are known to stay identical.
    8. **Reload participants** (settled on 2026-11-05, from the readiness check
-      for 3c.2b; relies on 3c.5 and 3c.6). The controller blocks Write and
-      Reload of the table while its centers job can still write it, as Feature
-      Extraction's controller does: it is a participant of its own, whose
-      blocker reports the job, and it is released only after its job finishes,
-      also when the widget closes first. The widget stays a participant too, to
-      invalidate a run in its query phase. With 3c.5's two passes, a blocked
-      reload changes nothing, in Spatial Query or elsewhere, whatever the
-      registration order, so the widget does not need to consult the
-      controller.
+      for 3c.2b; revised on 2026-11-06 for 3c.6's busy state). The controller
+      marks the table busy while its centers job can still write it, and
+      releases the mark when the worker finishes, also when the widget closes
+      first, as Feature Extraction's controller does. So Write and Reload of
+      the table wait for the job, and the controller is not a reload
+      participant. The widget stays a participant, to invalidate a run in its
+      query phase. With 3c.5's two passes, whose first pass is the busy check,
+      a blocked reload changes nothing, in Spatial Query or elsewhere.
 
    Also part of 3c.2b (found in its readiness check on 2026-11-05):
    - the two canonical component paths (`obsm/spatial_canonical` and
@@ -712,8 +712,9 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      on cancel, and the two multi-widget tests that treat canonical centers on
      backed SpatialData as a dirty mutation that Spatiato writes;
    - `docs/development/table_state.md` follows: Spatial Query's controller
-     joins the participants as a blocker, and its canonical centers become a
-     persisted change on backed SpatialData, installed by harpy in the worker;
+     marks the table busy while its centers job writes, and its canonical
+     centers become a persisted change on backed SpatialData, installed by
+     harpy in the worker;
    - accepted cost: the status check runs on the main thread when the labels
      element or table changes, after a reload, on every Run and at Apply. For a
      lazy backed matrix each check reads all centers (24 bytes per row).
@@ -1724,7 +1725,9 @@ These widgets return `None` and keep their invalidation.
 
 Not included in 3c.5: running the check before the persistence controls ask
 Write / Discard / Cancel, and blocking Write itself. Both follow in 3c.6
-(P11).
+(P11), which also replaces the participants' blocker with a busy state that
+app state tracks per table: the first pass then checks that state, and
+`prepare_for_table_reload(request)` stays the participants' only method.
 
 ### P11. Write is not blocked while a job writes the table
 
@@ -1744,27 +1747,57 @@ not, which leaves two problems:
 2. **A question before a refusal.** A reload of a dirty table first asks
    Write / Discard / Cancel, and only then asks the blockers. A user who
    chooses Write writes, and is then told the reload is blocked.
+3. **A refusal only after a click.** Write and Reload stay enabled while a job
+   writes the table; the user learns that the table cannot be touched only
+   from an error after clicking.
 
 3c.2b adds a second job that writes the table (Spatial Query's centers job),
 which needs the same guard.
 
-Decision: a job whose worker writes a table blocks both Write and Reload of
-that table.
+Decision (revised on 2026-11-06): **a table is busy while a job writes it**,
+and a busy table can be neither written nor reloaded. App state tracks the
+busy state per table, as it tracks the dirty state, instead of polling the
+participants.
 
-1. The participant method becomes `table_persistence_blocker(sdata,
-   table_name)`: a reason or `None`, without side effects, worded for both
-   actions (for example "Feature Extraction is still writing its results. Try
-   again once the calculation has finished.").
-2. App state gets one check, `check_table_persistence(sdata, table_name, *,
-   action)`, which raises `TablePersistenceBlockedError` (renamed from
-   `TableReloadBlockedError`) with the action and every reason, for example
-   'Cannot write table "T": …'. It is also the first pass of a reload, so the
-   error is formatted in one place for all three callers.
-3. Write calls it first. The persistence controls show the error; on Write
-   they caught only `ValueError` before.
-4. Reload calls it before the Write / Discard / Cancel dialog, so a blocked
-   reload never asks the question. The first pass checks again, because the
-   dialog lets other events run.
+1. **Marking.** The owner of a job whose worker writes the table marks it
+   busy when the job launches, with a reason, and releases it when the worker
+   finishes, on every path: returned, errored, or detached and finished later.
+   App state keeps the marks per SpatialData object and table, so two jobs on
+   one table are two marks, and the table stays busy until both are released.
+   API: `mark_table_busy(sdata, table_name, *, reason)` returns a token;
+   `release_table_busy(token)`; `table_busy_reasons(sdata, table_name)`.
+2. **Announcing.** App state emits `table_busy_state_changed` when a table
+   becomes busy or no longer busy, as it emits `table_dirty_state_changed`.
+3. **Buttons.** The persistence controls disable Write and Reload while the
+   table is busy, with the reason as tooltip, and refresh on that signal. The
+   user sees why before clicking, and a busy table never shows Write /
+   Discard / Cancel.
+4. **Guards.** `PersistenceController.write_table_state()` and the first pass
+   of `prepare_for_table_reload()` raise `TableBusyError` with every reason,
+   for example 'Table "T" is busy: Feature Extraction is still writing its
+   results. Try again once the calculation has finished.' They cover callers
+   other than the buttons, and a job that starts while the reload dialog is
+   open. The persistence controls show the error.
+5. **Participants.** The reload participant protocol goes back to one method,
+   `prepare_for_table_reload(request)`. The blocker method, the
+   `check_table_persistence(...)` check and its `action` parameter go.
+   Feature Extraction's controller stops being a reload participant, since its
+   `prepare_for_table_reload` does nothing; with it go the deferred release
+   (`release_reload_participant_when_safe(...)`,
+   `_release_reload_participant_if_safe()`) and the pending unregister in the
+   widget's teardown. The controller marks the table busy in `calculate()` and
+   releases it in `_clear_job()`; a detached job still reaches
+   `_clear_job()` through its worker's `finished` signal after the widget
+   closes.
+
+This replaces a first, pull-based implementation of the same day, in which
+app state asked every participant's `table_persistence_blocker(...)` before a
+Write or Reload, and the user learned of the block only by clicking. The
+two-pass reload of P10 stays: its first pass becomes the busy check.
+
+Risk: a mark that is never released locks the table. The release sits on the
+path that clears the job today (`_clear_job()`), which every end of a job
+reaches; a test covers the errored and the detached job.
 
 Out of scope: the headless API writes predictions directly, but has no widgets
 and no running jobs; Shapes saves write a different element of the store.
@@ -1782,7 +1815,7 @@ and no running jobs; Shapes saves write a different element of the store.
 - Spatial Query with harpy's canonical centers (P8): valid centers are reused
   without recomputation; absent or stale centers are recomputed with
   `add_canonical_centers`; only the selected labels element's rows are read;
-  backed SpatialData records a persisted change and blocks reloads while the
+  backed SpatialData records a persisted change and the table is busy while the
   worker writes; in-memory SpatialData records a mutation; a version-1 record
   is recomputed; a table whose centers cannot all be computed shows harpy's
   reason;
@@ -1792,10 +1825,12 @@ and no running jobs; Shapes saves write a different element of the store.
   participant's work untouched, whatever the registration order; the error
   lists every blocker's reason; an unblocked reload invalidates every
   affected participant once;
-- Write and Reload wait for jobs that write the table (P11): Write is refused
-  with the blocker's reason while Feature Extraction writes the table, and
-  succeeds after the job finishes; a blocked reload of a dirty table never
-  shows Write / Discard / Cancel;
+- a table is busy while a job writes it (P11): app state counts two marks on
+  one table as busy until both are released, and emits the busy signal only
+  on a change; Write and Reload are disabled with the reason while busy, and
+  enabled again on release; the guards raise for a busy table; Feature
+  Extraction releases its mark when its job returns, errors, or finishes after
+  the widget closed;
 - backed `zarr.Array` / `CSRDataset` consumers (P3);
 - reload keeps `obsm` lazy (P4);
 - persistence through harpy's API: write, delete, rollback on failure,
@@ -1867,9 +1902,11 @@ Settled on 2026-11-05:
 
 Settled on 2026-11-06:
 
-- P11: a job whose worker writes a table blocks both Write and Reload of that
-  table (3c.6, after 3c.5 and before 3c.2b); a blocked reload never asks Write
-  / Discard / Cancel.
+- P11: a table is busy while a job writes it, and a busy table can be neither
+  written nor reloaded (3c.6, after 3c.5 and before 3c.2b). App state tracks
+  the busy state per table, as it tracks the dirty state; the persistence
+  controls disable Write and Reload with the reason; the job's owner marks and
+  releases; reload participants keep only `prepare_for_table_reload`.
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
