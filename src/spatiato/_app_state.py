@@ -144,17 +144,45 @@ class TableReloadRequest:
             raise ValueError("Table reload requests require a non-empty source.")
 
 
+class TableReloadBlockedError(RuntimeError):
+    """A reload participant asked the reload to wait; no participant has acted."""
+
+
 class TableReloadParticipant(Protocol):
     """Prepare one table-consuming workflow before an accepted reload.
 
-    A class satisfies this structural protocol by implementing
-    ``prepare_for_table_reload()``; inheritance is not required. Participants
-    compare the immutable request with the table they consume and ignore
-    unrelated requests.
+    A class satisfies this structural protocol by implementing both methods;
+    inheritance is not required. Participants compare the immutable request
+    with the table they consume and ignore unrelated requests.
+
+    App state prepares a reload in two passes: it first asks every participant
+    for a blocker, and only when none gives one does it let every participant
+    invalidate its work. A blocked reload therefore changes nothing in any
+    participant, whatever the registration order.
     """
 
+    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
+        """Return whether the requested reload must wait, without side effects.
+
+        Block only for work that changes the table from a worker thread, in
+        memory or in its store, such as a harpy call: it can be neither
+        interrupted nor undone, and a reload would race with it. Work whose
+        result is applied on the main thread is invalidated in
+        ``prepare_for_table_reload()`` instead.
+
+        Returns
+        -------
+        str | None
+            Why the reload must wait, shown to the user; app state then stops
+            the reload before any participant has acted. ``None`` when this
+            participant does not block it.
+        """
+
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Invalidate work that must not survive the requested table reload."""
+        """Invalidate work that must not survive the requested table reload.
+
+        Called only after no participant blocked the reload.
+        """
 
 
 class _TableMutationToken:
@@ -539,25 +567,48 @@ class SpatiatoAppState(QObject):
         reload request has been accepted and immediately before it replaces
         the requested in-memory table components from disk. Each registered
         ``TableReloadParticipant`` receives the same immutable request and
-        decides whether it consumes that SpatialData table. Affected workflows
-        can then invalidate pending or active work that captured the old table
-        state.
+        decides whether it consumes that SpatialData table. It runs in two
+        passes:
+
+        1. every participant may block the reload, without side effects
+           (``table_reload_blocker()``);
+        2. only when none did, every participant invalidates pending or active
+           work that captured the old table state
+           (``prepare_for_table_reload()``).
+
+        So a blocked reload changes nothing in any participant, whatever the
+        registration order.
 
         This method does not reload the table or publish the post-reload event.
         The persistence controller performs those steps after every participant
         has prepared successfully.
 
-        Participants are visited through a stable snapshot so registration or
-        teardown during a callback cannot skip or duplicate another workflow
-        in the accepted transition.
+        Both passes loop over one copy of the participant list, taken before
+        the first pass. A participant registered or unregistered by a
+        callback meanwhile is then neither skipped nor visited twice, and
+        every participant that is prepared was also asked for a blocker.
 
         Parameters
         ----------
         request
             Accepted reload request identifying the table and components that
             are about to be restored from disk.
+
+        Raises
+        ------
+        TableReloadBlockedError
+            At least one participant gave a reason to wait; the message lists
+            every reason.
         """
-        for participant in tuple(self._table_reload_participants):
+        participants = tuple(self._table_reload_participants)
+        reasons = []
+        for participant in participants:
+            reason = participant.table_reload_blocker(request)
+            if reason is not None:
+                reasons.append(reason)
+        if reasons:
+            raise TableReloadBlockedError(" ".join(reasons))
+        for participant in participants:
             participant.prepare_for_table_reload(request)
 
     def clear_coordinate_system(self, *, source: str | None = None) -> bool:
