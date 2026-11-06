@@ -116,23 +116,25 @@ flowchart TB
     subgraph workers["Worker threads"]
         FEJ["hp.tb.add_feature_matrix<br/>changes the table"]
         OCJ["train and predict<br/>calculates only"]
-        SQJ["canonical centers, query<br/>calculates only"]
+        SQJC["hp.tb.add_canonical_centers<br/>changes the table"]
+        SQJ["query<br/>calculates only"]
     end
     T[("Table<br/>in memory and in the Zarr store")]
 
     FEW --> FEC -- launches --> FEJ -- writes --> T
     OCW --> OCC -- launches --> OCJ
     SQW --> SQC -- launches --> SQJ
+    SQC -- launches --> SQJC -- writes --> T
     OCW -- "writes annotation edits" --> T
     OCC -- "writes predictions" --> T
-    SQC -- "installs centers" --> T
     SQW -- "applies annotations" --> T
     PC --> PCC -- "writes, reloads" --> T
 
     FEC -- "marks its table busy<br/>until the job ends" --> AS
+    SQC -- "marks its table busy<br/>until the centers job ends" --> AS
     FEW -- "records its changes<br/>(persisted change when backed,<br/>mutation when unbacked)" --> AS
     OCW -- "records its changes" --> AS
-    SQW -- "records its changes" --> AS
+    SQW -- "records its changes<br/>(centers: persisted change when<br/>backed, mutation when unbacked)" --> AS
     PCC -- "prepares and records reloads,<br/>acknowledges writes" --> AS
 
     AS -. "prepare" .-> OCW
@@ -159,8 +161,8 @@ where the change is:
 
 | The change is | Recorded with | Effect on dirty paths | Examples |
 |---|---|---|---|
-| only in memory | `record_table_mutation(event)` | each path becomes dirty, with a new token | Object Classification's annotation edits, predictions and configuration; Spatial Query's annotations and canonical centers; Feature Extraction on unbacked SpatialData |
-| already in the store | `record_persisted_table_change(event, snapshot)` | none becomes dirty; a path that was dirty in the snapshot taken at launch and that harpy wrote becomes clean, unless it changed again since | Feature Extraction on backed SpatialData |
+| only in memory | `record_table_mutation(event)` | each path becomes dirty, with a new token | Object Classification's annotation edits, predictions and configuration; Spatial Query's annotations; Feature Extraction and Spatial Query's canonical centers on unbacked SpatialData |
+| already in the store | `record_persisted_table_change(event, snapshot)` | none becomes dirty; a path that was dirty in the snapshot taken at launch and that harpy wrote becomes clean, unless it changed again since | Feature Extraction and Spatial Query's canonical centers on backed SpatialData |
 
 Both publish the event on `table_state_changed`, and, when the table as a whole
 becomes dirty or clean, also `table_dirty_state_changed`. Consumers filter on
@@ -233,19 +235,26 @@ table:
 |---|---|---|
 | Feature Extraction | write the table through harpy: its controller marks the table busy until the job ends | nothing: not a reload participant |
 | Object Classification | only calculate | its widget freezes the classifier work: cancels its jobs and drops its model snapshot |
-| Spatial Query | only calculate | its widget invalidates the Run |
+| Spatial Query | its centers job writes the table through harpy: its controller marks the table busy until the job ends; its query only calculates | its widget invalidates the Run |
 
 Feature Extraction needs no prepare hook: while its job runs, the table is busy
 and cannot be reloaded, and once the job has ended, its result is already
 published, so no work tied to the old table remains. It only adopts the
-reloaded table, from the `reloaded` event.
+reloaded table, from the `reloaded` event. Spatial Query's centers job is the
+same, so only its query is invalidated before a reload.
 
-Feature Extraction's widget gives its controller app state as a
-`TableBusyMarker`. The controller marks the table busy in `calculate()` and
-releases the mark in `_clear_job()`, which every end of a job reaches: it
+The Feature Extraction and Spatial Query widgets give their controllers app
+state as a `TableBusyMarker`. Feature Extraction's controller marks the table
+busy in `calculate()` and releases the mark in `_clear_job()`; Spatial Query's
+controller marks it in `start_spatial_query()` for a centers job and releases
+it in `_clear_centers_job()`. Every end of a job reaches the release: it
 returned, errored, failed to start, or finished after the widget closed. After
 the widget closes, superqt keeps the running worker alive, and the worker's
 signal connections keep the controller alive, so the release still happens.
+
+A cancelled Spatial Query Run detaches its centers job instead of stopping it:
+the job keeps writing, still publishes its change, and keeps the table busy
+until it finishes. A new Run waits for it (`has_job_in_flight`).
 
 A workflow that only invalidates registers its widget as a reload participant
 and unregisters it when the widget is destroyed. It also invalidates its work
@@ -279,7 +288,9 @@ name with its own before acting.
   `write_table_components` and `reload_table_components` in
   [`src/spatiato/core/persistence.py`](../../src/spatiato/core/persistence.py).
 - Busy marks: `calculate` and `_clear_job` in
-  [`widgets/feature_extraction/controller.py`](../../src/spatiato/widgets/feature_extraction/controller.py).
+  [`widgets/feature_extraction/controller.py`](../../src/spatiato/widgets/feature_extraction/controller.py),
+  `start_spatial_query` and `_clear_centers_job` in
+  [`widgets/spatial_query/controller.py`](../../src/spatiato/widgets/spatial_query/controller.py).
 - Participants: `prepare_for_table_reload` in
   [`widgets/object_classification/widget.py`](../../src/spatiato/widgets/object_classification/widget.py)
   and
