@@ -38,19 +38,26 @@ Extraction decides what to calculate
 
 Signals and calls, as the diagram labels them:
 
-- **`table_state_changed`:** app state's signal for one change to a table's
-  contents. It carries a `TableStateChangedEvent`: the component paths, the
-  regions whose rows changed, the change kind and the source. It is emitted for
-  every recorded change, a reload included. Widgets use it to adapt to the new
-  contents.
-- **`table_dirty_state_changed`:** app state's signal that a table switched
-  between having dirty paths and having none. It carries only `is_dirty`,
-  and is emitted only on that switch. It reflects Spatiato's records, not a
-  comparison with the store: a change made outside the widgets, for example
-  from the napari console, is not seen. The persistence controls use it for
-  the Write button and the Reload warning.
-- **Records its changes:** a widget tells app state about each change it
-  makes, as a mutation or a persisted change.
+- **Records its changes:** after a widget changes a table, it tells app state
+  about it, as a mutation or a persisted change. App state then updates the
+  dirty paths and passes the change on to every widget through
+  `table_state_changed`. If that makes the table as a whole dirty or clean, it
+  also emits `table_dirty_state_changed`. So the widget that made the change
+  only talks to app state, and the others only listen to app state. A change
+  that is not recorded is never passed on, and never becomes dirty.
+- **`table_state_changed`:** app state's signal that something in a table
+  changed, for example a column was edited or a feature matrix was written.
+  It is emitted for every recorded change, a reload included. It carries a
+  `TableStateChangedEvent` that says what changed (the component paths, and
+  the regions whose rows changed), how (the change kind) and who changed it
+  (the source). Widgets use it to adapt to the new contents.
+- **`table_dirty_state_changed`:** app state's signal that a table became
+  dirty (it now has unsaved changes) or clean again (it has none left). It
+  carries only `is_dirty`, and is emitted only at that moment, not on every
+  change. It reflects Spatiato's records, not a comparison with the store: a
+  change made outside the widgets, for example from the napari console, is not
+  seen. The persistence controls use it for the Write button and the Reload
+  warning.
 - **Blocker, then prepare:** the two passes app state makes over the
   participants before a reload. First every participant may return a
   **blocker** from `table_reload_blocker()`: the reason the reload must wait.
