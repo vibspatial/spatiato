@@ -565,8 +565,8 @@ class FeatureExtractionController:
             raise
         return True
 
-    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Reject reload while the feature-extraction job can still write its table.
+    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
+        """Block a reload while the feature-extraction job can still write its table.
 
         `calculate()` stores the launched job in `_job`, and `_on_worker_finished()`
         clears it when its worker emits `finished`. Until then, a reload of its
@@ -574,16 +574,32 @@ class FeatureExtractionController:
         changed or the widget closed: its Harpy call cannot be stopped and may
         still be writing.
 
-        The controller performs no AnnData mutation here. Raising stops the
-        shared reload before live table components are replaced; reusable
-        persistence controls present the message to the user.
+        Returns the reason while that job can still write the requested table,
+        and `None` otherwise, so the reload may go ahead. On a reason, app
+        state stops the shared reload before any participant has acted, and
+        the persistence controls show it to the user.
         """
         job = self._job
         if job is not None and job.sdata is request.sdata and job.table_name == request.table_name:
-            raise RuntimeError(
+            return (
                 f'Cannot reload table "{request.table_name}" while Feature Extraction is still writing it. '
                 "Wait for Feature Extraction to finish and try again."
             )
+        return None
+
+    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
+        """Do nothing: Feature Extraction has no work to invalidate before a reload.
+
+        Other participants invalidate their pending work here. Feature
+        Extraction instead blocks a reload of its table until its job has
+        finished (`table_reload_blocker()`), because the job's Harpy call
+        writes the table and cannot be stopped. So when a reload gets this
+        far, no job of this controller is writing that table, and the result
+        of a finished job is already published. A reload replaces the
+        components of one table only, so a job writing another table is not
+        affected by it.
+        """
+        del request
 
     def shutdown(self, *args: object) -> None:
         """Stop accepting results and detach callbacks owned by the Qt widget."""
