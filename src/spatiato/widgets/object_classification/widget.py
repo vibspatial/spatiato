@@ -426,8 +426,8 @@ class ObjectClassificationWidget(QWidget):
         app_state = self._app_state
         participant = self
         self.destroyed.connect(
-            lambda *_args, app_state=app_state, participant=participant: (
-                app_state.unregister_table_reload_participant(participant)
+            lambda *_args, app_state=app_state, participant=participant: app_state.unregister_table_reload_participant(
+                participant
             )
         )
 
@@ -592,6 +592,11 @@ class ObjectClassificationWidget(QWidget):
             self._classifier_controller.invalidate_for_feature_matrix_overwrite(previous_feature_key)
 
         self._update_selection_status()
+
+    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
+        """Never block a reload: classifier jobs only compute, so a reload invalidates them instead."""
+        del request
+        return None
 
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
         """Freeze classifier work before a consumed table is reloaded."""
