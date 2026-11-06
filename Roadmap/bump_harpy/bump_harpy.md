@@ -525,7 +525,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3c.3 | Raise before a regional update onto a matrix that is not in memory, on unbacked SpatialData: `check_existing_feature_matrix(...)` (`core/feature_extraction.py`) raises `ValueError` when the SpatialData is unbacked, the existing entry is compatible, and `obsm[feature_key]` is not NumPy or SciPy CSR/CSC; the message says to load the matrix into memory or write to a store first. Tests: raises for a Dask array and a `zarr.Array`; does not raise for NumPy, backed SpatialData, or an incompatible entry. The developer doc's error table gets the row | ready |
    | 3c.4 | Reserved `.obsm` keys (P9): Feature Extraction rejects `spatial_canonical` and `spatial` in its key check; Object Classification leaves them out of its feature-matrix choices and refuses to register them | implemented on 2026-11-05 (`RESERVED_OBSM_KEYS` and `validate_feature_key_not_reserved(...)` in `core/feature_matrix_metadata.py`); the feature-extraction core also checks first, so an existing `obsm["spatial"]` is never removed |
    | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants | ready; before 3c.2b |
-   | 3c.6 | Write and Reload wait for jobs that write the table (P11), extending 3c.5: the participant method becomes `table_persistence_blocker(sdata, table_name)`, with a message that fits both; app state gets `table_persistence_blockers(sdata, table_name)`, which returns every reason and is also the first pass of a reload. Write asks it first and refuses with every reason (`TablePersistenceBlockedError`, renamed from `TableReloadBlockedError`), and the persistence controls show it. Reload asks it before the Write / Discard / Cancel dialog, and again in its first pass. Tests: Write is refused while Feature Extraction writes the table; a blocked reload never shows the dialog; the 3c.5 tests follow the rename. `docs/development/table_state.md` follows | planned on 2026-11-06, readiness check pending; after 3c.5, before 3c.2b |
+   | 3c.6 | Write and Reload wait for jobs that write the table (P11), extending 3c.5: the participant method becomes `table_persistence_blocker(sdata, table_name)`, with a reason that fits both; app state gets `check_table_persistence(sdata, table_name, *, action)`, which raises `TablePersistenceBlockedError` (renamed from `TableReloadBlockedError`) naming the action and every reason, and is also the first pass of a reload. Write calls it first, and the persistence controls show the error (they caught only `ValueError` on Write). Reload calls it before the Write / Discard / Cancel dialog, and again in its first pass. Tests: Write is refused while a participant blocks, and succeeds once it no longer does; a blocked reload never shows the dialog; the 3c.5 tests follow the rename. `docs/development/table_state.md` follows | ready (readiness check on 2026-11-06); after 3c.5, before 3c.2b |
    | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
@@ -1752,18 +1752,22 @@ Decision: a job whose worker writes a table blocks both Write and Reload of
 that table.
 
 1. The participant method becomes `table_persistence_blocker(sdata,
-   table_name)`: a reason or `None`, without side effects, with a message that
-   fits both actions (for example 'Feature Extraction is still writing table
-   "T". Wait for it to finish and try again.').
-2. App state gets one check, `table_persistence_blockers(sdata, table_name)`,
-   which returns every reason. It is also the first pass of a reload.
-3. Write asks it first and refuses with every reason
-   (`TablePersistenceBlockedError`, renamed from `TableReloadBlockedError`).
-   The persistence controls show the error; on Write they catch only
-   `ValueError` today.
-4. Reload asks it before the Write / Discard / Cancel dialog, so a blocked
-   reload never asks the question. The first pass asks again, because the
+   table_name)`: a reason or `None`, without side effects, worded for both
+   actions (for example "Feature Extraction is still writing its results. Try
+   again once the calculation has finished.").
+2. App state gets one check, `check_table_persistence(sdata, table_name, *,
+   action)`, which raises `TablePersistenceBlockedError` (renamed from
+   `TableReloadBlockedError`) with the action and every reason, for example
+   'Cannot write table "T": …'. It is also the first pass of a reload, so the
+   error is formatted in one place for all three callers.
+3. Write calls it first. The persistence controls show the error; on Write
+   they caught only `ValueError` before.
+4. Reload calls it before the Write / Discard / Cancel dialog, so a blocked
+   reload never asks the question. The first pass checks again, because the
    dialog lets other events run.
+
+Out of scope: the headless API writes predictions directly, but has no widgets
+and no running jobs; Shapes saves write a different element of the store.
 
 ## Tests to Add
 
