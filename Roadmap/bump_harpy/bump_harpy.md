@@ -527,12 +527,14 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3c.5 | Two-pass reload preparation (P10): the reload participant protocol gets `table_reload_blocker(request)`, which returns a reason or `None` without side effects; app state first asks every participant and raises one error with every reason before any participant acts, then calls `prepare_for_table_reload(request)`, which only invalidates. Feature Extraction's controller returns its "still writing" message as its blocker and no longer raises; the Object Classification and Spatial Query widgets return `None`. Tests in the app-state, feature-extraction, persistence-controls and Spatial Query widget modules. A developer document, `docs/development/table_state.md`, describes table state, Write, Reload and the participants. 3c.6 replaces the participants' blocker with app state's busy state | implemented on 2026-11-06, before 3c.6 and 3c.2b; 3c.6 then replaced the participants' blockers with the busy state, and the first pass became the busy check |
    | 3c.6 | A table is busy while a job writes it (P11), extending 3c.5: app state tracks busy marks per table (`mark_table_busy(...)` returning a token, `release_table_busy(token)`, `table_busy_reasons(...)`) and emits `table_busy_state_changed`. The persistence controls disable Write and Reload while the table is busy, with the reason as tooltip. `write_table_state()` and the first pass of `prepare_for_table_reload()` raise `TableBusyError` as guards, and the controls show it. The reload participant protocol goes back to `prepare_for_table_reload(request)` only: the blocker methods and `check_table_persistence(...)` go. Feature Extraction's controller marks the table busy in `calculate()` and releases it in `_clear_job()`; it stops being a reload participant, so its deferred release and the widget's pending unregister go. Details from the readiness check: the controller gets a required `table_busy_marker=` keyword typed as a narrow `TableBusyMarker` protocol (`mark_table_busy`, `release_table_busy`), which app state implements, so the controller does not depend on app state; required, unlike the callbacks, because a controller without it would silently drop the guard (the widget passes app state; the unit tests construct the controller through a helper that passes a throwaway app state); app state also offers `is_table_busy(...)` and `require_table_not_busy(...)`, which formats 'Table "T" is busy: …' in one place for both guards and the tooltip; busy marks survive loading another SpatialData (the job keeps the old object alive, so its release still finds the mark); Reload needs no check before its dialog, since the button is disabled while busy and the first pass guards a job that starts meanwhile. After the widget closes, superqt keeps the running worker alive, and its signal connections keep the controller alive until `finished`, so the release is reached. Tests: busy marks and the signal in app state; buttons disabled with the reason, and enabled again on release; the guards; Feature Extraction releases the mark when its job returns, errors, or finishes after the widget closed; the 3c.5 tests without the blocker. `docs/development/table_state.md` follows | implemented on 2026-11-06 (busy state instead of polled blockers), after 3c.5. Also in 3c.6: the Spatial Query widget invalidates its Run on the `reloaded` event too, so every participant's hook is a defense (`TableReloadParticipant`); `PersistenceController.write_table_state()` leaves a table without unsaved changes as it is instead of raising `ValueError` |
    | 3c.7 | No job starts on a busy table (P11, point 6): `TableBusyMarker` gains `table_busy_reasons(...)`; Feature Extraction's `calculate()` and Spatial Query's `start_spatial_query()` refuse while another job keeps the table busy; their widgets disable Calculate and Run with 'Table "T" is busy: …' and refresh on `table_busy_state_changed`; the Spatial Query widget checks the centers again when the table is no longer busy. Tests in the controller, widget and status-card modules; the multi-widget reload test accepts Spatial Query's Run before Feature Extraction's job starts. `docs/development/table_state.md` follows | implemented on 2026-11-06, after 3c.2b. Not covered: a query-only Run does not mark the table busy, and jobs on different tables of one store are not serialized (design point 6) |
-   | 3d | Object Classification refactor and headless `apply_classifier(...)`, with test updates | ready (design points 1-4 settled) |
+   | 3d.1 | Object Classification without scanning the matrix (3d design points 1-8 below): the summary reads only `obs` and `uns`, with the column count from `feature_matrix_n_features(...)`; the job carries the matrix object and the row positions instead of copies; the worker reads its rows with `read_matrix_rows(...)`, skips rows without finite features, checks the labeled count and the classes again, and returns an "ineligible" result with its reason when they no longer suffice; the result carries the counts and the predicted row positions, which the prediction write and `uns["classifier_config"]` use (point 5); the status card and the messages report the rows in the scope before a job, and the rows used and skipped after it. Tests: the controller, widget and multi-widget tests listed with the design points change; new tests as listed with the readiness check | ready (readiness check of 2026-11-06) |
+   | 3d.2 | Headless `apply_classifier(...)` the same way: it reads only the prediction rows with `read_matrix_rows(...)` and skips rows without finite features; `normalize_feature_matrix(...)`, then without callers, is deleted (point 6). Tests: headless with a lazy matrix and skipped rows | ready, after 3d.1 |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
    that order), with 3c.5 and then 3c.6 between 3c.2a and 3c.2b: design
    point 8 relies on their contract, and 3c.2b adds a second job that writes
-   the table; 3c.7 follows 3c.2b. 3c.1 comes first, because the classifier
+   the table; 3c.7 follows 3c.2b. 3d is committed in two parts, 3d.1 and then
+   3d.2. 3c.1 comes first, because the classifier
    summary in 3d relies on its shape-only check. 3c.4 comes before 3c.2, because a feature-matrix
    record under a reserved key would make `add_canonical_centers` reject the
    table. 3c.2 comes next: until it lands, Spatial Query rewrites harpy 0.5.3's
@@ -610,6 +612,54 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    point 4. The headless tests keep their field names
    (`n_predicted_rows`, `n_skipped_feature_invalid_rows`). No test covers the
    sparse finite check or most of the count messages today.
+
+   Readiness check for 3d (2026-11-06, against the code after 3c.7). The
+   design above still matches the code: the summary reads the whole matrix on
+   every refresh, through `normalize_feature_matrix(..., copy=False)` and the
+   finite-row mask; the job copies its rows on the main thread; headless
+   `apply_classifier(...)` reads the whole matrix. 3c.1's
+   `feature_matrix_n_features(...)` gives the summary its shape-only checks,
+   and 3a's `read_matrix_rows(...)` lets the worker and headless read only
+   their rows; `_get_finite_feature_row_mask(...)` works on what it returns
+   (NumPy, or SciPy CSR/CSC). Nothing in `src` writes into an `obsm` array in
+   place, so point 4's premise holds. Settled the same day:
+   5. **What the counts in `uns["classifier_config"]` mean**, which point 2
+      left open. After 3d the worker reads only the labeled training rows and
+      the prediction rows, so it cannot count the finite unlabeled training
+      rows that `n_training_rows` counts today. Decision:
+      - `n_training_rows`: the rows in the training scope, as reported before
+        a job (point 1);
+      - `n_labeled_objects`: the labeled rows used for training, after
+        skipping; when the summary blocks Train before a job, the labeled rows
+        in the scope;
+      - `n_predicted_rows`: the rows that received a prediction, and 0 when
+        nothing was trained (today an ineligible config stores the eligible
+        prediction count there).
+
+      Only `_update_status_from_reloaded_table(...)` reads a count back
+      ("Loaded predictions for N objects"), and only when `trained` is true.
+   6. **`normalize_feature_matrix(...)` goes.** Its three callers (the summary,
+      the job and headless `apply_classifier(...)`) stop using it. The test
+      that wraps it ("the preparation summary should not construct worker
+      feature arrays") becomes "the summary reads no matrix values", with a
+      Dask array that fails when computed.
+   7. **The busy state (3c.6, 3c.7) changes nothing here.** Classifier jobs
+      still only calculate: they do not mark the table busy, and Train does not
+      wait for a busy table. The risk accepted above, a job reading a key that
+      Feature Extraction rewrites, stays accepted; it becomes a little more
+      likely, since the read moves into the worker.
+   8. **An ineligible result from the worker** (point 3) needs
+      `_apply_ineligible_state(...)` to take the worker's reason and counts,
+      not only the job's summary.
+
+   3d is split in two parts, committed separately: 3d.1, the widget path;
+   3d.2, headless `apply_classifier(...)` and the removal of
+   `normalize_feature_matrix(...)`, which needs both. Tests: the about 16
+   tests above change; new tests cover the summary reading no matrix values,
+   the worker skipping non-finite rows (dense, CSR and CSC), the counts
+   checked again after skipping and the ineligible result that follows, the
+   message naming a labels element whose rows were all skipped, the config
+   counts, and headless with a lazy matrix and skipped rows.
 
    Readiness check for 3c.2 (2026-11-05, against harpy 0.5.3). Today the
    centers worker computes without changing anything, and the main thread
@@ -1976,6 +2026,12 @@ Settled on 2026-11-06:
   controller separates an attached operation (`is_running`) from a centers job
   still writing (`has_job_in_flight`); Run waits for both, and a detached job
   is detached explicitly on cancel, without reattachment.
+- Step 3d readiness check, design points 5-8 (see "Migration Plan", step 3):
+  the counts in `uns["classifier_config"]` get defined meanings;
+  `normalize_feature_matrix(...)` goes; classifier jobs still do not mark the
+  table busy; an ineligible result from the worker reaches
+  `_apply_ineligible_state(...)` with its reason and counts. 3d is split into
+  3d.1 (the widget path) and 3d.2 (headless and the cleanup).
 
 Settled on 2026-10-27 (see "Migration Plan"):
 
