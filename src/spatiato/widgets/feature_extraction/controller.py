@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
-from spatiato._app_state import TableDirtySnapshot, TableReloadRequest
+from spatiato._app_state import TableBusyMark, TableBusyMarker, TableDirtySnapshot
 from spatiato.core.feature_extraction import (
     ExistingFeatureMatrix,
     ExistingFeatureMatrixKind,
@@ -249,10 +249,17 @@ class FeatureExtractionController:
     def __init__(
         self,
         *,
+        table_busy_marker: TableBusyMarker,
         on_state_changed: Callable[[], None] | None = None,
         on_table_selection_refresh_required: Callable[[FeatureExtractionResult], None] | None = None,
         on_feature_matrix_changed: Callable[[FeatureExtractionResult], None] | None = None,
     ) -> None:
+        # Marks the job's table busy while the job writes it. The widget passes
+        # app state, which implements `TableBusyMarker`. Required, unlike the
+        # callbacks: without it, Write and Reload would not wait for the job.
+        # It is also kept after `shutdown()`, so a job that outlives the widget
+        # still releases its mark.
+        self._table_busy_marker = table_busy_marker
         self._on_state_changed = on_state_changed
         self._on_table_selection_refresh_required = on_table_selection_refresh_required
         self._on_feature_matrix_changed = on_feature_matrix_changed
@@ -279,15 +286,18 @@ class FeatureExtractionController:
         #   keeps writing; its table change is still published and the table
         #   choices are refreshed, but the status and selection follow the
         #   current inputs.
-        # - Until `finished`, reloads of its table stay blocked, also when the
-        #   job is detached or the widget closed.
+        # - Until `finished`, the job's table is busy (`_busy_mark`), so it can be
+        #   neither written nor reloaded, also when the job is detached or the
+        #   widget closed. After the widget closes, superqt keeps the running
+        #   worker alive, and its signal connections keep this controller alive,
+        #   so `_on_worker_finished()` still releases the mark.
         # The limit holds per controller: closing the widget mid-run and opening
         # a new one gives a second controller, which may start a second job.
         # Accepted: rare, and a guard across widgets would need shared state in
         # `SpatiatoAppState`.
         self._job: FeatureExtractionJob | None = None
         self._worker: Any | None = None
-        self._release_reload_participant: Callable[[], None] | None = None
+        self._busy_mark: TableBusyMark | None = None
         self._is_shutdown = False
 
         self._status_message = FEATURE_EXTRACTION_IDLE_STATUS
@@ -308,8 +318,8 @@ class FeatureExtractionController:
         """Return whether a harpy job has not finished, also when it was detached.
 
         Such a job may still write its table: in memory and, for backed
-        SpatialData, in the store. It blocks new launches and reloads of its
-        table.
+        SpatialData, in the store. It blocks new launches, and keeps its table
+        busy, so the table can be neither written nor reloaded.
         """
         return self._job is not None
 
@@ -554,6 +564,11 @@ class FeatureExtractionController:
         worker = self._create_feature_extraction_worker(job)
         self._job = job
         self._worker = worker
+        self._busy_mark = self._table_busy_marker.mark_table_busy(
+            job.sdata,
+            job.table_name,
+            reason="Feature Extraction is still writing its results. Try again once the calculation has finished.",
+        )
         worker.returned.connect(partial(self._on_worker_returned, job.job_id))
         worker.errored.connect(partial(self._on_worker_errored, job.job_id))
         worker.finished.connect(partial(self._on_worker_finished, job.job_id))
@@ -564,42 +579,6 @@ class FeatureExtractionController:
             self._clear_job()
             raise
         return True
-
-    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-        """Block a reload while the feature-extraction job can still write its table.
-
-        `calculate()` stores the launched job in `_job`, and `_on_worker_finished()`
-        clears it when its worker emits `finished`. Until then, a reload of its
-        table is blocked, also when the job is detached because an input
-        changed or the widget closed: its Harpy call cannot be stopped and may
-        still be writing.
-
-        Returns the reason while that job can still write the requested table,
-        and `None` otherwise, so the reload may go ahead. On a reason, app
-        state stops the shared reload before any participant has acted, and
-        the persistence controls show it to the user.
-        """
-        job = self._job
-        if job is not None and job.sdata is request.sdata and job.table_name == request.table_name:
-            return (
-                f'Cannot reload table "{request.table_name}" while Feature Extraction is still writing it. '
-                "Wait for Feature Extraction to finish and try again."
-            )
-        return None
-
-    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Do nothing: Feature Extraction has no work to invalidate before a reload.
-
-        Other participants invalidate their pending work here. Feature
-        Extraction instead blocks a reload of its table until its job has
-        finished (`table_reload_blocker()`), because the job's Harpy call
-        writes the table and cannot be stopped. So when a reload gets this
-        far, no job of this controller is writing that table, and the result
-        of a finished job is already published. A reload replaces the
-        components of one table only, so a job writing another table is not
-        affected by it.
-        """
-        del request
 
     def shutdown(self, *args: object) -> None:
         """Stop accepting results and detach callbacks owned by the Qt widget."""
@@ -614,42 +593,6 @@ class FeatureExtractionController:
         self._on_state_changed = None
         self._on_table_selection_refresh_required = None
         self._on_feature_matrix_changed = None
-
-    def release_reload_participant_when_safe(self, release: Callable[[], None]) -> None:
-        """Release the detached reload participant after all Harpy calls finish."""
-        if self._release_reload_participant is not None:
-            raise RuntimeError("Feature Extraction reload-participant release is already pending.")
-        self._release_reload_participant = release
-        self._release_reload_participant_if_safe()
-
-    def _release_reload_participant_if_safe(self) -> None:
-        """Run the deferred app-state unregister after all Harpy jobs finish.
-
-        Widget destruction installs an unregister callback through
-        ``release_reload_participant_when_safe()``. Keep that callback pending
-        while the Feature Extraction job remains physically in flight so the
-        controller continues protecting its table from reload. Its worker
-        consumes the callback exactly once when it finishes.
-
-        This helper is called at both lifecycle boundaries because either one
-        may happen first:
-
-        worker already finished, then widget teardown
-            → the teardown call unregisters immediately
-
-        widget teardown while worker is still busy
-            → the teardown call leaves the unregister pending
-            → the final ``_on_worker_finished()`` call unregisters
-        """
-        if self._job is not None:
-            return
-
-        release = self._release_reload_participant
-        if release is None:
-            return
-
-        self._release_reload_participant = None
-        release()
 
     def _prepare_feature_extraction_job(
         self,
@@ -872,8 +815,12 @@ class FeatureExtractionController:
         )
 
     def _clear_job(self) -> None:
+        # Every end of a job comes here, so the table is never left busy.
         self._job = None
         self._worker = None
+        if self._busy_mark is not None:
+            self._table_busy_marker.release_table_busy(self._busy_mark)
+        self._busy_mark = None
 
     def _job_for(self, job_id: int) -> FeatureExtractionJob | None:
         """Return the job in flight if it has `job_id`; signals of other workers are ignored."""
@@ -932,8 +879,9 @@ class FeatureExtractionController:
             self._set_status(f"Feature extraction: calculation failed: {error}", kind="error")
 
     def _on_worker_finished(self, job_id: int) -> None:
-        # Remove reload protection when the job finishes, also when it was
-        # detached and is no longer the active job.
+        # Clearing the job releases the table's busy mark (`_clear_job()`), also
+        # when the job was detached and is no longer the active job, or the
+        # widget has closed.
         if self._job_for(job_id) is not None:
             was_detached = self._job_detached
             self._clear_job()
@@ -944,8 +892,6 @@ class FeatureExtractionController:
                 self._update_idle_status()
             elif self._on_state_changed is not None:
                 self._on_state_changed()
-
-        self._release_reload_participant_if_safe()
 
     def _get_bound_table(self) -> AnnData | None:
         if self._selected_spatialdata is None or self._selected_table_name is None or self._create_table:
