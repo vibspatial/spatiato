@@ -593,20 +593,19 @@ class ObjectClassificationWidget(QWidget):
 
         self._update_selection_status()
 
-    def table_reload_blocker(self, request: TableReloadRequest) -> str | None:
-        """Return `None`: Object Classification never blocks a reload.
-
-        Its classifier jobs only compute in a worker; their results are written
-        to the table on the main thread. So a reload does not have to wait for
-        them: `prepare_for_table_reload()` cancels them instead. A cancelled
-        job's result, computed from the table being replaced, is discarded and
-        never written to the table.
-        """
-        del request
-        return None
-
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Freeze classifier work before a consumed table is reloaded."""
+        """Freeze classifier work before a consumed table is reloaded.
+
+        Classifier jobs only compute in a worker; their results are written to
+        the table on the main thread. So they never make the table busy, and a
+        reload does not wait for them: it cancels them here instead. A
+        cancelled job's result, computed from the table being replaced, is
+        discarded and never written to the table.
+
+        This is a defense, see `TableReloadParticipant`: the controller also
+        cancels these jobs when the widget receives the `reloaded` event
+        (`reset_after_reload()`).
+        """
         if request.sdata is not self.selected_spatialdata or request.table_name != self.selected_table_name:
             return
         self._classifier_controller.freeze_for_reload()
