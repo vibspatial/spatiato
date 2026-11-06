@@ -23,6 +23,7 @@ from spatiato.core.feature_matrix_metadata import (
     validate_feature_key_not_reserved,
 )
 from spatiato.core.spatialdata import get_table, get_table_metadata
+from spatiato.core.table_matrix import is_in_memory_matrix
 
 if TYPE_CHECKING:
     from spatialdata import SpatialData
@@ -298,7 +299,10 @@ def check_existing_feature_matrix(
 
     Raises `ValueError` when harpy would reject any feature update of the table
     because of its rows, or `feature_key` because it is reserved for spatial
-    coordinates, so nothing is removed for an update that cannot succeed.
+    coordinates, so nothing is removed for an update that cannot succeed. Also
+    raises `ValueError` for a regional update of unbacked SpatialData whose
+    matrix is not in memory (a Dask, Zarr or memory-mapped array): harpy would
+    chain lazy merges onto it.
     """
     validate_feature_key_not_reserved(feature_key)
     table = get_table(sdata, table_name)
@@ -343,6 +347,19 @@ def check_existing_feature_matrix(
         triplets=triplets,
         feature_names=feature_names,
     )
+    if reason is None and sdata.path is None and not is_in_memory_matrix(matrix):
+        # For unbacked SpatialData, harpy merges a regional update with the
+        # matrix in `table.obsm`. If that matrix is in memory, harpy computes
+        # the result right away. If it is not (a Dask, Zarr or memory-mapped
+        # array), harpy keeps the result lazy, so each later update chains
+        # another lazy merge onto it, and memory and read time keep growing.
+        raise ValueError(
+            f'Feature matrix "{feature_key}" in table "{table_name}" is not in memory '
+            "(a Dask, Zarr or memory-mapped array); updating it for the selected labels elements "
+            "would chain lazy merges onto it. Load it into memory first (for a Dask array: "
+            f'`table.obsm["{feature_key}"] = table.obsm["{feature_key}"].compute()`), '
+            "or write the SpatialData to a store."
+        )
     return ExistingFeatureMatrix("compatible" if reason is None else "incompatible", reason, unselected_regions)
 
 

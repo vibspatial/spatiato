@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import dask.array as da
 import harpy as hp
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
 from harpy.table._add_feature_matrix import _SOURCE_KIND
 from harpy.table._metadata import _FEATURE_MATRIX_SCHEMA_VERSION
 from loguru import logger
@@ -195,6 +199,50 @@ def test_check_existing_feature_matrix_treats_metadata_without_matrix_as_none(
     assert existing.kind == "absent"
     assert existing.orphaned_metadata is True
     assert result.change_kind == "created"
+
+
+def _not_in_memory(values: np.ndarray, representation: str, directory: Path) -> object:
+    if representation == "dask":
+        return da.from_array(values)
+    if representation == "zarr":
+        return zarr.array(values)
+    memmap = np.lib.format.open_memmap(directory / "matrix.npy", mode="w+", dtype=values.dtype, shape=values.shape)
+    memmap[...] = values
+    return memmap
+
+
+@pytest.mark.parametrize("representation", ["dask", "zarr", "memmap"])
+def test_unbacked_regional_update_of_a_matrix_not_in_memory_raises_before_changes(
+    sdata_blobs_multi_region: SpatialData,
+    tmp_path: Path,
+    representation: str,
+) -> None:
+    _calculate(sdata_blobs_multi_region, "blobs_labels_2")
+    table = sdata_blobs_multi_region[_TABLE]
+    values = np.asarray(table.obsm[_KEY]).copy()
+    table.obsm[_KEY] = _not_in_memory(values, representation, tmp_path)
+
+    with pytest.raises(ValueError, match=f'Feature matrix "{_KEY}" in table "{_TABLE}" is not in memory'):
+        _check(sdata_blobs_multi_region, "blobs_labels")
+    # The worker checks again, before anything changes.
+    with pytest.raises(ValueError, match="is not in memory"):
+        _calculate(sdata_blobs_multi_region, "blobs_labels", overwrite_feature_key=True)
+
+    np.testing.assert_array_equal(np.asarray(table.obsm[_KEY]), values)
+
+
+def test_unbacked_incompatible_matrix_not_in_memory_is_replaced_entirely(
+    sdata_blobs_multi_region: SpatialData,
+) -> None:
+    table = sdata_blobs_multi_region[_TABLE]
+    table.obsm[_KEY] = da.ones((table.n_obs, 3))
+
+    # Not a regional update: the replacement is a new matrix, so nothing chains.
+    result = _calculate(sdata_blobs_multi_region, "blobs_labels", overwrite_feature_key=True)
+
+    assert result.existing.kind == "incompatible"
+    assert result.existing.reason == "it has no harpy feature metadata"
+    assert not np.isnan(_rows(sdata_blobs_multi_region, "blobs_labels")).any()
 
 
 def test_calculate_feature_matrix_rejects_changed_confirmation_before_changes(

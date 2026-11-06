@@ -42,6 +42,19 @@ def is_sparse_matrix(matrix: Any) -> bool:
     return issparse(matrix) or isinstance(matrix, _BACKED_SPARSE_TYPES)
 
 
+def is_in_memory_matrix(matrix: Any) -> bool:
+    """Return whether `matrix` is in memory: a NumPy array that is not memory-mapped, or a SciPy CSR/CSC matrix.
+
+    This is harpy's rule for a regional update of unbacked SpatialData: harpy
+    computes the merge only into such a matrix. A Dask array, a Zarr array, a
+    backed sparse handle or a memory-mapped array may read from storage, so
+    harpy attaches the merge lazily instead.
+    """
+    if isinstance(matrix, np.ndarray):
+        return not isinstance(matrix, np.memmap)
+    return issparse(matrix) and matrix.format in _IN_MEMORY_SPARSE_FORMATS
+
+
 def read_matrix(matrix: Any) -> Any:
     """Return the whole matrix in memory, as a NumPy array or a SciPy CSR/CSC matrix."""
     _validate_matrix(matrix)

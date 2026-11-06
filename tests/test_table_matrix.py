@@ -15,7 +15,13 @@ from scipy import sparse
 from spatialdata import SpatialData
 from spatialdata.models import TableModel
 
-from spatiato.core.table_matrix import is_sparse_matrix, read_matrix, read_matrix_column, read_matrix_rows
+from spatiato.core.table_matrix import (
+    is_in_memory_matrix,
+    is_sparse_matrix,
+    read_matrix,
+    read_matrix_column,
+    read_matrix_rows,
+)
 
 _N_OBS = 30
 _POSITIONS = np.array([0, 3, 5, 17, 29])
@@ -121,6 +127,20 @@ def test_is_sparse_matrix_recognizes_every_representation_without_reading(name: 
     matrix, _ = _representation(name, table_store)
 
     assert is_sparse_matrix(matrix) is (name in _SPARSE_REPRESENTATIONS)
+
+
+@pytest.mark.parametrize("name", _REPRESENTATIONS)
+def test_is_in_memory_matrix_accepts_only_numpy_and_scipy_csr_or_csc(name: str, table_store: Path) -> None:
+    matrix, _ = _representation(name, table_store)
+
+    assert is_in_memory_matrix(matrix) is (name in ("numpy", "csr", "csc", "csr_array"))
+
+
+def test_is_in_memory_matrix_rejects_a_memory_mapped_array(tmp_path: Path) -> None:
+    # As in harpy: a memory-mapped array reads from a file.
+    matrix = np.lib.format.open_memmap(tmp_path / "matrix.npy", mode="w+", dtype=np.float64, shape=(3, 2))
+
+    assert is_in_memory_matrix(matrix) is False
 
 
 @pytest.mark.parametrize("name", _REPRESENTATIONS)
