@@ -49,7 +49,7 @@ Extraction decides what to calculate
   (`prepare_for_table_reload()`), as a defense: it also invalidates that work
   on the `reloaded` event.
 
-Signals and calls, as the diagram labels them:
+Signals and calls, as the second diagram below labels them:
 
 - **Records its changes:** after a widget changes a table, it tells app state
   about it, as a mutation or a persisted change. App state then updates the
@@ -99,8 +99,11 @@ Annotation widget, below Shapes Annotation.
 
 ## How they connect
 
+Two diagrams: who changes the table, and how app state connects the pieces.
 Solid arrows are calls, dotted arrows are signals and callbacks from app
 state.
+
+### Who changes the table
 
 ```mermaid
 flowchart TB
@@ -111,10 +114,8 @@ flowchart TB
         OCC["Object Classification controller"]
         SQW["Spatial Query widget<br/>(in the Annotation widget)"]
         SQC["Spatial Query controller"]
-        VW["Viewer widget"]
         PC["TablePersistenceControls<br/>(in the OC and SQ widgets)"]
         PCC["PersistenceController"]
-        AS[("SpatiatoAppState<br/>dirty paths, busy marks,<br/>events, reload participants")]
     end
     subgraph workers["Worker threads"]
         FEJ["hp.tb.add_feature_matrix<br/>changes the table"]
@@ -132,24 +133,47 @@ flowchart TB
     OCC -- "writes predictions" --> T
     SQW -- "applies annotations" --> T
     PC --> PCC -- "writes, reloads" --> T
+```
 
-    FEC -- "marks its table busy<br/>until the job ends" --> AS
-    SQC -- "marks its table busy<br/>until the centers job ends" --> AS
-    FEW -- "records its changes<br/>(persisted change when backed,<br/>mutation when unbacked)" --> AS
-    OCW -- "records its changes" --> AS
-    SQW -- "records its changes<br/>(centers: persisted change when<br/>backed, mutation when unbacked)" --> AS
-    PCC -- "prepares and records reloads,<br/>acknowledges writes" --> AS
+### How app state connects them
 
-    AS -. "prepare" .-> OCW
-    AS -. "prepare" .-> SQW
-    AS -. "table_state_changed" .-> FEW
-    AS -. "table_state_changed" .-> OCW
-    AS -. "table_state_changed" .-> SQW
-    AS -. "table_state_changed" .-> VW
-    AS -. "table_dirty_state_changed" .-> PC
-    AS -. "table_busy_state_changed" .-> PC
-    AS -. "table_busy_state_changed" .-> FEW
-    AS -. "table_busy_state_changed" .-> SQW
+The widgets that both call app state and listen to it appear in both rows.
+
+```mermaid
+flowchart TB
+    subgraph callers["Call app state"]
+        FEC["Feature Extraction controller"]
+        SQC["Spatial Query controller"]
+        FEW["Feature Extraction widget"]
+        OCW["Object Classification widget"]
+        SQW["Spatial Query widget"]
+        PCC["PersistenceController"]
+    end
+    MB(["marks its table busy"])
+    RC(["records its changes"])
+    RL(["prepares and records reloads,<br/>acknowledges writes"])
+    AS[("SpatiatoAppState<br/>dirty paths, busy marks,<br/>reload participants")]
+    PREP(["prepare"])
+    STC(["table_state_changed"])
+    TDC(["table_dirty_state_changed"])
+    TBC(["table_busy_state_changed"])
+    subgraph listeners["Listen to app state"]
+        FEW2["Feature Extraction widget"]
+        OCW2["Object Classification widget"]
+        SQW2["Spatial Query widget"]
+        VW["Viewer widget"]
+        PC["TablePersistenceControls"]
+    end
+
+    FEC & SQC --> MB --> AS
+    FEW & OCW & SQW --> RC --> AS
+    PCC --> RL --> AS
+
+    AS -.-> PREP & STC & TDC & TBC
+    PREP -.-> OCW2 & SQW2
+    STC -.-> FEW2 & OCW2 & SQW2 & VW
+    TDC -.-> PC
+    TBC -.-> PC & FEW2 & SQW2
 ```
 
 Widgets never tell each other about table changes directly: everything they
