@@ -90,7 +90,9 @@ re-check is not caught (accepted).
 changing anything. The widget calls it on the main thread to pick a dialog,
 and `calculate_feature_matrix(...)` calls it again in the worker. It
 raises when no update can succeed: rows that harpy would reject, an unknown
-channel or a missing image, or a backed table that is not in the store.
+channel or a missing image, or a backed table that is not in the store. It
+also raises before a regional update of an unbacked matrix that is not in
+memory.
 
 ```mermaid
 flowchart TD
@@ -105,7 +107,9 @@ flowchart TD
     read_memory --> found{"Matrix found?"}
     found -- no --> absent(["absent<br/>(orphaned_metadata if a<br/>metadata record exists)"])
     found -- yes --> reason{"_incompatibility_reason"}
-    reason -- "None" --> compatible(["compatible"])
+    reason -- "None" --> lazy{"Unbacked, and the matrix<br/>not in memory?"}
+    lazy -- yes --> lazy_error[/"Raise: load it into memory<br/>or write to a store"/]
+    lazy -- no --> compatible(["compatible"])
     reason -- "a reason" --> incompatible
 ```
 
@@ -116,6 +120,16 @@ flowchart TD
 - **The check reads what harpy will merge against.** For backed SpatialData,
   harpy reads the existing entry from the store, so the check does too. Memory
   is only used to detect a matrix that was never saved.
+- **A regional update needs an unbacked matrix in memory.** For unbacked
+  SpatialData, harpy merges a regional update into the attached matrix, and
+  computes the merge only when that matrix is in memory: a NumPy array that is
+  not memory-mapped, or a SciPy CSR/CSC matrix (`is_in_memory_matrix(...)`).
+  Into a Dask, Zarr or memory-mapped array, which may read from storage, it
+  attaches the merge lazily, so every later update chains onto it and keeps its
+  values in memory. The check raises instead, and the message says to load the
+  matrix into memory or write the SpatialData to a store. Absent and
+  incompatible entries give a new matrix, and backed SpatialData ends every
+  write with a fresh read of the store, so nothing chains there.
 
 Reasons for an incompatible entry, in the order they are checked:
 
@@ -186,6 +200,7 @@ flowchart TD
 | Unsaved changes to a stored entry, tracked by Spatiato | –                                          | widget: blocked at launch; headless: the store wins                                      |
 | Changes Spatiato does not track (notebook, other process) | –                                       | the store wins silently (accepted, as in harpy)                                          |
 | Rows invalid, or differ between memory and store       | invalid rows: raise before any change      | raise before any change                                                                  |
+| Compatible matrix not in memory (Dask, Zarr, memory-mapped) | raise before any change               | –: harpy merges from the store and attaches a fresh read                                 |
 | Where the result lands                                 | memory; the widget marks the paths dirty   | store and memory; already persisted                                                      |
 
 ## After the worker
@@ -233,6 +248,7 @@ Classification only invalidates its classifier on `updated`.
 | Rows harpy would reject                                 | `_validate_table_rows`, in the check               | no             | main thread: status; worker: status               | exception  |
 | Unknown channel, missing image                          | channel resolution, in the check                   | no             | the same                                          | exception  |
 | Backed table not in the store                           | the check                                          | no             | the same                                          | exception  |
+| Regional update of a matrix not in memory (unbacked)    | the check                                          | no             | the same                                          | exception  |
 | `FeatureMatrixChangedError`                             | the re-check, kind differs from the confirmed kind | no             | status (active job)                               | –          |
 | Already exists                                          | `overwrite_feature_key=False` with an entry        | no             | not reached: the widget passes the confirmed kind | exception  |
 | Labels element missing or without rows                  | before the removal                                 | no             | status (active job)                               | exception  |
@@ -241,7 +257,7 @@ Classification only invalidates its classifier on `updated`.
 
 ## Temporary parts
 
-Two parts copy or call harpy internals until harpy offers a public check
+These parts copy or call harpy internals until harpy offers a public check
 ([saeyslab/harpy#281](https://github.com/saeyslab/harpy/issues/281)):
 
 - `_incompatibility_reason(...)` and its helpers copy harpy's existing-matrix
@@ -253,14 +269,16 @@ Two parts copy or call harpy internals until harpy offers a public check
   (`_validated_observation_pairs`, `_check_in_memory_versus_storage_axes`).
 
 Once the public check is released, `check_existing_feature_matrix(...)` should
-use it, and both parts can go.
+use it, and these parts can go.
 
 ## Where to find it
 
 - Core: `check_existing_feature_matrix`, `calculate_feature_matrix`,
   `ExistingFeatureMatrix`, `FeatureMatrixCalculation`,
   `FeatureMatrixChangedError` and `FeatureMatrixRemovedError` in
-  [`src/spatiato/core/feature_extraction.py`](../../src/spatiato/core/feature_extraction.py).
+  [`src/spatiato/core/feature_extraction.py`](../../src/spatiato/core/feature_extraction.py);
+  `is_in_memory_matrix` in
+  [`src/spatiato/core/table_matrix.py`](../../src/spatiato/core/table_matrix.py).
 - Headless: `compute_features_for_classifier` in
   [`src/spatiato/headless.py`](../../src/spatiato/headless.py).
 - Widget: `_calculate_feature_matrix` and `_on_controller_feature_matrix_changed`
