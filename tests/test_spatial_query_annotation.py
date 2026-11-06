@@ -8,16 +8,17 @@ from spatialdata import SpatialData
 from spatiato.core.class_palette import default_categorical_colors, default_labeled_class_color
 from spatiato.core.spatial_query import (
     CanonicalCenterQueryResult,
-    CanonicalCentersResult,
     SpatialAnnotationColumnChangedError,
+    SpatialAnnotationPreparation,
     SpatialAnnotationQueryOutdatedError,
-    apply_canonical_cache_update,
     apply_spatial_annotation,
-    build_canonical_cache_update_payload,
     get_compatible_spatial_annotation_column_names,
-    inspect_canonical_cache,
     prepare_spatial_annotation,
     summarize_spatial_annotation,
+)
+from spatiato.core.spatial_query.canonical_centers import (
+    compute_canonical_centers,
+    read_canonical_centers_region,
 )
 
 
@@ -47,7 +48,7 @@ def test_existing_annotation_set_extends_category_and_valid_palette_stably(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1, 2))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1, 2))
     values = [pd.NA] * table.n_obs
     values[1:4] = ["A", "B", "B"]
     table.obs["annotation"] = pd.Categorical(values, categories=["A", "B"], ordered=True)
@@ -78,7 +79,7 @@ def test_positive_integer_annotation_appends_and_retains_vocabulary_and_palette(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1, 2))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1, 2))
     values = [pd.NA] * table.n_obs
     values[:3] = [3, 1, 1]
     table.obs["user_class"] = pd.Categorical(values, categories=[3, 1])
@@ -124,7 +125,7 @@ def test_empty_user_class_retains_positive_integer_semantics_on_first_apply(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 2))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 2))
     table.obs["user_class"] = pd.Categorical([pd.NA] * table.n_obs, categories=[])
 
     preparation = prepare_spatial_annotation(
@@ -148,7 +149,7 @@ def test_annotation_summary_value_must_match_the_prepared_value_kind(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0,))
+    query_result = _query_result(sdata_blobs, matched_positions=(0,))
     table.obs["string_annotation"] = pd.Categorical(["A"] * table.n_obs, categories=["A"])
     table.obs["integer_annotation"] = pd.Categorical([1] * table.n_obs, categories=[1])
 
@@ -183,7 +184,7 @@ def test_prediction_columns_and_new_object_classification_columns_are_rejected(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0,))
+    query_result = _query_result(sdata_blobs, matched_positions=(0,))
     table.obs["pred_class"] = pd.Categorical([1] * table.n_obs, categories=[1])
 
     with pytest.raises(ValueError, match="classifier-owned"):
@@ -222,7 +223,7 @@ def test_remove_annotation_preserves_categories_and_resolves_palette_only_on_eff
     expected_palette: list[str],
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1, 2))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1, 2))
     values = [pd.NA] * table.n_obs
     values[:3] = ["A", pd.NA, "B"]
     table.obs["annotation"] = pd.Categorical(values, categories=["A", "B"])
@@ -251,7 +252,7 @@ def test_new_annotation_column_is_categorical_and_missing_outside_matching_rows(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 2))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 2))
 
     preparation = prepare_spatial_annotation(
         sdata_blobs,
@@ -276,7 +277,7 @@ def test_noop_annotation_does_not_repair_a_missing_palette(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
     table.obs["annotation"] = pd.Categorical(["A"] * table.n_obs, categories=["A"])
     before = table.obs["annotation"].copy(deep=True)
 
@@ -300,7 +301,7 @@ def test_apply_rejects_changed_reviewed_values_without_mutation(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
     table.obs["annotation"] = pd.Categorical(["A"] * table.n_obs, categories=["A", "B"])
     preparation = prepare_spatial_annotation(
         sdata_blobs,
@@ -323,7 +324,7 @@ def test_apply_rejects_changed_canonical_centers_without_mutation(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
     table.obs["annotation"] = pd.Categorical([pd.NA] * table.n_obs, categories=["A"])
     preparation = prepare_spatial_annotation(
         sdata_blobs,
@@ -334,18 +335,63 @@ def test_apply_rejects_changed_canonical_centers_without_mutation(
     summary = summarize_spatial_annotation(preparation, "A")
     table.obsm["spatial_canonical"][0, 1] += 1.0
 
-    with pytest.raises(SpatialAnnotationQueryOutdatedError, match="centers changed"):
+    with pytest.raises(SpatialAnnotationQueryOutdatedError, match="centers of the selected labels element changed"):
         apply_spatial_annotation(sdata_blobs, preparation, summary)
 
     assert table.obs["annotation"].isna().all()
     assert "annotation_colors" not in table.uns
 
 
+def test_apply_rejects_canonical_centers_that_are_no_longer_valid_without_mutation(
+    sdata_blobs: SpatialData,
+) -> None:
+    table = sdata_blobs.tables["table"]
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
+    table.obs["annotation"] = pd.Categorical([pd.NA] * table.n_obs, categories=["A"])
+    preparation = prepare_spatial_annotation(
+        sdata_blobs,
+        query_result=query_result,
+        column_name="annotation",
+        column_mode="existing",
+    )
+    summary = summarize_spatial_annotation(preparation, "A")
+    # A matrix without its record is invalid.
+    del table.uns["spatial_coordinates"]["spatial_canonical"]
+
+    with pytest.raises(SpatialAnnotationQueryOutdatedError, match="no longer valid"):
+        apply_spatial_annotation(sdata_blobs, preparation, summary)
+
+    assert table.obs["annotation"].isna().all()
+
+
+def test_apply_rejects_changed_table_rows_of_the_labels_element_without_mutation(
+    sdata_blobs: SpatialData,
+) -> None:
+    table = sdata_blobs.tables["table"]
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
+    table.obs["annotation"] = pd.Categorical([pd.NA] * table.n_obs, categories=["A"])
+    preparation = prepare_spatial_annotation(
+        sdata_blobs,
+        query_result=query_result,
+        column_name="annotation",
+        column_mode="existing",
+    )
+    summary = summarize_spatial_annotation(preparation, "A")
+    instance_ids = table.obs["instance_id"].to_numpy().copy()
+    instance_ids[[0, 1]] = instance_ids[[1, 0]]
+    table.obs["instance_id"] = instance_ids
+
+    with pytest.raises(SpatialAnnotationQueryOutdatedError, match="table rows of the selected labels element changed"):
+        apply_spatial_annotation(sdata_blobs, preparation, summary)
+
+    assert table.obs["annotation"].isna().all()
+
+
 def test_annotation_assignment_removes_new_column_when_palette_assignment_fails(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0, 1))
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
     preparation = prepare_spatial_annotation(
         sdata_blobs,
         query_result=query_result,
@@ -372,11 +418,35 @@ def test_annotation_assignment_removes_new_column_when_palette_assignment_fails(
     assert "annotation_colors" not in table.uns
 
 
+def test_preparation_rejects_row_positions_that_are_not_the_rows_of_the_matched_instances(
+    sdata_blobs: SpatialData,
+) -> None:
+    query_result = _query_result(sdata_blobs, matched_positions=(0, 1))
+    preparation = prepare_spatial_annotation(
+        sdata_blobs,
+        query_result=query_result,
+        column_name="annotation",
+        column_mode="new",
+    )
+    region = query_result.canonical_centers
+    other_rows = region.row_positions[[2, 3]]
+
+    # The right number of unique rows, but those of other instances.
+    with pytest.raises(ValueError, match="table rows of the matched instance IDs"):
+        SpatialAnnotationPreparation(
+            query_result=query_result,
+            column_name=preparation.column_name,
+            column_mode=preparation.column_mode,
+            row_positions=other_rows,
+            prepared_values=preparation.prepared_values,
+        )
+
+
 def test_prepare_rejects_linkage_and_non_categorical_existing_columns(
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs.tables["table"]
-    query_result = _query_result(sdata_blobs, matched_binding_positions=(0,))
+    query_result = _query_result(sdata_blobs, matched_positions=(0,))
     table.obs["text_annotation"] = "A"
 
     with pytest.raises(ValueError, match="linkage column"):
@@ -398,28 +468,13 @@ def test_prepare_rejects_linkage_and_non_categorical_existing_columns(
 def _query_result(
     sdata: SpatialData,
     *,
-    matched_binding_positions: tuple[int, ...],
+    matched_positions: tuple[int, ...],
 ) -> CanonicalCenterQueryResult:
-    report = inspect_canonical_cache(sdata, table_name="table", labels_name="blobs_labels")
-    centers = np.zeros((report.binding.n_obs, 3), dtype=np.float64)
-    centers[:, 1] = np.arange(report.binding.n_obs, dtype=np.float64)
-    centers[:, 2] = np.arange(report.binding.n_obs, dtype=np.float64) + 0.5
-    cache_update = apply_canonical_cache_update(
-        sdata,
-        build_canonical_cache_update_payload(
-            binding=report.binding,
-            centers=centers,
-            source_signature=report.source_signature,
-        ),
-    )
-    canonical_centers = CanonicalCentersResult(
-        source_signature=report.source_signature,
-        binding=report.binding,
-        centers=centers,
-        cache_update=cache_update,
-    )
-    matching_ids = np.sort(report.binding.instance_ids[list(matched_binding_positions)])
+    """Calculate the table's canonical centers and match the instances at `matched_positions` of `blobs_labels`."""
+    compute_canonical_centers(sdata, table_name="table")
+    region = read_canonical_centers_region(sdata, table_name="table", labels_name="blobs_labels")
+    matching_ids = np.sort(region.instance_ids[list(matched_positions)])
     return CanonicalCenterQueryResult(
-        canonical_centers=canonical_centers,
+        canonical_centers=region,
         matched_instance_ids=matching_ids,
     )
