@@ -47,7 +47,9 @@ class TablePersistenceControls(QWidget):
     Discard / Cancel and then captures one immutable ``TableReloadRequest``.
     Before replacing any in-memory AnnData components,
     ``PersistenceController`` passes that request through ``SpatiatoAppState``.
-    App state calls ``prepare_for_table_reload()`` on every registered workflow.
+    App state first asks every registered workflow whether the reload must
+    wait (``table_reload_blocker()``), and stops with every reason if one does.
+    Otherwise it calls ``prepare_for_table_reload()`` on every workflow.
     Unrelated workflows ignore the request; workflows using the selected table
     stop work that must not survive its replacement. For example, Object
     Classification freezes pending or running classifier work. Only then does
@@ -185,16 +187,11 @@ class TablePersistenceControls(QWidget):
             )
         else:
             table_store_path = self._controller.selected_table_store_path
-            destination = (
-                self._selected_spatialdata.path
-                if table_store_path is None
-                else table_store_path
-            )
+            destination = self._selected_spatialdata.path if table_store_path is None else table_store_path
             has_unsynced_changes = self._controller.has_unsynced_table_changes
             if has_unsynced_changes:
                 write_tooltip = (
-                    f'Write {self._write_content_description} for "{self._selected_table_name}" '
-                    f'to "{destination}".'
+                    f'Write {self._write_content_description} for "{self._selected_table_name}" to "{destination}".'
                 )
             else:
                 write_tooltip = (
