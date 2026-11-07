@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import dask.array as da
 import numpy as np
@@ -50,7 +50,7 @@ PRED_CLASS_COLUMN = "pred_class"
 PRED_CLASS_COLORS_KEY = f"{PRED_CLASS_COLUMN}_colors"
 PRED_CONFIDENCE_COLUMN = "pred_confidence"
 CLASSIFIER_CONFIG_KEY = "classifier_config"
-CLASSIFIER_APPLY_CONFIG_KEY = "classifier_apply_config"
+ClassifierConfigSource = Literal["widget", "apply_classifier"]
 
 
 class ObjectClassificationStateError(ValueError):
@@ -150,6 +150,89 @@ class ClassifierApplyResult:
     applied_at: str
 
 
+def build_classifier_config_entry(
+    *,
+    source: ClassifierConfigSource,
+    pred_class_column: str,
+    pred_confidence_column: str,
+    feature_key: str,
+    prediction_regions: Sequence[str],
+    prediction_timestamp: str,
+    prediction_scope: str | None,
+    classifier_path: str | None,
+    reason: str | None,
+    model_provenance: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Return one entry of `uns["classifier_config"]`.
+
+    `uns["classifier_config"]` maps each prediction class column to one
+    entry: who last wrote that column, and how. The Object Classification
+    widget writes the `pred_class` entry, and `apply_classifier(...)` the
+    entry of its `pred_class_column`. Whoever writes a column replaces its
+    entry (`store_classifier_config_entry(...)`), so no writer removes
+    another's entry. The prediction counts are not stored: the class column
+    within `prediction_regions` holds them.
+
+    Parameters
+    ----------
+    source
+        Who wrote the columns: `"widget"` or `"apply_classifier"`.
+    pred_class_column
+        The column of predicted classes, and the entry's key.
+    pred_confidence_column
+        The column of prediction confidences.
+    feature_key
+        The `obsm` key of the matrix the predictions were computed from.
+    prediction_regions
+        The labels elements whose rows this writer cleared and predicted.
+    prediction_timestamp
+        When the columns were written, in ISO 8601.
+    prediction_scope
+        The widget's prediction scope mode; `None` for `apply_classifier(...)`.
+    classifier_path
+        The exported classifier file `apply_classifier(...)` applied, if
+        given; `None` for the widget.
+    reason
+        Why no model was trained, or `None`.
+    model_provenance
+        How the model was obtained, or `None` when no model was trained:
+        `feature_key` (the key the model was trained on), `model_type`,
+        `rf_params`, `training_scope`, `training_regions`, `n_features`,
+        `training_timestamp`, `n_training_labels` and `class_labels_seen`.
+        The export bundle carries the same mapping.
+    """
+    return {
+        "source": source,
+        "pred_class_column": pred_class_column,
+        "pred_confidence_column": pred_confidence_column,
+        "feature_key": feature_key,
+        "prediction_regions": list(prediction_regions),
+        "prediction_timestamp": prediction_timestamp,
+        "prediction_scope": prediction_scope,
+        "classifier_path": classifier_path,
+        "reason": reason,
+        "model_provenance": None if model_provenance is None else deepcopy(dict(model_provenance)),
+    }
+
+
+def store_classifier_config_entry(table: AnnData, entry: dict[str, object]) -> None:
+    """Store `entry` in `uns["classifier_config"]`, under its prediction class column.
+
+    It replaces the entry of whoever wrote that column before, and leaves the
+    entries of other columns alone.
+    """
+    table.uns.setdefault(CLASSIFIER_CONFIG_KEY, {})[entry["pred_class_column"]] = entry
+
+
+def get_classifier_config_entry(table: AnnData, pred_class_column: str) -> Mapping[str, object] | None:
+    """Return the `uns["classifier_config"]` entry of `pred_class_column`, or `None`."""
+    config = table.uns.get(CLASSIFIER_CONFIG_KEY)
+    if not isinstance(config, Mapping):
+        return None
+    entry = config.get(pred_class_column)
+    return entry if isinstance(entry, Mapping) else None
+
+
 def apply_classifier(
     sdata: SpatialData,
     bundle: ClassifierExportBundle,
@@ -213,10 +296,20 @@ def apply_classifier(
         pred_class_column=resolved_pred_class_column,
         pred_confidence_column=resolved_pred_confidence_column,
     )
-    table.uns[CLASSIFIER_APPLY_CONFIG_KEY] = _build_classifier_apply_config(
-        bundle,
-        result,
-        classifier_path=classifier_path,
+    store_classifier_config_entry(
+        table,
+        build_classifier_config_entry(
+            source="apply_classifier",
+            pred_class_column=result.pred_class_column,
+            pred_confidence_column=result.pred_confidence_column,
+            feature_key=result.feature_key,
+            prediction_regions=result.prediction_regions,
+            prediction_timestamp=result.applied_at,
+            prediction_scope=None,
+            classifier_path=None if classifier_path is None else str(classifier_path),
+            reason=None,
+            model_provenance=bundle.model_provenance,
+        ),
     )
     return result
 
@@ -390,28 +483,6 @@ def _predict_classes_and_confidences(estimator: Any, features: Any) -> tuple[np.
     best = np.argmax(pred_proba, axis=1)
     pred_classes = np.asarray(estimator.classes_.take(best), dtype=np.int64)
     return pred_classes, pred_proba.max(axis=1)
-
-
-def _build_classifier_apply_config(
-    bundle: ClassifierExportBundle,
-    result: ClassifierApplyResult,
-    *,
-    classifier_path: str | Path | None,
-) -> dict[str, object]:
-    """Return `uns["classifier_apply_config"]`: how these predictions were made, and with which model.
-
-    The prediction counts are not stored: the prediction column within
-    `prediction_regions` holds them, and `ClassifierApplyResult` returns them.
-    """
-    return {
-        "apply_timestamp": result.applied_at,
-        "classifier_path": None if classifier_path is None else str(classifier_path),
-        "feature_key": result.feature_key,
-        "prediction_regions": list(result.prediction_regions),
-        "pred_class_column": result.pred_class_column,
-        "pred_confidence_column": result.pred_confidence_column,
-        "source_classifier_config": deepcopy(bundle.source_classifier_config),
-    }
 
 
 def _normalize_nonempty_str(value: str, name: str) -> str:
