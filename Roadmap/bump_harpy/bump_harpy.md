@@ -528,7 +528,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3c.6 | A table is busy while a job writes it (P11), extending 3c.5: app state tracks busy marks per table (`mark_table_busy(...)` returning a token, `release_table_busy(token)`, `table_busy_reasons(...)`) and emits `table_busy_state_changed`. The persistence controls disable Write and Reload while the table is busy, with the reason as tooltip. `write_table_state()` and the first pass of `prepare_for_table_reload()` raise `TableBusyError` as guards, and the controls show it. The reload participant protocol goes back to `prepare_for_table_reload(request)` only: the blocker methods and `check_table_persistence(...)` go. Feature Extraction's controller marks the table busy in `calculate()` and releases it in `_clear_job()`; it stops being a reload participant, so its deferred release and the widget's pending unregister go. Details from the readiness check: the controller gets a required `table_busy_marker=` keyword typed as a narrow `TableBusyMarker` protocol (`mark_table_busy`, `release_table_busy`), which app state implements, so the controller does not depend on app state; required, unlike the callbacks, because a controller without it would silently drop the guard (the widget passes app state; the unit tests construct the controller through a helper that passes a throwaway app state); app state also offers `is_table_busy(...)` and `require_table_not_busy(...)`, which formats 'Table "T" is busy: …' in one place for both guards and the tooltip; busy marks survive loading another SpatialData (the job keeps the old object alive, so its release still finds the mark); Reload needs no check before its dialog, since the button is disabled while busy and the first pass guards a job that starts meanwhile. After the widget closes, superqt keeps the running worker alive, and its signal connections keep the controller alive until `finished`, so the release is reached. Tests: busy marks and the signal in app state; buttons disabled with the reason, and enabled again on release; the guards; Feature Extraction releases the mark when its job returns, errors, or finishes after the widget closed; the 3c.5 tests without the blocker. `docs/development/table_state.md` follows | implemented on 2026-11-06 (busy state instead of polled blockers), after 3c.5. Also in 3c.6: the Spatial Query widget invalidates its Run on the `reloaded` event too, so every participant's hook is a defense (`TableReloadParticipant`); `PersistenceController.write_table_state()` leaves a table without unsaved changes as it is instead of raising `ValueError` |
    | 3c.7 | No job starts on a busy table (P11, point 6): `TableBusyMarker` gains `table_busy_reasons(...)`; Feature Extraction's `calculate()` and Spatial Query's `start_spatial_query()` refuse while another job keeps the table busy; their widgets disable Calculate and Run with 'Table "T" is busy: …' and refresh on `table_busy_state_changed`; the Spatial Query widget checks the centers again when the table is no longer busy. Tests in the controller, widget and status-card modules; the multi-widget reload test accepts Spatial Query's Run before Feature Extraction's job starts. `docs/development/table_state.md` follows | implemented on 2026-11-06, after 3c.2b. Not covered: a query-only Run does not mark the table busy, and jobs on different tables of one store are not serialized (design point 6) |
    | 3d.1 | Object Classification without scanning the matrix (3d design points 1-8 below): the summary reads only `obs` and `uns`, with the column count from `feature_matrix_n_features(...)`; the job carries the matrix object and the row positions instead of copies; the worker reads its rows with `read_matrix_rows(...)`, skips rows without finite features, checks the labeled count and the classes again, and returns an "ineligible" result with its reason when they no longer suffice; the result carries the counts and the predicted row positions, which the prediction write and `uns["classifier_config"]` use (point 5); the status card and the messages report the rows in the scope before a job, and the rows used and skipped after it. Tests: the controller, widget and multi-widget tests listed with the design points change; new tests as listed with the readiness check | implemented on 2026-11-06. `ResolvedClassifierScope` keeps one position array, named `table_row_positions`, now every row of the scope (the old "raw" positions); `raw_table_row_positions` and the eligible counts go. The summary uses `feature_matrix_n_features(...)`; its two "no usable rows" blockers move to the worker. A leaner contract between the main thread and the worker (settled the same day, after a review of the first version): the worker gets only a `ClassifierWorkerInput` (the matrix, the labeled training rows with their labels, the prediction rows, and the region of every row it reads, so it can name a labels element whose rows it all skipped; its docstring states the accepted risk of point 7) and returns only what it computed, a `ClassifierTrainingResult` (predictions with `predicted_row_positions`, the labeled count and classes used, the skipped counts, the estimator) or a `ClassifierIneligibleResult` (reason, labeled count and classes used). `ClassifierJob` stays on the main thread (job ID, feature key, table, summary, worker input) and is bound to the worker's signals, so the handlers combine it with the result; the summary never reaches the worker, the results echo nothing, and `labels_name`, `model_params` and `_active_job` go. `_apply_ineligible_state(feature_key=, table_name=, summary=)` serves both kinds of ineligibility. `_build_classifier_config(...)` takes `n_predicted_rows`. Tests: 19 existing tests updated (a `_fake_training_result(...)` helper in `test_classifier.py`; two tests wrap a fake in a real thread worker to keep the job); new: the summary and the job read no values (a Dask matrix that fails when computed), the worker skips rows without finite features (dense, CSR, CSC), the labeled rows are checked again after skipping, a prediction scope without features is reported by the worker and names its labels element, and the success status names it too |
-   | 3d.2 | Headless `apply_classifier(...)` the same way: it reads only the prediction rows with `read_matrix_rows(...)` and skips rows without finite features; `normalize_feature_matrix(...)`, then without callers, is deleted (point 6). Tests: headless with a lazy matrix and skipped rows | ready, after 3d.1 |
+   | 3d.2 | Headless `apply_classifier(...)` the same way (3d design points 6 and 9-11 below): `_read_rows_with_finite_features(...)` moves to the core, and `apply_classifier(...)` reads only the prediction rows through it, skipping rows without finite features; the estimator width check uses the shape; `normalize_feature_matrix(...)`, then without callers, is deleted; `uns["classifier_apply_config"]` drops `applied`, `table_name`, `n_predicted_rows` and `n_skipped_feature_invalid_rows`. Tests: headless with a lazy matrix, reading only the prediction rows, and the apply-config assertions | implemented on 2026-11-07: `_read_rows_with_finite_features(...)` is in `core/object_classification/classifier.py`, and the widget's worker and headless `apply_classifier(...)` both read through it; `_validate_estimator_matches_feature_matrix(...)` takes the column count; `normalize_feature_matrix(...)` is gone, and with it `feature_matrix_metadata.py`'s now-unused `numpy` import and `issparse` fallback; `_build_classifier_apply_config(...)` writes the seven kept fields. Tests: the apply-config assertions check the exact field set; new: a lazy matrix predicts the same as a NumPy one, and only the prediction rows are read (a Dask matrix whose chunk for `blobs_labels_2` fails when computed) |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
    that order), with 3c.5 and then 3c.6 between 3c.2a and 3c.2b: design
@@ -687,6 +687,44 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    checked again after skipping and the ineligible result that follows, the
    message naming a labels element whose rows were all skipped, the config
    counts, and headless with a lazy matrix and skipped rows.
+
+   Readiness check for 3d.2 (2026-11-07, against the code after 3d.1).
+   Headless `apply_classifier(...)` still reads the whole matrix
+   (`normalize_feature_matrix(..., copy=False)`, then the finite-row mask over
+   every row of the table) and is the last caller of
+   `normalize_feature_matrix(...)`; its estimator width check needs only the
+   shape. Settled the same day:
+   9. **One place reads feature values, in the core.**
+      `_read_rows_with_finite_features(...)` moves from the widget controller
+      to `core/object_classification/classifier.py`, next to
+      `_get_finite_feature_row_mask(...)` and
+      `_predict_classes_and_confidences(...)`; the controller imports it. The
+      core and headless do not import from `spatiato.widgets`
+      (`test_headless_module_avoids_direct_interactive_classifier_imports`).
+   10. **Headless reads only the prediction rows.** `apply_classifier(...)`
+       resolves the prediction scope's rows first and reads only those, with
+       `_read_rows_with_finite_features(...)`; rows without finite features
+       are skipped and cleared, as before. The estimator width check uses
+       `feature_matrix_n_features(...)`. `normalize_feature_matrix(...)` is
+       deleted, and the `feature_matrix_n_features(...)` docstring states its
+       checks without referring to it.
+   11. **The apply config follows design point 5's rule** (no field kept only
+       for compatibility). `uns["classifier_apply_config"]` keeps
+       `apply_timestamp`, `classifier_path`, `feature_key`,
+       `prediction_regions`, `pred_class_column`, `pred_confidence_column`
+       and `source_classifier_config` (how these predictions were made, and
+       with which model). Dropped: `applied` (always `True`), `table_name`
+       (the config lives in that table), `n_predicted_rows` and
+       `n_skipped_feature_invalid_rows` (derivable from the prediction column
+       within `prediction_regions`; `ClassifierApplyResult` still returns both
+       to the caller).
+
+   Tests for 3d.2: the existing headless tests for skipped rows and selected
+   regions keep their assertions; the assertions on the dropped apply-config
+   fields change; new tests: a lazy matrix predicts the same as a NumPy one,
+   and only the prediction rows are read (a Dask matrix whose chunk for the
+   other labels element fails when computed, if the fixture keeps each
+   region's rows contiguous).
 
    Readiness check for 3c.2 (2026-11-05, against harpy 0.5.3). Today the
    centers worker computes without changing anything, and the main thread
@@ -2045,6 +2083,12 @@ Settled on 2026-11-07:
   nothing is kept only for compatibility. `table_name`, `eligible`,
   `roi_mode`, `n_training_rows` and `n_predicted_rows` go;
   `n_labeled_objects` becomes `n_training_labels`.
+- Step 3d.2 readiness check, design points 9-11 (see "Migration Plan", step
+  3): `_read_rows_with_finite_features(...)` moves to the core, so headless
+  `apply_classifier(...)` reads only its prediction rows through it;
+  `normalize_feature_matrix(...)` is deleted; `uns["classifier_apply_config"]`
+  drops `applied`, `table_name`, `n_predicted_rows` and
+  `n_skipped_feature_invalid_rows`.
 
 Settled on 2026-11-06:
 
