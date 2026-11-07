@@ -14,7 +14,6 @@ from spatiato.core.feature_extraction import (
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND
 from spatiato.core.object_classification.annotation import USER_CLASS_COLORS_KEY
 from spatiato.core.object_classification.classifier import (
-    CLASSIFIER_APPLY_CONFIG_KEY,
     CLASSIFIER_CONFIG_KEY,
     ClassifierApplyResult,
     _validate_feature_matrix_compatible_with_bundle,
@@ -109,9 +108,16 @@ def apply_classifier(
     The target table must already contain a compatible feature matrix in
     `.obsm`. When `feature_key` is omitted, the source feature key stored in the
     classifier is used. Predictions are written in place to `table.obs` using
-    `pred_class_column` and `pred_confidence_column`, and apply provenance is
-    recorded in `table.uns["classifier_apply_config"]`. If `sdata` is backed by
+    `pred_class_column` and `pred_confidence_column`, and how they were made
+    is recorded in `table.uns["classifier_config"][pred_class_column]`. That
+    entry replaces the one of whoever wrote the column before; for the default
+    `pred_class`, that may be the Object Classification widget, which then
+    has no model of its own for these predictions. If `sdata` is backed by
     zarr, the updated prediction state is written back to disk automatically.
+
+    The Object Classification widget is not notified when this function
+    changes the SpatialData object it shows. If that object is backed by a
+    zarr store, click Reload in the widget to show the new predictions.
 
     Parameters
     ----------
@@ -133,8 +139,8 @@ def apply_classifier(
     pred_confidence_column
         Column in `table.obs` that will receive prediction confidences.
     classifier_path
-        Optional artifact path to record in `classifier_apply_config`; this
-        does not affect prediction.
+        Optional artifact path to record in the `classifier_config` entry;
+        this does not affect prediction.
 
     The returned `ClassifierApplyResult` summarizes the rows that were written
     and any in-scope rows skipped because of invalid feature values.
@@ -168,7 +174,7 @@ def apply_classifier_from_path(
     This is a convenience wrapper around `load_classifier(...)` and
     `apply_classifier(...)`. The artifact path is passed through as
     `classifier_path`, so it is recorded in
-    `table.uns["classifier_apply_config"]`.
+    `table.uns["classifier_config"][pred_class_column]`.
     """
     classifier = load_classifier(path)
     return apply_classifier(
@@ -210,7 +216,7 @@ def apply_classifier_with_feature_extraction(
 
     If `sdata` is backed by zarr, Harpy persists the feature matrix and feature
     metadata during feature extraction, and `apply_classifier(...)` persists
-    the prediction columns and classifier apply metadata.
+    the prediction columns and their `classifier_config` entry.
 
     Parameters
     ----------
@@ -248,8 +254,8 @@ def apply_classifier_with_feature_extraction(
     pred_confidence_column
         Column in `table.obs` that will receive prediction confidences.
     classifier_path
-        Optional artifact path to record in `classifier_apply_config`; this
-        does not affect feature extraction or prediction.
+        Optional artifact path to record in the `classifier_config` entry;
+        this does not affect feature extraction or prediction.
 
     The returned `ClassifierApplyResult` summarizes the rows that were written
     and any in-scope rows skipped because of invalid feature values.
@@ -295,7 +301,7 @@ def apply_classifier_with_feature_extraction_from_path(
     This is a convenience wrapper around `load_classifier(...)` and
     `apply_classifier_with_feature_extraction(...)`. The artifact path is
     passed through as `classifier_path`, so it is recorded in
-    `table.uns["classifier_apply_config"]`.
+    `table.uns["classifier_config"][pred_class_column]`.
 
     Parameters
     ----------
@@ -540,6 +546,5 @@ def _write_backed_prediction_state_if_needed(sdata: SpatialData, result: Classif
             USER_CLASS_COLORS_KEY,
             f"{result.pred_class_column}_colors",
             CLASSIFIER_CONFIG_KEY,
-            CLASSIFIER_APPLY_CONFIG_KEY,
         ),
     )
