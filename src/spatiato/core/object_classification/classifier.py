@@ -192,7 +192,7 @@ def apply_classifier(
 
     if prediction_positions.size:
         predict_features = feature_matrix[prediction_positions]
-        pred_classes, pred_confidences = _predict_classifier(bundle, predict_features)
+        pred_classes, pred_confidences = _predict_classes_and_confidences(bundle.estimator, predict_features)
     else:
         pred_classes = np.array([], dtype=np.int64)
         pred_confidences = np.array([], dtype=np.float64)
@@ -375,11 +375,17 @@ def _resolve_prediction_regions(
     return normalized_regions
 
 
-def _predict_classifier(bundle: ClassifierExportBundle, predict_features: Any) -> tuple[np.ndarray, np.ndarray]:
-    pred_classes = np.asarray(bundle.estimator.predict(predict_features), dtype=np.int64)
-    pred_proba = np.asarray(bundle.estimator.predict_proba(predict_features), dtype=np.float64)
-    pred_confidences = pred_proba.max(axis=1)
-    return pred_classes, pred_confidences
+def _predict_classes_and_confidences(estimator: Any, features: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return each row's predicted class and its probability, with one pass over the forest.
+
+    For a single-output classifier, `predict(...)` is
+    `classes_[argmax(predict_proba(...))]`, so calling both would run every
+    tree twice.
+    """
+    pred_proba = np.asarray(estimator.predict_proba(features), dtype=np.float64)
+    best = np.argmax(pred_proba, axis=1)
+    pred_classes = np.asarray(estimator.classes_.take(best), dtype=np.int64)
+    return pred_classes, pred_proba.max(axis=1)
 
 
 def _build_classifier_apply_config(

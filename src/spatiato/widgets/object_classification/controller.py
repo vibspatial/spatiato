@@ -8,9 +8,11 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 from qtpy.QtCore import QObject, QTimer
+from scipy.sparse import issparse
 from sklearn.ensemble import RandomForestClassifier
 
 import spatiato.core.object_classification.classifier as _classifier_core
@@ -18,9 +20,9 @@ from spatiato.core.class_palette import normalize_class_values
 from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
     FeatureMatrixMetadataState,
+    feature_matrix_n_features,
     inspect_feature_matrix_metadata,
     normalize_feature_columns,
-    normalize_feature_matrix,
     normalize_feature_matrix_source_kind,
 )
 from spatiato.core.object_classification.annotation import USER_CLASS_COLUMN
@@ -29,6 +31,7 @@ from spatiato.core.object_classification.classifier import (
     _get_feature_metadata,
     _get_finite_feature_row_mask,
     _normalize_prediction_regions,
+    _predict_classes_and_confidences,
     _resolve_region_row_positions,
 )
 from spatiato.core.object_classification.classifier_export import (
@@ -39,6 +42,7 @@ from spatiato.core.object_classification.classifier_export import (
 )
 from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata
+from spatiato.core.table_matrix import read_matrix_rows
 
 
 def _resolve_thread_worker() -> Any:
@@ -104,28 +108,19 @@ class ResolvedClassifierScope:
     """Resolved classifier scope for one training or prediction selection.
 
     ``regions`` is the resolved semantic scope requested by the user, expressed
-    as table region names. ``raw_table_row_positions`` contains all original
-    table row positions in those regions, before feature-validity filtering.
-    ``table_row_positions`` contains the original table row positions that are
-    both in those regions and usable for the selected feature matrix.
+    as table region names. ``table_row_positions`` contains every table row
+    position in those regions, ascending. Whether a row has finite features is
+    known only in the worker, which reads the feature values and skips the
+    rows without.
     """
 
     mode: ClassifierScopeMode
     regions: tuple[str, ...]
-    raw_table_row_positions: TableRowPositions
     table_row_positions: TableRowPositions
 
     @property
     def n_rows_in_regions(self) -> int:
-        return int(self.raw_table_row_positions.size)
-
-    @property
-    def n_eligible_rows(self) -> int:
         return int(self.table_row_positions.size)
-
-    @property
-    def n_excluded_feature_invalid_rows(self) -> int:
-        return self.n_rows_in_regions - self.n_eligible_rows
 
 
 @dataclass(frozen=True)
@@ -138,14 +133,41 @@ class ResolvedClassifierScopes:
 
 @dataclass(frozen=True)
 class ClassifierPreparationSummary:
-    """Describe the current classifier preparation state without worker arrays."""
+    """Describe the classifier inputs before a job, from `obs` and `uns` only.
+
+    It reads no feature values: the column count comes from the matrix's shape.
+    A job's outcome, such as the rows it used after skipping those without
+    finite features, is not stored here: it goes into the classifier config
+    directly (`_build_classifier_config(...)`).
+
+    Parameters
+    ----------
+    training_scope
+        The training scope: its labels elements and their table rows.
+    prediction_scope
+        The prediction scope: its labels elements and their table rows.
+    labeled_count
+        Labeled rows in the training scope, also those without finite features.
+    class_labels
+        The classes of those labeled rows.
+    n_features
+        Column count of the feature matrix, from its shape; `None` when the
+        matrix is missing or cannot be used.
+    training_blocker_reason
+        Why Train is not allowed now, shown to the user; `None` when it is.
+    training_blocker_kind
+        What blocks Train: `"metadata"`, the feature metadata is missing or
+        does not match, and nothing changes; or `"data"`, the selection or
+        the labels do not allow training, and Train clears the scope's
+        predictions and records the reason. `None` when Train is allowed.
+    """
 
     training_scope: ResolvedClassifierScope
     prediction_scope: ResolvedClassifierScope
-    reason: str
     labeled_count: int
     class_labels: tuple[int, ...]
     n_features: int | None
+    training_blocker_reason: str | None = None
     training_blocker_kind: ClassifierTrainingBlockerKind | None = None
 
     def __post_init__(self) -> None:
@@ -154,18 +176,20 @@ class ClassifierPreparationSummary:
             and self.training_blocker_kind not in _CLASSIFIER_TRAINING_BLOCKER_KINDS
         ):
             raise ValueError(f"Unsupported classifier training blocker kind: {self.training_blocker_kind!r}.")
+        if (self.training_blocker_reason is None) != (self.training_blocker_kind is None):
+            raise ValueError("A training blocker needs both a reason and a kind, or neither.")
 
     @property
     def eligible(self) -> bool:
         return self.training_blocker_kind is None
 
     @property
-    def resolved_training_row_count(self) -> int:
-        return self.training_scope.n_eligible_rows
+    def training_row_count(self) -> int:
+        return self.training_scope.n_rows_in_regions
 
     @property
-    def resolved_prediction_row_count(self) -> int:
-        return self.prediction_scope.n_eligible_rows
+    def prediction_row_count(self) -> int:
+        return self.prediction_scope.n_rows_in_regions
 
     @property
     def training_region_count(self) -> int:
@@ -173,17 +197,149 @@ class ClassifierPreparationSummary:
 
 
 @dataclass(frozen=True)
+class ClassifierWorkerInput:
+    """What a classifier worker reads: the feature matrix, the rows to read, and the training labels.
+
+    The input carries the feature matrix object and the row positions to read,
+    not copies. The worker reads only the labeled rows of the training scope
+    and the rows of the prediction scope, with `read_matrix_rows(...)`. For a
+    lazy or backed matrix, only these rows reach memory: an unlabeled row is
+    read only to be predicted, and a row outside both scopes is never read.
+
+    Parameters
+    ----------
+    feature_key
+        Key of the feature matrix in `table.obsm`, for messages.
+    feature_matrix
+        The matrix object from `table.obsm[feature_key]`, as attached: NumPy,
+        SciPy, Dask, or a backed handle.
+    train_row_positions
+        Table row positions of every labeled row in the training scope,
+        including rows without finite features: the worker reads them and
+        skips those.
+    train_labels
+        `user_class` of each row, aligned with `train_row_positions`.
+    train_row_regions
+        Region of each row, aligned with `train_row_positions` (rows without
+        finite features included), so the worker can name a labels element
+        whose labeled rows it all skipped.
+    prediction_row_positions
+        Table row positions of every row in the prediction scope, including
+        rows without finite features: the worker reads them and skips those.
+    prediction_row_regions
+        Region of each row, aligned with `prediction_row_positions` (rows
+        without finite features included), so the worker can name a labels
+        element whose rows it all skipped.
+
+    Notes
+    -----
+    Accepted on purpose: the worker may read the matrix while Feature
+    Extraction rewrites the same key.
+
+    - Unbacked, harpy installs a new matrix, and the job still reads the old
+      one.
+    - Backed, the job reads from the store that harpy is rewriting, so it may
+      read a mix of old and new values, or fail.
+
+    This needs the user to recalculate the very key the classifier uses while
+    training on it, which is rare. The outcome is always visible, never
+    silently wrong:
+
+    - the job is still running when Feature Extraction ends: the "updated"
+      event reaches `invalidate_for_feature_matrix_overwrite(...)`, which
+      discards the job's result, so nothing wrong reaches the table;
+    - the job finished first: its predictions, possibly made from mixed
+      values, stay in the table, and the same call marks the model stale;
+      the next Train replaces the predictions (it does not retrain by itself);
+    - the read failed: `_on_worker_errored(...)` shows "training failed: …"
+      and records the classifier config as not trained.
+
+    It is not prevented: that would need the job to keep the table busy, so
+    that Write and Reload wait for every training run, or Train to wait for a
+    busy table, which does not cover Feature Extraction starting during a job.
+    """
+
+    feature_key: str
+    feature_matrix: Any
+    train_row_positions: TableRowPositions
+    train_labels: np.ndarray
+    train_row_regions: np.ndarray
+    prediction_row_positions: TableRowPositions
+    prediction_row_regions: np.ndarray
+
+    def __post_init__(self) -> None:
+        # The worker applies one mask per scope to these arrays, so they must
+        # align. The positions are not checked against the matrix's shape:
+        # `read_matrix_rows(...)` checks that they lie within it.
+        n_train_rows = len(self.train_row_positions)
+        if len(self.train_labels) != n_train_rows or len(self.train_row_regions) != n_train_rows:
+            raise ValueError("`train_labels` and `train_row_regions` must align with `train_row_positions`.")
+        if len(self.prediction_row_regions) != len(self.prediction_row_positions):
+            raise ValueError("`prediction_row_regions` must align with `prediction_row_positions`.")
+
+    @classmethod
+    def from_summary(
+        cls,
+        summary: ClassifierPreparationSummary,
+        table: AnnData,
+        *,
+        feature_key: str,
+        region_key: str,
+    ) -> ClassifierWorkerInput:
+        """Derive what the worker reads from the summary's scopes, on the main thread.
+
+        Only `obs` is read here, for the labels and the regions; the feature
+        matrix is passed on as the object attached at `table.obsm[feature_key]`.
+        `prediction_row_positions` is the prediction scope's positions array
+        itself, and `train_row_positions` are the labeled rows of the training
+        scope, with their labels.
+        """
+        user_class_values = _get_user_class_values(table.obs)
+        training_user_class_values = user_class_values.iloc[summary.training_scope.table_row_positions]
+        labeled_mask = training_user_class_values.notna().to_numpy()
+        train_row_positions = summary.training_scope.table_row_positions[labeled_mask]
+        prediction_row_positions = summary.prediction_scope.table_row_positions
+        row_regions = np.asarray(table.obs[region_key].to_numpy(), dtype=object)
+        return cls(
+            feature_key=feature_key,
+            feature_matrix=table.obsm[feature_key],
+            train_row_positions=train_row_positions,
+            train_labels=training_user_class_values.iloc[labeled_mask].to_numpy(dtype=np.int64),
+            train_row_regions=row_regions[train_row_positions],
+            prediction_row_positions=prediction_row_positions,
+            prediction_row_regions=row_regions[prediction_row_positions],
+        )
+
+
+@dataclass(frozen=True)
 class ClassifierJob:
-    """Immutable payload copied on the main thread and consumed by a worker."""
+    """One launched classifier job, kept on the main thread.
+
+    The worker gets only `worker_input`; the main thread keeps the rest, and
+    combines it with the worker's result.
+
+    Parameters
+    ----------
+    job_id
+        Identity of the job; a result of an older job is ignored.
+    feature_key
+        Key of the feature matrix in `table.obsm`.
+    table_name
+        Table the job reads, and writes its predictions to.
+    summary
+        The summary the job was launched from: the scopes, and the labeled
+        count and classes before any row is skipped.
+    worker_input
+        What the worker reads, derived from `summary` by
+        `ClassifierWorkerInput.from_summary(...)`; `None` when the summary is
+        not eligible, for a job that never reaches a worker.
+    """
 
     job_id: int
     feature_key: str
-    labels_name: str
     table_name: str
-    predict_features: Any
-    train_features: Any
-    train_labels: np.ndarray
     summary: ClassifierPreparationSummary
+    worker_input: ClassifierWorkerInput | None = None
 
     @property
     def training_scope(self) -> ResolvedClassifierScope:
@@ -195,56 +351,178 @@ class ClassifierJob:
 
 
 @dataclass(frozen=True)
-class ClassifierJobResult:
-    """Predictions produced by a completed training worker."""
+class ClassifierTrainingResult:
+    """What a classifier worker computed when it trained.
 
-    job_id: int
-    feature_key: str
-    labels_name: str
-    table_name: str
+    Parameters
+    ----------
+    trained_at
+        When the model was trained, as an ISO 8601 timestamp in UTC.
+    predicted_row_positions
+        Table row positions of the rows that got a prediction: the rows of the
+        prediction scope with finite features. The other rows of the scope
+        were skipped, and get no prediction.
+    pred_classes
+        Predicted class of each row, aligned with `predicted_row_positions`.
+    pred_confidences
+        Probability of that class for each row, aligned with
+        `predicted_row_positions`. `_update_table_prediction_state(...)`
+        checks both alignments again before it changes the table.
+    labeled_count
+        Labeled rows used for training, after skipping those without finite
+        features.
+    class_labels
+        The classes of those labeled rows.
+    n_skipped_labeled_rows
+        Labeled rows not used for training, because they lack finite features.
+    n_skipped_prediction_rows
+        Rows of the prediction scope that got no prediction, for the same
+        reason.
+    prediction_regions_without_features
+        Labels elements of the prediction scope whose rows were all skipped.
+    estimator
+        The fitted classifier, kept for export. `None` in a result built
+        without one, as in tests; the model then cannot be exported.
+    """
+
+    trained_at: str
+    predicted_row_positions: TableRowPositions
     pred_classes: np.ndarray
     pred_confidences: np.ndarray
-    trained_at: str
-    model_params: dict[str, int]
-    summary: ClassifierPreparationSummary
+    labeled_count: int
+    class_labels: tuple[int, ...]
+    n_skipped_labeled_rows: int = 0
+    n_skipped_prediction_rows: int = 0
+    prediction_regions_without_features: tuple[str, ...] = ()
     estimator: RandomForestClassifier | None = None
 
-    @property
-    def training_scope(self) -> ResolvedClassifierScope:
-        return self.summary.training_scope
+    def __post_init__(self) -> None:
+        # As for `ClassifierWorkerInput`: the arrays must align. The prediction
+        # write checks this again, with the positions against the scope.
+        n_predicted_rows = len(self.predicted_row_positions)
+        if len(self.pred_classes) != n_predicted_rows or len(self.pred_confidences) != n_predicted_rows:
+            raise ValueError("`pred_classes` and `pred_confidences` must align with `predicted_row_positions`.")
 
-    @property
-    def prediction_scope(self) -> ResolvedClassifierScope:
-        return self.summary.prediction_scope
+
+@dataclass(frozen=True)
+class ClassifierIneligibleResult:
+    """What a classifier worker found when too few rows were usable after skipping those without finite features.
+
+    Nothing was trained; `reason` says why, with the counts of the usable rows.
+    """
+
+    reason: str
+
+
+ClassifierWorkerResult = ClassifierTrainingResult | ClassifierIneligibleResult
 
 
 @thread_worker(start_thread=False, ignore_errors=True)
-def _run_classifier_job(job: ClassifierJob) -> ClassifierJobResult:
-    return _fit_classifier_job(job)
+def _run_classifier_job(worker_input: ClassifierWorkerInput) -> ClassifierWorkerResult:
+    return _fit_classifier_job(worker_input)
 
 
 # Keep the synchronous fit/predict logic separate from the `@thread_worker`
 # wrapper above: `_run_classifier_job(...)` returns a worker object, while this
-# function directly computes and returns the eventual `ClassifierJobResult`.
-def _fit_classifier_job(job: ClassifierJob) -> ClassifierJobResult:
-    classifier = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
-    classifier.fit(job.train_features, job.train_labels)
-    pred_classes = np.asarray(classifier.predict(job.predict_features), dtype=np.int64)
-    pred_proba = np.asarray(classifier.predict_proba(job.predict_features), dtype=np.float64)
-    pred_confidences = pred_proba.max(axis=1)
+# function directly computes and returns the eventual result.
+def _fit_classifier_job(worker_input: ClassifierWorkerInput) -> ClassifierWorkerResult:
+    # Rows without finite features (a NaN or ±inf in any column) are skipped:
+    # labels elements without calculated features, table rows without an
+    # object in the labels element, or undefined features.
+    train_features, train_finite = _read_rows_with_finite_features(
+        worker_input.feature_matrix, worker_input.train_row_positions
+    )
+    train_labels = worker_input.train_labels[train_finite]
+    labeled_count = int(train_finite.sum())
+    class_labels = tuple(sorted(int(value) for value in np.unique(train_labels)))
 
-    return ClassifierJobResult(
-        job_id=job.job_id,
-        feature_key=job.feature_key,
-        labels_name=job.labels_name,
-        table_name=job.table_name,
+    # The summary counted every labeled row; check again with the rows used.
+    training_reason = _training_rows_ineligible_reason(worker_input, labeled_count, class_labels, train_finite)
+    if training_reason is not None:
+        return ClassifierIneligibleResult(reason=training_reason)
+
+    prediction_positions = worker_input.prediction_row_positions
+    predict_features, predict_finite = _read_rows_with_finite_features(
+        worker_input.feature_matrix, prediction_positions
+    )
+    prediction_regions_without_features = _regions_without_finite_rows(
+        worker_input.prediction_row_regions, predict_finite
+    )
+    if not predict_finite.any():
+        reason = (
+            f'Feature matrix "{worker_input.feature_key}" has no usable rows in the prediction scope: '
+            f"all {prediction_positions.size} row(s) have non-finite or missing values."
+            f"{_regions_without_features_note(prediction_regions_without_features)}"
+        )
+        return ClassifierIneligibleResult(reason=reason)
+
+    classifier = RandomForestClassifier(**RANDOM_FOREST_PARAMS)
+    classifier.fit(train_features, train_labels)
+    pred_classes, pred_confidences = _predict_classes_and_confidences(classifier, predict_features)
+
+    return ClassifierTrainingResult(
+        trained_at=datetime.now(UTC).isoformat(),
+        predicted_row_positions=np.asarray(prediction_positions[predict_finite], dtype=np.int64),
         pred_classes=pred_classes,
         pred_confidences=pred_confidences,
-        trained_at=datetime.now(UTC).isoformat(),
-        model_params={key: int(value) for key, value in RANDOM_FOREST_PARAMS.items()},
-        summary=job.summary,
+        labeled_count=labeled_count,
+        class_labels=class_labels,
+        n_skipped_labeled_rows=int((~train_finite).sum()),
+        n_skipped_prediction_rows=int((~predict_finite).sum()),
+        prediction_regions_without_features=prediction_regions_without_features,
         estimator=classifier,
     )
+
+
+def _read_rows_with_finite_features(matrix: Any, positions: TableRowPositions) -> tuple[Any, BoolArray]:
+    """Read the rows at `positions` into memory, and return those whose features are all finite, with that mask.
+
+    This is the only place where Object Classification reads feature values,
+    in the worker; the main thread reads none.
+    """
+    # As in `feature_matrix_n_features(...)`, a 1-D matrix counts as one column.
+    if isinstance(matrix, (np.ndarray, da.Array)) and matrix.ndim == 1:
+        matrix = matrix.reshape(-1, 1)
+    # The feature values of these rows are read into memory here.
+    rows = read_matrix_rows(matrix, positions)
+    if not issparse(rows):
+        rows = np.asarray(rows, dtype=np.float64)
+    finite = _get_finite_feature_row_mask(rows)
+    return rows[finite], finite
+
+
+def _regions_without_finite_rows(row_regions: np.ndarray, finite: BoolArray) -> tuple[str, ...]:
+    """Return the regions, in order of appearance, whose rows all lack finite features."""
+    regions_with_finite_rows = set(row_regions[finite].tolist())
+    return tuple(str(region) for region in pd.unique(row_regions) if region not in regions_with_finite_rows)
+
+
+def _regions_without_features_note(regions: tuple[str, ...]) -> str:
+    if not regions:
+        return ""
+    names = ", ".join(f'"{region}"' for region in regions)
+    return f" Labels element(s) {names} have no rows with finite features; were features calculated for them?"
+
+
+def _training_rows_ineligible_reason(
+    worker_input: ClassifierWorkerInput,
+    labeled_count: int,
+    class_labels: tuple[int, ...],
+    train_finite: BoolArray,
+) -> str | None:
+    """Return why the labeled rows with finite features cannot train a classifier, or `None`."""
+    note = _regions_without_features_note(_regions_without_finite_rows(worker_input.train_row_regions, train_finite))
+    if labeled_count < MIN_LABELED_SAMPLES:
+        return (
+            f"Need at least {MIN_LABELED_SAMPLES} labeled samples with finite features before training the "
+            f"classifier: {labeled_count} of {train_finite.size} labeled row(s) have finite features.{note}"
+        )
+    if len(class_labels) < 2:
+        return (
+            "Need at least two labeled classes with finite features before training the classifier: "
+            f"the {labeled_count} labeled row(s) with finite features cover {len(class_labels)} class(es).{note}"
+        )
+    return None
 
 
 def _feature_matrix_metadata_training_blocker_reason(
@@ -303,7 +581,6 @@ class ClassifierController:
         self._latest_requested_job_id = 0
         self._active_worker_job_id: int | None = None
         self._active_worker: Any | None = None
-        self._active_job: ClassifierJob | None = None
         # A snapshot exists only when there is an exportable fitted model.
         # Reasons for missing export state stay separate so the snapshot type
         # never has to represent both success and failure.
@@ -472,7 +749,7 @@ class ClassifierController:
             self._set_status("Classifier: choose an annotation table and feature matrix.", kind="warning")
             return False
         if summary.training_blocker_kind == "metadata":
-            self._set_status(f"Classifier: {summary.reason}", kind="warning")
+            self._set_status(f"Classifier: {summary.training_blocker_reason}", kind="warning")
             return False
 
         self._latest_requested_job_id += 1
@@ -522,7 +799,11 @@ class ClassifierController:
         self._update_idle_status()
 
     def invalidate_for_feature_matrix_overwrite(self, feature_key: str) -> bool:
-        """Invalidate pending work when the selected feature matrix was overwritten in place."""
+        """Invalidate pending work when the selected feature matrix was overwritten in place.
+
+        This also catches a job that read the matrix while Feature Extraction
+        rewrote it, which is accepted on purpose (see `ClassifierJob`).
+        """
         if self._is_shutdown:
             return False
 
@@ -584,26 +865,33 @@ class ClassifierController:
             return
 
         summary = job.summary
-        if not summary.eligible:
+        if summary.training_blocker_reason is not None:
             if summary.training_blocker_kind == "metadata":
-                self._set_status(f"Classifier: {summary.reason}", kind="warning")
+                self._set_status(f"Classifier: {summary.training_blocker_reason}", kind="warning")
                 return
-            self._apply_ineligible_state(job)
+            self._apply_ineligible_state(
+                feature_key=job.feature_key,
+                summary=summary,
+                reason=summary.training_blocker_reason,
+            )
             return
 
         worker = self._create_training_worker(job)
         self._active_worker = worker
-        self._active_job = job
         self._active_worker_job_id = job_id
-        worker.returned.connect(partial(self._on_worker_returned, job_id))
-        worker.errored.connect(partial(self._on_worker_errored, job_id))
-        worker.finished.connect(partial(self._on_worker_finished, job_id))
+        # Only `job.worker_input` goes to the worker, which trains in its own
+        # thread. The job itself stays with these handlers, which Qt runs on
+        # the main thread when the worker's signals arrive; they combine the
+        # job with the worker's result.
+        worker.returned.connect(partial(self._on_worker_returned, job))
+        worker.errored.connect(partial(self._on_worker_errored, job))
+        worker.finished.connect(partial(self._on_worker_finished, job))
         self._set_status(
             (
                 f"Classifier: training RandomForest on {summary.labeled_count} labeled objects "
-                f"across {len(summary.class_labels)} classes from {summary.resolved_training_row_count} "
-                f"eligible rows in {summary.training_region_count} region(s). "
-                f"Prediction scope contains {summary.resolved_prediction_row_count} row(s)."
+                f"across {len(summary.class_labels)} classes from {summary.training_row_count} "
+                f"rows in {summary.training_region_count} region(s). "
+                f"Prediction scope contains {summary.prediction_row_count} row(s)."
             ),
             kind="info",
         )
@@ -615,15 +903,14 @@ class ClassifierController:
         if table is None or metadata is None or self._selected_labels_name is None or self._selected_table_name is None:
             return None
 
-        # Early error paths still need region/count context for status and
-        # summary reporting, even before feature-valid row positions can be
-        # resolved from a concrete feature matrix.
-        pre_feature_scopes = self._resolve_classifier_scopes(table, metadata, feature_valid_row_mask=None)
+        scopes = self._resolve_classifier_scopes(table, metadata)
+        prediction_scope = scopes.prediction
+        training_scope = scopes.training
         if self._selected_feature_key is None:
             return ClassifierPreparationSummary(
-                training_scope=pre_feature_scopes.training,
-                prediction_scope=pre_feature_scopes.prediction,
-                reason="Choose a feature matrix before training the classifier.",
+                training_scope=training_scope,
+                prediction_scope=prediction_scope,
+                training_blocker_reason="Choose a feature matrix before training the classifier.",
                 labeled_count=0,
                 class_labels=(),
                 n_features=None,
@@ -636,9 +923,9 @@ class ClassifierController:
         )
         if feature_matrix_metadata_blocker_reason is not None:
             return ClassifierPreparationSummary(
-                training_scope=pre_feature_scopes.training,
-                prediction_scope=pre_feature_scopes.prediction,
-                reason=feature_matrix_metadata_blocker_reason,
+                training_scope=training_scope,
+                prediction_scope=prediction_scope,
+                training_blocker_reason=feature_matrix_metadata_blocker_reason,
                 labeled_count=0,
                 class_labels=(),
                 n_features=feature_matrix_metadata_state.n_features,
@@ -646,14 +933,15 @@ class ClassifierController:
             )
 
         try:
-            # Preparation only needs counts and validity masks, so avoid copying
-            # the matrix on every widget refresh/status update.
-            feature_matrix = normalize_feature_matrix(table.obsm[self._selected_feature_key], table.n_obs, copy=False)
+            # The summary runs on every refresh, so it reads only the matrix's
+            # shape and dtype, never its values: a lazy or backed matrix stays
+            # unread. Rows without finite features are skipped by the worker.
+            n_features = feature_matrix_n_features(table.obsm[self._selected_feature_key], table.n_obs)
         except KeyError:
             return ClassifierPreparationSummary(
-                training_scope=pre_feature_scopes.training,
-                prediction_scope=pre_feature_scopes.prediction,
-                reason=f'Feature matrix "{self._selected_feature_key}" is not available in ".obsm".',
+                training_scope=training_scope,
+                prediction_scope=prediction_scope,
+                training_blocker_reason=f'Feature matrix "{self._selected_feature_key}" is not available in ".obsm".',
                 labeled_count=0,
                 class_labels=(),
                 n_features=None,
@@ -661,42 +949,22 @@ class ClassifierController:
             )
         except ValueError as error:
             return ClassifierPreparationSummary(
-                training_scope=pre_feature_scopes.training,
-                prediction_scope=pre_feature_scopes.prediction,
-                reason=str(error),
+                training_scope=training_scope,
+                prediction_scope=prediction_scope,
+                training_blocker_reason=str(error),
                 labeled_count=0,
                 class_labels=(),
                 n_features=None,
                 training_blocker_kind="data",
             )
 
-        feature_valid_row_mask = _get_finite_feature_row_mask(feature_matrix)
-        scopes = self._resolve_classifier_scopes(table, metadata, feature_valid_row_mask=feature_valid_row_mask)
-        prediction_scope = scopes.prediction
-        training_scope = scopes.training
-        n_features = int(feature_matrix.shape[1])
-
         if prediction_scope.n_rows_in_regions == 0:
             return ClassifierPreparationSummary(
                 training_scope=training_scope,
                 prediction_scope=prediction_scope,
-                reason=(
+                training_blocker_reason=(
                     f'No table rows for labels element "{self._selected_labels_name}" were found in '
                     f'"{self._selected_table_name}".'
-                ),
-                labeled_count=0,
-                class_labels=(),
-                n_features=n_features,
-                training_blocker_kind="data",
-            )
-
-        if prediction_scope.n_eligible_rows == 0:
-            return ClassifierPreparationSummary(
-                training_scope=training_scope,
-                prediction_scope=prediction_scope,
-                reason=(
-                    f'Feature matrix "{self._selected_feature_key}" has no usable rows in the prediction scope: '
-                    f"all {prediction_scope.n_rows_in_regions} row(s) have non-finite or missing values."
                 ),
                 labeled_count=0,
                 class_labels=(),
@@ -708,24 +976,10 @@ class ClassifierController:
             return ClassifierPreparationSummary(
                 training_scope=training_scope,
                 prediction_scope=prediction_scope,
-                reason=f'Feature matrix "{self._selected_feature_key}" does not contain any columns.',
+                training_blocker_reason=f'Feature matrix "{self._selected_feature_key}" does not contain any columns.',
                 labeled_count=0,
                 class_labels=(),
                 n_features=0,
-                training_blocker_kind="data",
-            )
-
-        if training_scope.n_rows_in_regions > 0 and training_scope.n_eligible_rows == 0:
-            return ClassifierPreparationSummary(
-                training_scope=training_scope,
-                prediction_scope=prediction_scope,
-                reason=(
-                    f'Feature matrix "{self._selected_feature_key}" has no usable rows in the training scope: '
-                    f"all {training_scope.n_rows_in_regions} row(s) have non-finite or missing values."
-                ),
-                labeled_count=0,
-                class_labels=(),
-                n_features=n_features,
                 training_blocker_kind="data",
             )
 
@@ -736,7 +990,6 @@ class ClassifierController:
         summary = ClassifierPreparationSummary(
             training_scope=training_scope,
             prediction_scope=prediction_scope,
-            reason="Ready to train.",
             labeled_count=int(labeled_mask.sum()),
             class_labels=class_labels,
             n_features=n_features,
@@ -744,11 +997,11 @@ class ClassifierController:
 
         if summary.labeled_count < MIN_LABELED_SAMPLES:
             summary = ClassifierPreparationSummary(
-                reason=(
+                training_blocker_reason=(
                     f"Need at least {MIN_LABELED_SAMPLES} labeled samples before training the classifier. "
-                    f"Resolved {summary.resolved_training_row_count} eligible training row(s) across "
+                    f"Resolved {summary.training_row_count} training row(s) across "
                     f"{summary.training_region_count} region(s); {summary.labeled_count} row(s) are labeled. "
-                    f"Prediction scope contains {summary.resolved_prediction_row_count} row(s)."
+                    f"Prediction scope contains {summary.prediction_row_count} row(s)."
                 ),
                 training_scope=summary.training_scope,
                 prediction_scope=summary.prediction_scope,
@@ -759,12 +1012,12 @@ class ClassifierController:
             )
         elif len(summary.class_labels) < 2:
             summary = ClassifierPreparationSummary(
-                reason=(
+                training_blocker_reason=(
                     "Need at least two labeled classes before training the classifier. "
-                    f"Resolved {summary.resolved_training_row_count} eligible training row(s) across "
+                    f"Resolved {summary.training_row_count} training row(s) across "
                     f"{summary.training_region_count} region(s); {summary.labeled_count} row(s) are labeled "
                     f"across {len(summary.class_labels)} class(es). "
-                    f"Prediction scope contains {summary.resolved_prediction_row_count} row(s)."
+                    f"Prediction scope contains {summary.prediction_row_count} row(s)."
                 ),
                 training_scope=summary.training_scope,
                 prediction_scope=summary.prediction_scope,
@@ -788,185 +1041,115 @@ class ClassifierController:
             return None
 
         feature_key = "" if self._selected_feature_key is None else self._selected_feature_key
-        n_features = 0 if summary.n_features is None else int(summary.n_features)
-        empty_features = np.empty((0, n_features), dtype=np.float64)
-        if not summary.eligible or self._selected_feature_key is None:
-            return ClassifierJob(
-                job_id=job_id,
-                feature_key=feature_key,
-                labels_name=self._selected_labels_name,
-                table_name=self._selected_table_name,
-                predict_features=empty_features,
-                train_features=empty_features,
-                train_labels=np.array([], dtype=np.int64),
-                summary=summary,
-            )
-
-        try:
-            # Worker jobs must own an eager snapshot of feature values at launch
-            # time. If `.obsm` later supports lazy arrays, this path should
-            # explicitly materialize them instead of relying on `.copy()`.
-            feature_matrix = normalize_feature_matrix(
-                table.obsm[self._selected_feature_key],
-                table.n_obs,
-                copy=True,
-            )
-        except KeyError:
-            summary = ClassifierPreparationSummary(
-                training_scope=summary.training_scope,
-                prediction_scope=summary.prediction_scope,
-                reason=f'Feature matrix "{self._selected_feature_key}" is not available in ".obsm".',
-                labeled_count=summary.labeled_count,
-                class_labels=summary.class_labels,
-                n_features=None,
-                training_blocker_kind="data",
-            )
-            return ClassifierJob(
-                job_id=job_id,
-                feature_key=feature_key,
-                labels_name=self._selected_labels_name,
-                table_name=self._selected_table_name,
-                predict_features=np.empty((0, 0), dtype=np.float64),
-                train_features=np.empty((0, 0), dtype=np.float64),
-                train_labels=np.array([], dtype=np.int64),
-                summary=summary,
-            )
-        except ValueError as error:
-            summary = ClassifierPreparationSummary(
-                training_scope=summary.training_scope,
-                prediction_scope=summary.prediction_scope,
-                reason=str(error),
-                labeled_count=summary.labeled_count,
-                class_labels=summary.class_labels,
-                n_features=None,
-                training_blocker_kind="data",
-            )
-            return ClassifierJob(
-                job_id=job_id,
-                feature_key=feature_key,
-                labels_name=self._selected_labels_name,
-                table_name=self._selected_table_name,
-                predict_features=np.empty((0, 0), dtype=np.float64),
-                train_features=np.empty((0, 0), dtype=np.float64),
-                train_labels=np.array([], dtype=np.int64),
-                summary=summary,
-            )
-
-        predict_features = feature_matrix[summary.prediction_scope.table_row_positions]
-        user_class_values = _get_user_class_values(table.obs)
-        training_user_class_values = user_class_values.iloc[summary.training_scope.table_row_positions]
-        labeled_mask = training_user_class_values.notna().to_numpy()
-        labeled_training_positions = summary.training_scope.table_row_positions[labeled_mask]
-        train_features = feature_matrix[labeled_training_positions]
-        train_labels = training_user_class_values.iloc[labeled_mask].to_numpy(dtype=np.int64)
-        return ClassifierJob(
+        job = ClassifierJob(
             job_id=job_id,
             feature_key=feature_key,
-            labels_name=self._selected_labels_name,
             table_name=self._selected_table_name,
-            predict_features=predict_features,
-            train_features=train_features,
-            train_labels=train_labels,
             summary=summary,
         )
+        if not summary.eligible or self._selected_feature_key is None or self._selected_table_metadata is None:
+            return job
+
+        # Only the worker reads feature values. Here, on the main thread, only
+        # `obs` is read: the labels and the region of each row.
+        worker_input = ClassifierWorkerInput.from_summary(
+            summary,
+            table,
+            feature_key=feature_key,
+            region_key=self._selected_table_metadata.region_key,
+        )
+        return replace(job, worker_input=worker_input)
 
     def _apply_ineligible_state(
         self,
-        job: ClassifierJob,
+        *,
+        feature_key: str,
+        summary: ClassifierPreparationSummary,
+        reason: str,
     ) -> None:
+        """Clear the scope's predictions and record why the classifier is not trained.
+
+        `summary` gives the scopes. `reason` comes from the summary when it
+        blocks Train before a job, or from a worker that found too few usable
+        rows (`ClassifierIneligibleResult`).
+        """
         table = self._get_bound_table()
         if table is None:
-            self._set_status(f"Classifier: {job.summary.reason}", kind="warning")
+            self._set_status(f"Classifier: {reason}", kind="warning")
             return
 
         prediction_state_change = self._clear_predictions_for_prediction_regions(
             table,
-            job.prediction_scope.regions,
+            summary.prediction_scope.regions,
         )
 
         table.uns[CLASSIFIER_CONFIG_KEY] = self._build_classifier_config(
-            feature_key=job.feature_key,
-            table_name=job.table_name,
-            summary=job.summary,
-            trained=False,
-            trained_at=None,
+            feature_key=feature_key,
+            summary=summary,
+            training=None,
+            reason=reason,
         )
         self._clear_model_snapshot("the latest classifier inputs are not trainable")
         self._notify_prediction_table_state_changed(
-            job.prediction_scope.regions,
+            summary.prediction_scope.regions,
             prediction_state_change,
         )
         self._is_dirty = True
-        self._set_status(f"Classifier: {job.summary.reason}", kind="warning")
+        self._set_status(f"Classifier: {reason}", kind="warning")
 
-    def _on_worker_returned(self, job_id: int, result: ClassifierJobResult) -> None:
-        if self._is_shutdown:
-            return
+    def _is_current_job(self, job: ClassifierJob) -> bool:
+        """Return whether `job` is the latest requested job and its worker is still the active one."""
+        return job.job_id == self._latest_requested_job_id and job.job_id == self._active_worker_job_id
 
-        if job_id != self._latest_requested_job_id or job_id != self._active_worker_job_id:
+    def _on_worker_returned(self, job: ClassifierJob, result: ClassifierWorkerResult) -> None:
+        if self._is_shutdown or not self._is_current_job(job):
             return
 
         table = self._get_bound_table()
         if table is None:
             return
 
+        if isinstance(result, ClassifierIneligibleResult):
+            self._apply_ineligible_state(feature_key=job.feature_key, summary=job.summary, reason=result.reason)
+            return
+
+        # Every row of the scope is cleared; only the rows with finite features
+        # get a prediction.
         apply_result = _classifier_core._write_classifier_predictions(
             table,
-            table_name=result.table_name,
-            feature_key=result.feature_key,
-            prediction_regions=result.prediction_scope.regions,
-            raw_prediction_table_row_positions=result.prediction_scope.raw_table_row_positions,
-            prediction_table_row_positions=result.prediction_scope.table_row_positions,
+            table_name=job.table_name,
+            feature_key=job.feature_key,
+            prediction_regions=job.prediction_scope.regions,
+            raw_prediction_table_row_positions=job.prediction_scope.table_row_positions,
+            prediction_table_row_positions=result.predicted_row_positions,
             pred_classes=result.pred_classes,
             pred_confidences=result.pred_confidences,
         )
         classifier_config = self._build_classifier_config(
-            feature_key=result.feature_key,
-            table_name=result.table_name,
-            summary=result.summary,
-            trained=True,
-            trained_at=result.trained_at,
+            feature_key=job.feature_key,
+            summary=job.summary,
+            training=result,
         )
         table.uns[CLASSIFIER_CONFIG_KEY] = classifier_config
-        self._store_model_snapshot(table, result, classifier_config)
+        self._store_model_snapshot(table, job.feature_key, result, classifier_config)
         self._notify_prediction_table_state_changed(
-            result.prediction_scope.regions,
+            job.prediction_scope.regions,
             apply_result.prediction_state_change,
         )
         self._is_dirty = False
-        self._set_status(
-            f"Classifier: model is up to date. Updated predictions for {apply_result.n_predicted_rows} objects.",
-            kind="success",
-        )
+        self._set_status(_trained_status_message(result, apply_result.n_predicted_rows), kind="success")
 
-    def _on_worker_errored(self, job_id: int, error: Exception) -> None:
-        if self._is_shutdown:
-            return
-
-        if job_id != self._latest_requested_job_id or job_id != self._active_worker_job_id:
+    def _on_worker_errored(self, job: ClassifierJob, error: Exception) -> None:
+        if self._is_shutdown or not self._is_current_job(job):
             return
 
         table = self._get_bound_table()
         if table is not None:
-            active_job = self._active_job
-            if active_job is None:
-                error_summary = ClassifierPreparationSummary(
-                    training_scope=_empty_resolved_classifier_scope(self._selected_training_scope),
-                    prediction_scope=_empty_resolved_classifier_scope(self._selected_prediction_scope),
-                    reason=str(error),
-                    labeled_count=0,
-                    class_labels=(),
-                    n_features=None,
-                    training_blocker_kind="data",
-                )
-            else:
-                error_summary = replace(active_job.summary, reason=str(error), training_blocker_kind="data")
             table.uns[CLASSIFIER_CONFIG_KEY] = self._build_classifier_config(
-                feature_key=None if active_job is None else active_job.feature_key,
-                table_name=None if active_job is None else active_job.table_name,
-                summary=error_summary,
-                trained=False,
-                trained_at=None,
+                feature_key=job.feature_key,
+                summary=job.summary,
+                training=None,
+                reason=str(error),
             )
             self._notify_table_state_changed(
                 frozenset({TableComponentPath("uns", (CLASSIFIER_CONFIG_KEY,))}),
@@ -977,15 +1160,14 @@ class ClassifierController:
         self._clear_model_snapshot("classifier training failed")
         self._set_status(f"Classifier: training failed: {error}", kind="error")
 
-    def _on_worker_finished(self, job_id: int) -> None:
+    def _on_worker_finished(self, job: ClassifierJob) -> None:
         if self._is_shutdown:
             return
 
-        if job_id != self._active_worker_job_id:
+        if job.job_id != self._active_worker_job_id:
             return
 
         self._active_worker = None
-        self._active_job = None
         self._active_worker_job_id = None
         if self._on_state_changed is not None:
             self._on_state_changed()
@@ -1006,16 +1188,16 @@ class ClassifierController:
         if callable(quit_worker):
             quit_worker()
         self._active_worker = None
-        self._active_job = None
         self._active_worker_job_id = None
 
     def _create_training_worker(self, job: ClassifierJob) -> Any:
-        return _run_classifier_job(job)
+        return _run_classifier_job(job.worker_input)
 
     def _store_model_snapshot(
         self,
         table: AnnData,
-        result: ClassifierJobResult,
+        feature_key: str,
+        result: ClassifierTrainingResult,
         classifier_config: dict[str, object],
     ) -> None:
         if result.estimator is None:
@@ -1023,14 +1205,14 @@ class ClassifierController:
             return
 
         try:
-            feature_metadata = _get_feature_metadata(table, result.feature_key)
+            feature_metadata = _get_feature_metadata(table, feature_key)
             feature_columns = normalize_feature_columns(feature_metadata)
             source_kind = normalize_feature_matrix_source_kind(feature_metadata)
             # Export relies on `.uns["feature_matrices"]` for column order, so
             # ensure that metadata still matches the live `.obsm` matrix shape.
             _classifier_core._validate_current_feature_matrix_matches_columns(
                 table,
-                result.feature_key,
+                feature_key,
                 feature_columns,
                 custom_obsm=source_kind == CUSTOM_OBSM_SOURCE_KIND,
             )
@@ -1042,7 +1224,7 @@ class ClassifierController:
             estimator=result.estimator,
             classifier_config=deepcopy(classifier_config),
             feature_metadata=deepcopy(feature_metadata),
-            feature_key=result.feature_key,
+            feature_key=feature_key,
             trained_at=result.trained_at,
         )
         self._model_snapshot_missing_reason = None
@@ -1117,34 +1299,47 @@ class ClassifierController:
             prediction_table_row_positions,
         )
 
+    def _count_predicted_rows(self, table: AnnData, prediction_regions: tuple[str, ...]) -> int:
+        """Return how many rows of `prediction_regions` hold a prediction."""
+        if self._selected_table_metadata is None or PRED_CLASS_COLUMN not in table.obs:
+            return 0
+        positions = _resolve_region_row_positions(
+            table.obs, self._selected_table_metadata.region_key, prediction_regions
+        )
+        return int(table.obs[PRED_CLASS_COLUMN].iloc[positions].notna().sum())
+
     def _build_classifier_config(
         self,
         *,
         feature_key: str | None,
-        table_name: str | None,
         summary: ClassifierPreparationSummary,
-        trained: bool,
-        trained_at: str | None,
+        training: ClassifierTrainingResult | None,
+        reason: str | None = None,
     ) -> dict[str, object]:
+        """Return `uns["classifier_config"]`.
+
+        It holds what the reload status reads, and how the model behind the
+        predictions was obtained: the table holds no estimator. `training` is
+        the trained model's result, or `None` when nothing was trained, with
+        `reason` saying why. `summary` gives the scopes and the column count.
+        `training_timestamp`, `n_training_labels` (the labeled rows the model
+        was trained on) and `class_labels_seen` describe the trained model:
+        `None`, 0 and `[]` when nothing was trained.
+        """
         return {
-            "model_type": "RandomForestClassifier",
+            "trained": training is not None,
+            "reason": None if training is not None else reason,
             "feature_key": feature_key,
-            "table_name": table_name,
-            "roi_mode": "none",
-            "trained": trained,
-            "eligible": summary.eligible,
-            "reason": summary.reason,
-            "training_timestamp": trained_at,
-            "n_labeled_objects": summary.labeled_count,
-            "n_features": summary.n_features,
-            "class_labels_seen": list(summary.class_labels),
+            "prediction_scope": summary.prediction_scope.mode,
+            "prediction_regions": list(summary.prediction_scope.regions),
+            "model_type": "RandomForestClassifier",
             "rf_params": dict(RANDOM_FOREST_PARAMS),
             "training_scope": summary.training_scope.mode,
             "training_regions": list(summary.training_scope.regions),
-            "n_training_rows": summary.resolved_training_row_count,
-            "prediction_scope": summary.prediction_scope.mode,
-            "prediction_regions": list(summary.prediction_scope.regions),
-            "n_predicted_rows": summary.resolved_prediction_row_count,
+            "n_features": summary.n_features,
+            "training_timestamp": None if training is None else training.trained_at,
+            "n_training_labels": 0 if training is None else training.labeled_count,
+            "class_labels_seen": [] if training is None else list(training.class_labels),
         }
 
     def _set_status(self, message: str, *, kind: str) -> None:
@@ -1242,16 +1437,6 @@ class ClassifierController:
                 f'loaded predictions use feature matrix "{config_feature_key}" but "{self._selected_feature_key}" is selected'
             )
 
-        config_table_name = config.get("table_name")
-        if (
-            isinstance(config_table_name, str)
-            and self._selected_table_name is not None
-            and config_table_name != self._selected_table_name
-        ):
-            mismatches.append(
-                f'loaded predictions target table "{config_table_name}" but "{self._selected_table_name}" is selected'
-            )
-
         config_prediction_scope = config.get("prediction_scope")
         if not isinstance(config_prediction_scope, str):
             mismatches.append("loaded predictions do not describe their prediction scope")
@@ -1271,21 +1456,15 @@ class ClassifierController:
 
         trained = config.get("trained")
         if trained is True:
-            predicted_count = config.get("n_predicted_rows")
-            if isinstance(predicted_count, int):
-                self._set_status(
-                    f"Classifier: model is up to date. Loaded predictions for {predicted_count} objects from disk.",
-                    kind="success",
-                )
-            else:
-                self._set_status("Classifier: model is up to date. Loaded predictions from disk.", kind="success")
+            # Counted from the table, which holds the predictions themselves.
+            predicted_count = self._count_predicted_rows(table, config_prediction_regions)
+            self._set_status(
+                f"Classifier: model is up to date. Loaded predictions for {predicted_count} objects from disk.",
+                kind="success",
+            )
             return
 
-        eligible = config.get("eligible")
         reason = config.get("reason")
-        if eligible is False and isinstance(reason, str) and reason:
-            self._set_status(f"Classifier: {reason}", kind="warning")
-            return
         if trained is False and isinstance(reason, str) and reason:
             self._set_status(f"Classifier: {reason}", kind="warning")
             return
@@ -1296,8 +1475,6 @@ class ClassifierController:
         self,
         table: AnnData,
         metadata: SpatialDataTableMetadata,
-        *,
-        feature_valid_row_mask: BoolArray | None,
     ) -> ResolvedClassifierScopes:
         def resolve_one_scope(scope_mode: ClassifierScopeMode) -> ResolvedClassifierScope:
             if scope_mode == "selected_segmentation_only":
@@ -1307,22 +1484,10 @@ class ClassifierController:
             else:  # pragma: no cover - guarded by _normalize_scope_mode
                 raise ValueError(f"Unsupported classifier scope mode: {scope_mode!r}")
 
-            raw_table_row_positions = _resolve_region_row_positions(
-                table.obs,
-                metadata.region_key,
-                regions,
-            )
-            if feature_valid_row_mask is None or raw_table_row_positions.size == 0:
-                table_row_positions = np.array([], dtype=np.int64)
-            else:
-                valid_in_scope_mask = feature_valid_row_mask[raw_table_row_positions]
-                table_row_positions = np.asarray(raw_table_row_positions[valid_in_scope_mask], dtype=np.int64)
-
             return ResolvedClassifierScope(
                 mode=scope_mode,
                 regions=regions,
-                raw_table_row_positions=raw_table_row_positions,
-                table_row_positions=table_row_positions,
+                table_row_positions=_resolve_region_row_positions(table.obs, metadata.region_key, regions),
             )
 
         return ResolvedClassifierScopes(
@@ -1337,13 +1502,19 @@ def _normalize_scope_mode(scope_mode: ClassifierScopeMode | str) -> ClassifierSc
     raise ValueError(f"Unsupported classifier scope mode: {scope_mode!r}")
 
 
-def _empty_resolved_classifier_scope(mode: ClassifierScopeMode) -> ResolvedClassifierScope:
-    return ResolvedClassifierScope(
-        mode=mode,
-        regions=(),
-        raw_table_row_positions=np.array([], dtype=np.int64),
-        table_row_positions=np.array([], dtype=np.int64),
-    )
+def _trained_status_message(result: ClassifierTrainingResult, n_predicted_rows: int) -> str:
+    message = f"Classifier: model is up to date. Updated predictions for {n_predicted_rows} objects."
+    if result.n_skipped_prediction_rows:
+        message += (
+            f" Skipped {result.n_skipped_prediction_rows} row(s) without finite features, "
+            "which get no prediction."
+            f"{_regions_without_features_note(result.prediction_regions_without_features)}"
+        )
+    if result.n_skipped_labeled_rows:
+        message += (
+            f" {result.n_skipped_labeled_rows} labeled row(s) without finite features were not used for training."
+        )
+    return message
 
 
 def _get_user_class_values(obs: pd.DataFrame) -> pd.Series:

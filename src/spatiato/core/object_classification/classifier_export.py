@@ -41,39 +41,9 @@ class ClassifierExportBundle:
         return normalize_required_str(self.source_classifier_config, "feature_key")
 
     @property
-    def source_table_name(self) -> str:
-        """Return the source table used for training."""
-        return normalize_required_str(self.source_classifier_config, "table_name")
-
-    @property
     def class_labels_seen(self) -> tuple[int, ...]:
         """Return the class labels observed during training."""
         return normalize_int_tuple(self.source_classifier_config, "class_labels_seen")
-
-    @property
-    def rf_params(self) -> dict[str, object]:
-        """Return the RandomForest parameters recorded at training time."""
-        return normalize_mapping(self.source_classifier_config, "rf_params")
-
-    @property
-    def source_training_scope(self) -> str:
-        """Return the source training scope mode."""
-        return normalize_required_str(self.source_classifier_config, "training_scope")
-
-    @property
-    def source_training_regions(self) -> tuple[str, ...]:
-        """Return the source training regions."""
-        return normalize_str_tuple(self.source_classifier_config, "training_regions")
-
-    @property
-    def source_prediction_scope(self) -> str:
-        """Return the source prediction scope mode."""
-        return normalize_required_str(self.source_classifier_config, "prediction_scope")
-
-    @property
-    def source_prediction_regions(self) -> tuple[str, ...]:
-        """Return the source prediction regions."""
-        return normalize_str_tuple(self.source_classifier_config, "prediction_regions")
 
     @property
     def feature_columns(self) -> tuple[str, ...]:
@@ -163,25 +133,9 @@ def normalize_required_str(mapping: Mapping[str, object], key: str) -> str:
     return value
 
 
-def normalize_mapping(mapping: Mapping[str, object], key: str) -> dict[str, object]:
-    """Return a copied mapping value from a metadata mapping."""
-    value = mapping.get(key)
-    if not isinstance(value, Mapping):
-        raise ValueError(f"Classifier export metadata is missing required mapping `{key}`.")
-    return dict(value)
-
-
 def normalize_int_tuple(mapping: Mapping[str, object], key: str) -> tuple[int, ...]:
     """Return a tuple of integer values from a metadata mapping."""
     return tuple(int(value) for value in _normalize_sequence(mapping, key))
-
-
-def normalize_str_tuple(mapping: Mapping[str, object], key: str) -> tuple[str, ...]:
-    """Return a tuple of string values from a metadata mapping."""
-    values = tuple(str(value) for value in _normalize_sequence(mapping, key))
-    if any(not value for value in values):
-        raise ValueError(f"Classifier export metadata `{key}` must not contain empty strings.")
-    return values
 
 
 def normalize_feature_names(feature_metadata: Mapping[str, object]) -> tuple[str, ...]:
