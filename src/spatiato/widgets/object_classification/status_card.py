@@ -200,12 +200,12 @@ def build_object_classification_classifier_preparation_card_spec(
     lines = [
         f"Training annotations: {_format_count(summary.labeled_count, 'row')}",
         f"Training elements: {_format_count(summary.training_region_count, 'labels element', 'labels elements')}",
-        f"Prediction rows: {_format_count(summary.resolved_prediction_row_count, 'row')}",
+        f"Prediction rows: {_format_count(summary.prediction_row_count, 'row')}",
         f"Prediction scope: {_format_prediction_scope(summary)}",
         _format_feature_matrix_line(feature_key_text, summary.n_features),
     ]
-    if not summary.eligible and summary.reason:
-        lines.append(summary.reason)
+    if summary.training_blocker_reason is not None:
+        lines.append(summary.training_blocker_reason)
     if hidden_prediction_regions:
         lines.append("Some prediction updates may not be visible in the current selection.")
 

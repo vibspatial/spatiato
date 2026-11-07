@@ -1508,8 +1508,11 @@ class ObjectClassificationWidget(QWidget):
             tooltip = "Choose a feature matrix before training the classifier."
         elif self._classifier_controller.is_training:
             tooltip = "A classifier training job is currently running."
-        elif classifier_preparation_summary is not None and not classifier_preparation_summary.eligible:
-            tooltip = classifier_preparation_summary.reason
+        elif (
+            classifier_preparation_summary is not None
+            and classifier_preparation_summary.training_blocker_reason is not None
+        ):
+            tooltip = classifier_preparation_summary.training_blocker_reason
         elif self._classifier_controller.is_dirty:
             tooltip = "The classifier model is stale. Click Train Classifier to refresh predictions."
         else:
