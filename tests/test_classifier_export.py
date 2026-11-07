@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import joblib
 import numpy as np
 import pytest
 from sklearn.ensemble import RandomForestClassifier
 
 from spatiato.core.object_classification.classifier_export import (
+    CLASSIFIER_EXPORT_BUNDLE_TYPE,
     CLASSIFIER_EXPORT_SCHEMA_VERSION,
     ClassifierExportBundle,
+    read_classifier_export_bundle,
 )
 
 _MISSING = object()
@@ -32,19 +37,35 @@ def _make_bundle(*, source_channels: object = _MISSING) -> ClassifierExportBundl
         spatiato_version="0.0.0-test",
         sklearn_version=None,
         estimator=estimator,
-        source_classifier_config={
-            "model_type": "RandomForestClassifier",
+        model_provenance={
             "feature_key": "features_cd3_cd8a",
-            "table_name": "table",
+            "model_type": "RandomForestClassifier",
+            "rf_params": {"n_estimators": 5, "random_state": 0, "n_jobs": 1},
             "training_scope": "all",
             "training_regions": ["labels"],
-            "prediction_scope": "all",
-            "prediction_regions": ["labels"],
+            "n_features": 2,
+            "training_timestamp": "2026-05-05T09:00:00+00:00",
+            "n_training_labels": 2,
             "class_labels_seen": [1, 2],
-            "rf_params": {"n_estimators": 5, "random_state": 0, "n_jobs": 1},
         },
         source_feature_metadata=source_feature_metadata,
     )
+
+
+def test_read_classifier_export_bundle_refuses_an_older_schema_version(tmp_path: Path) -> None:
+    path = tmp_path / "old.spatiato-classifier.joblib"
+    # Version 1 named the provenance `source_classifier_config`; the version is checked first.
+    joblib.dump(
+        {
+            "bundle_type": CLASSIFIER_EXPORT_BUNDLE_TYPE,
+            "schema_version": 1,
+            "source_classifier_config": {"model_type": "RandomForestClassifier"},
+        },
+        path,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported classifier export schema version: 1. Expected 2."):
+        read_classifier_export_bundle(path)
 
 
 def test_classifier_export_bundle_source_channels_missing_is_none() -> None:
