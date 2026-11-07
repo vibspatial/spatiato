@@ -14,36 +14,59 @@ from spatiato import __version__ as spatiato_version
 from spatiato.core.feature_matrix_metadata import normalize_feature_columns
 
 CLASSIFIER_EXPORT_BUNDLE_TYPE = "spatiato_classifier"
-CLASSIFIER_EXPORT_SCHEMA_VERSION = 1
+CLASSIFIER_EXPORT_SCHEMA_VERSION = 2
 DEFAULT_CLASSIFIER_EXPORT_SUFFIX = ".spatiato-classifier.joblib"
 
 
 @dataclass(frozen=True)
 class ClassifierExportBundle:
-    """A fitted classifier plus the source feature schema needed to reuse it."""
+    """A fitted classifier plus the source feature schema needed to reuse it.
+
+    Parameters
+    ----------
+    schema_version
+        The version of this bundle's layout.
+    created_at
+        When the bundle was exported, in ISO 8601.
+    spatiato_version
+        The Spatiato version that exported it.
+    sklearn_version
+        The scikit-learn version that fitted the estimator.
+    estimator
+        The fitted model itself.
+    model_provenance
+        How the model was obtained, as recorded in the widget's
+        `uns["classifier_config"]` entry: `feature_key` (the key it was
+        trained on), `model_type`, `rf_params`, `training_scope`,
+        `training_regions`, `n_features`, `training_timestamp`,
+        `n_training_labels` and `class_labels_seen`.
+    source_feature_metadata
+        The training matrix's feature metadata: its columns and how they were
+        calculated.
+    """
 
     schema_version: int
     created_at: str
     spatiato_version: str | None
     sklearn_version: str | None
     estimator: RandomForestClassifier
-    source_classifier_config: dict[str, object]
+    model_provenance: dict[str, object]
     source_feature_metadata: dict[str, object]
 
     @property
     def model_type(self) -> str:
         """Return the classifier model type recorded at training time."""
-        return normalize_required_str(self.source_classifier_config, "model_type")
+        return normalize_required_str(self.model_provenance, "model_type")
 
     @property
     def feature_key(self) -> str:
         """Return the source feature matrix key used for training."""
-        return normalize_required_str(self.source_classifier_config, "feature_key")
+        return normalize_required_str(self.model_provenance, "feature_key")
 
     @property
     def class_labels_seen(self) -> tuple[int, ...]:
         """Return the class labels observed during training."""
-        return normalize_int_tuple(self.source_classifier_config, "class_labels_seen")
+        return normalize_int_tuple(self.model_provenance, "class_labels_seen")
 
     @property
     def feature_columns(self) -> tuple[str, ...]:
@@ -78,10 +101,9 @@ class ClassifierModelSnapshot:
     """In-memory fitted model snapshot owned by the widget controller."""
 
     estimator: RandomForestClassifier
-    classifier_config: dict[str, object]
+    model_provenance: dict[str, object]
     feature_metadata: dict[str, object]
     feature_key: str
-    trained_at: str
 
     @property
     def feature_columns(self) -> tuple[str, ...]:
@@ -101,7 +123,7 @@ def build_classifier_export_bundle(
         spatiato_version=spatiato_version,
         sklearn_version=sklearn_version,
         estimator=snapshot.estimator,
-        source_classifier_config=deepcopy(snapshot.classifier_config),
+        model_provenance=deepcopy(snapshot.model_provenance),
         source_feature_metadata=deepcopy(snapshot.feature_metadata),
     )
     _validate_export_bundle(bundle)
@@ -188,12 +210,16 @@ def _coerce_metadata_sequence(value: object) -> object:
     return value
 
 
-def _validate_export_bundle(bundle: ClassifierExportBundle) -> None:
-    if bundle.schema_version != CLASSIFIER_EXPORT_SCHEMA_VERSION:
+def _validate_schema_version(schema_version: object) -> None:
+    if schema_version != CLASSIFIER_EXPORT_SCHEMA_VERSION:
         raise ValueError(
-            f"Unsupported classifier export schema version: {bundle.schema_version!r}. "
+            f"Unsupported classifier export schema version: {schema_version!r}. "
             f"Expected {CLASSIFIER_EXPORT_SCHEMA_VERSION}."
         )
+
+
+def _validate_export_bundle(bundle: ClassifierExportBundle) -> None:
+    _validate_schema_version(bundle.schema_version)
     if not isinstance(bundle.estimator, RandomForestClassifier):
         raise ValueError("Classifier export bundle estimator must be a RandomForestClassifier.")
     if bundle.model_type != "RandomForestClassifier":
@@ -216,7 +242,7 @@ def _bundle_to_payload(bundle: ClassifierExportBundle) -> dict[str, object]:
         "created_at": bundle.created_at,
         "spatiato_version": bundle.spatiato_version,
         "sklearn_version": bundle.sklearn_version,
-        "source_classifier_config": deepcopy(bundle.source_classifier_config),
+        "model_provenance": deepcopy(bundle.model_provenance),
         "source_feature_metadata": deepcopy(bundle.source_feature_metadata),
         "estimator": bundle.estimator,
     }
@@ -227,16 +253,19 @@ def _payload_to_bundle(payload: Mapping[str, object]) -> ClassifierExportBundle:
     if bundle_type != CLASSIFIER_EXPORT_BUNDLE_TYPE:
         raise ValueError(f"Unsupported classifier artifact type: {bundle_type!r}.")
 
-    source_classifier_config = payload.get("source_classifier_config")
-    if not isinstance(source_classifier_config, Mapping):
-        raise ValueError("Classifier artifact is missing `source_classifier_config` metadata.")
+    # Checked before the payload fields, whose names depend on the version.
+    schema_version = payload.get("schema_version")
+    if not isinstance(schema_version, int):
+        raise ValueError("Classifier artifact is missing integer `schema_version`.")
+    _validate_schema_version(schema_version)
+
+    model_provenance = payload.get("model_provenance")
+    if not isinstance(model_provenance, Mapping):
+        raise ValueError("Classifier artifact is missing `model_provenance` metadata.")
     source_feature_metadata = payload.get("source_feature_metadata")
     if not isinstance(source_feature_metadata, Mapping):
         raise ValueError("Classifier artifact is missing `source_feature_metadata` metadata.")
 
-    schema_version = payload.get("schema_version")
-    if not isinstance(schema_version, int):
-        raise ValueError("Classifier artifact is missing integer `schema_version`.")
     created_at = payload.get("created_at")
     if not isinstance(created_at, str) or not created_at:
         raise ValueError("Classifier artifact is missing string `created_at`.")
@@ -257,7 +286,7 @@ def _payload_to_bundle(payload: Mapping[str, object]) -> ClassifierExportBundle:
         spatiato_version=napari_version,
         sklearn_version=sklearn_artifact_version,
         estimator=estimator,
-        source_classifier_config=dict(source_classifier_config),
+        model_provenance=dict(model_provenance),
         source_feature_metadata=dict(source_feature_metadata),
     )
     _validate_export_bundle(bundle)

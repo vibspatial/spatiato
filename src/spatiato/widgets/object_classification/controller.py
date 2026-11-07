@@ -31,6 +31,9 @@ from spatiato.core.object_classification.classifier import (
     _predict_classes_and_confidences,
     _read_rows_with_finite_features,
     _resolve_region_row_positions,
+    build_classifier_config_entry,
+    get_classifier_config_entry,
+    store_classifier_config_entry,
 )
 from spatiato.core.object_classification.classifier_export import (
     ClassifierExportBundle,
@@ -75,10 +78,7 @@ RANDOM_FOREST_PARAMS = {
 }
 
 ClassifierScopeMode = Literal["selected_segmentation_only", "all"]
-ClassifierTableStateChangeSource = Literal[
-    "object_classification_inference",
-    "object_classification_metadata",
-]
+ClassifierTableStateChangeSource = Literal["object_classification_inference"]
 DEFAULT_TRAINING_SCOPE: ClassifierScopeMode = "all"
 DEFAULT_PREDICTION_SCOPE: ClassifierScopeMode = "selected_segmentation_only"
 
@@ -135,7 +135,7 @@ class ClassifierPreparationSummary:
     It reads no feature values: the column count comes from the matrix's shape.
     A job's outcome, such as the rows it used after skipping those without
     finite features, is not stored here: it goes into the classifier config
-    directly (`_build_classifier_config(...)`).
+    entry directly (`_build_widget_config_entry(...)`).
 
     Parameters
     ----------
@@ -145,8 +145,11 @@ class ClassifierPreparationSummary:
         The prediction scope: its labels elements and their table rows.
     labeled_count
         Labeled rows in the training scope, also those without finite features.
+        The worker skips those, so the training result's `n_training_labels`
+        can be lower.
     class_labels
-        The classes of those labeled rows.
+        The classes of those labeled rows; the training result's
+        `class_labels_seen` can have fewer.
     n_features
         Column count of the feature matrix, from its shape; `None` when the
         matrix is missing or cannot be used.
@@ -249,7 +252,7 @@ class ClassifierWorkerInput:
       values, stay in the table, and the same call marks the model stale;
       the next Train replaces the predictions (it does not retrain by itself);
     - the read failed: `_on_worker_errored(...)` shows "training failed: …"
-      and records the classifier config as not trained.
+      and marks the model stale, leaving the table as it was.
 
     It is not prevented: that would need the job to keep the table busy, so
     that Write and Reload wait for every training run, or Train to wait for a
@@ -351,9 +354,13 @@ class ClassifierJob:
 class ClassifierTrainingResult:
     """What a classifier worker computed when it trained.
 
+    `training_timestamp`, `n_training_labels` and `class_labels_seen` are
+    recorded as is, under the same names, in the classifier config entry's
+    `model_provenance` (`_build_model_provenance(...)`).
+
     Parameters
     ----------
-    trained_at
+    training_timestamp
         When the model was trained, as an ISO 8601 timestamp in UTC.
     predicted_row_positions
         Table row positions of the rows that got a prediction: the rows of the
@@ -365,10 +372,10 @@ class ClassifierTrainingResult:
         Probability of that class for each row, aligned with
         `predicted_row_positions`. `_update_table_prediction_state(...)`
         checks both alignments again before it changes the table.
-    labeled_count
-        Labeled rows used for training, after skipping those without finite
-        features.
-    class_labels
+    n_training_labels
+        Labeled rows the model was trained on: the summary's `labeled_count`,
+        minus those without finite features.
+    class_labels_seen
         The classes of those labeled rows.
     n_skipped_labeled_rows
         Labeled rows not used for training, because they lack finite features.
@@ -382,12 +389,12 @@ class ClassifierTrainingResult:
         without one, as in tests; the model then cannot be exported.
     """
 
-    trained_at: str
+    training_timestamp: str
     predicted_row_positions: TableRowPositions
     pred_classes: np.ndarray
     pred_confidences: np.ndarray
-    labeled_count: int
-    class_labels: tuple[int, ...]
+    n_training_labels: int
+    class_labels_seen: tuple[int, ...]
     n_skipped_labeled_rows: int = 0
     n_skipped_prediction_rows: int = 0
     prediction_regions_without_features: tuple[str, ...] = ()
@@ -430,11 +437,11 @@ def _fit_classifier_job(worker_input: ClassifierWorkerInput) -> ClassifierWorker
         worker_input.feature_matrix, worker_input.train_row_positions
     )
     train_labels = worker_input.train_labels[train_finite]
-    labeled_count = int(train_finite.sum())
-    class_labels = tuple(sorted(int(value) for value in np.unique(train_labels)))
+    n_training_labels = int(train_finite.sum())
+    class_labels_seen = tuple(sorted(int(value) for value in np.unique(train_labels)))
 
     # The summary counted every labeled row; check again with the rows used.
-    training_reason = _training_rows_ineligible_reason(worker_input, labeled_count, class_labels, train_finite)
+    training_reason = _training_rows_ineligible_reason(worker_input, n_training_labels, class_labels_seen, train_finite)
     if training_reason is not None:
         return ClassifierIneligibleResult(reason=training_reason)
 
@@ -458,12 +465,12 @@ def _fit_classifier_job(worker_input: ClassifierWorkerInput) -> ClassifierWorker
     pred_classes, pred_confidences = _predict_classes_and_confidences(classifier, predict_features)
 
     return ClassifierTrainingResult(
-        trained_at=datetime.now(UTC).isoformat(),
+        training_timestamp=datetime.now(UTC).isoformat(),
         predicted_row_positions=np.asarray(prediction_positions[predict_finite], dtype=np.int64),
         pred_classes=pred_classes,
         pred_confidences=pred_confidences,
-        labeled_count=labeled_count,
-        class_labels=class_labels,
+        n_training_labels=n_training_labels,
+        class_labels_seen=class_labels_seen,
         n_skipped_labeled_rows=int((~train_finite).sum()),
         n_skipped_prediction_rows=int((~predict_finite).sum()),
         prediction_regions_without_features=prediction_regions_without_features,
@@ -486,21 +493,22 @@ def _regions_without_features_note(regions: tuple[str, ...]) -> str:
 
 def _training_rows_ineligible_reason(
     worker_input: ClassifierWorkerInput,
-    labeled_count: int,
-    class_labels: tuple[int, ...],
+    n_training_labels: int,
+    class_labels_seen: tuple[int, ...],
     train_finite: BoolArray,
 ) -> str | None:
     """Return why the labeled rows with finite features cannot train a classifier, or `None`."""
     note = _regions_without_features_note(_regions_without_finite_rows(worker_input.train_row_regions, train_finite))
-    if labeled_count < MIN_LABELED_SAMPLES:
+    if n_training_labels < MIN_LABELED_SAMPLES:
         return (
             f"Need at least {MIN_LABELED_SAMPLES} labeled samples with finite features before training the "
-            f"classifier: {labeled_count} of {train_finite.size} labeled row(s) have finite features.{note}"
+            f"classifier: {n_training_labels} of {train_finite.size} labeled row(s) have finite features.{note}"
         )
-    if len(class_labels) < 2:
+    if len(class_labels_seen) < 2:
         return (
             "Need at least two labeled classes with finite features before training the classifier: "
-            f"the {labeled_count} labeled row(s) with finite features cover {len(class_labels)} class(es).{note}"
+            f"the {n_training_labels} labeled row(s) with finite features cover {len(class_labels_seen)} "
+            f"class(es).{note}"
         )
     return None
 
@@ -1051,7 +1059,8 @@ class ClassifierController:
 
         `summary` gives the scopes. `reason` comes from the summary when it
         blocks Train before a job, or from a worker that found too few usable
-        rows (`ClassifierIneligibleResult`).
+        rows (`ClassifierIneligibleResult`). The reason is recorded in the
+        `pred_class` entry only when that column exists.
         """
         table = self._get_bound_table()
         if table is None:
@@ -1062,18 +1071,28 @@ class ClassifierController:
             table,
             summary.prediction_scope.regions,
         )
-
-        table.uns[CLASSIFIER_CONFIG_KEY] = self._build_classifier_config(
-            feature_key=feature_key,
-            summary=summary,
-            training=None,
-            reason=reason,
-        )
         self._clear_model_snapshot("the latest classifier inputs are not trainable")
-        self._notify_prediction_table_state_changed(
-            summary.prediction_scope.regions,
-            prediction_state_change,
-        )
+
+        # `_clear_predictions_for_prediction_regions(...)` above only empties
+        # existing prediction columns; it never creates them. So when
+        # `pred_class` does not exist, nothing was written, and there is no
+        # column for a `classifier_config` entry to describe: skip the entry
+        # and the table event.
+        if PRED_CLASS_COLUMN in table.obs:
+            store_classifier_config_entry(
+                table,
+                _build_widget_config_entry(
+                    feature_key=feature_key,
+                    summary=summary,
+                    prediction_timestamp=datetime.now(UTC).isoformat(),
+                    reason=reason,
+                    model_provenance=None,
+                ),
+            )
+            self._notify_prediction_table_state_changed(
+                summary.prediction_scope.regions,
+                prediction_state_change,
+            )
         self._is_dirty = True
         self._set_status(f"Classifier: {reason}", kind="warning")
 
@@ -1105,13 +1124,18 @@ class ClassifierController:
             pred_classes=result.pred_classes,
             pred_confidences=result.pred_confidences,
         )
-        classifier_config = self._build_classifier_config(
-            feature_key=job.feature_key,
-            summary=job.summary,
-            training=result,
+        model_provenance = _build_model_provenance(feature_key=job.feature_key, summary=job.summary, training=result)
+        store_classifier_config_entry(
+            table,
+            _build_widget_config_entry(
+                feature_key=job.feature_key,
+                summary=job.summary,
+                prediction_timestamp=result.training_timestamp,
+                reason=None,
+                model_provenance=model_provenance,
+            ),
         )
-        table.uns[CLASSIFIER_CONFIG_KEY] = classifier_config
-        self._store_model_snapshot(table, job.feature_key, result, classifier_config)
+        self._store_model_snapshot(table, job.feature_key, result, model_provenance)
         self._notify_prediction_table_state_changed(
             job.prediction_scope.regions,
             apply_result.prediction_state_change,
@@ -1123,19 +1147,8 @@ class ClassifierController:
         if self._is_shutdown or not self._is_current_job(job):
             return
 
-        table = self._get_bound_table()
-        if table is not None:
-            table.uns[CLASSIFIER_CONFIG_KEY] = self._build_classifier_config(
-                feature_key=job.feature_key,
-                summary=job.summary,
-                training=None,
-                reason=str(error),
-            )
-            self._notify_table_state_changed(
-                frozenset({TableComponentPath("uns", (CLASSIFIER_CONFIG_KEY,))}),
-                regions=(),
-                source="object_classification_metadata",
-            )
+        # A failed training wrote no prediction column, so the table, and the
+        # classifier config entry describing those columns, stay as they were.
         self._is_dirty = True
         self._clear_model_snapshot("classifier training failed")
         self._set_status(f"Classifier: training failed: {error}", kind="error")
@@ -1178,7 +1191,7 @@ class ClassifierController:
         table: AnnData,
         feature_key: str,
         result: ClassifierTrainingResult,
-        classifier_config: dict[str, object],
+        model_provenance: dict[str, object],
     ) -> None:
         if result.estimator is None:
             self._clear_model_snapshot("the latest training result did not include a fitted estimator")
@@ -1202,10 +1215,9 @@ class ClassifierController:
 
         self._model_snapshot = ClassifierModelSnapshot(
             estimator=result.estimator,
-            classifier_config=deepcopy(classifier_config),
+            model_provenance=deepcopy(model_provenance),
             feature_metadata=deepcopy(feature_metadata),
             feature_key=feature_key,
-            trained_at=result.trained_at,
         )
         self._model_snapshot_missing_reason = None
 
@@ -1287,40 +1299,6 @@ class ClassifierController:
             table.obs, self._selected_table_metadata.region_key, prediction_regions
         )
         return int(table.obs[PRED_CLASS_COLUMN].iloc[positions].notna().sum())
-
-    def _build_classifier_config(
-        self,
-        *,
-        feature_key: str | None,
-        summary: ClassifierPreparationSummary,
-        training: ClassifierTrainingResult | None,
-        reason: str | None = None,
-    ) -> dict[str, object]:
-        """Return `uns["classifier_config"]`.
-
-        It holds what the reload status reads, and how the model behind the
-        predictions was obtained: the table holds no estimator. `training` is
-        the trained model's result, or `None` when nothing was trained, with
-        `reason` saying why. `summary` gives the scopes and the column count.
-        `training_timestamp`, `n_training_labels` (the labeled rows the model
-        was trained on) and `class_labels_seen` describe the trained model:
-        `None`, 0 and `[]` when nothing was trained.
-        """
-        return {
-            "trained": training is not None,
-            "reason": None if training is not None else reason,
-            "feature_key": feature_key,
-            "prediction_scope": summary.prediction_scope.mode,
-            "prediction_regions": list(summary.prediction_scope.regions),
-            "model_type": "RandomForestClassifier",
-            "rf_params": dict(RANDOM_FOREST_PARAMS),
-            "training_scope": summary.training_scope.mode,
-            "training_regions": list(summary.training_scope.regions),
-            "n_features": summary.n_features,
-            "training_timestamp": None if training is None else training.trained_at,
-            "n_training_labels": 0 if training is None else training.labeled_count,
-            "class_labels_seen": [] if training is None else list(training.class_labels),
-        }
 
     def _set_status(self, message: str, *, kind: str) -> None:
         self._status_message = message
@@ -1405,28 +1383,35 @@ class ClassifierController:
             self._set_status("Classifier: choose a feature matrix to enable training.", kind="warning")
             return
 
-        config = table.uns.get(CLASSIFIER_CONFIG_KEY)
-        if not isinstance(config, Mapping):
-            self._update_idle_status()
+        # Only the widget's own entry counts: a table whose `pred_class` column
+        # another writer, such as headless `apply_classifier(...)`, wrote last
+        # is as if nothing was trained here.
+        entry = get_classifier_config_entry(table, PRED_CLASS_COLUMN)
+        if entry is None or entry.get("source") != "widget":
+            self._is_dirty = True
+            self._set_status(
+                "Classifier: no trained model for this table. Click Train Classifier to train one.",
+                kind="warning",
+            )
             return
 
         mismatches: list[str] = []
-        config_feature_key = config.get("feature_key")
-        if isinstance(config_feature_key, str) and config_feature_key != self._selected_feature_key:
+        entry_feature_key = entry.get("feature_key")
+        if isinstance(entry_feature_key, str) and entry_feature_key != self._selected_feature_key:
             mismatches.append(
-                f'loaded predictions use feature matrix "{config_feature_key}" but "{self._selected_feature_key}" is selected'
+                f'loaded predictions use feature matrix "{entry_feature_key}" but "{self._selected_feature_key}" is selected'
             )
 
-        config_prediction_scope = config.get("prediction_scope")
-        if not isinstance(config_prediction_scope, str):
+        entry_prediction_scope = entry.get("prediction_scope")
+        if not isinstance(entry_prediction_scope, str):
             mismatches.append("loaded predictions do not describe their prediction scope")
-        elif config_prediction_scope != self._selected_prediction_scope:
+        elif entry_prediction_scope != self._selected_prediction_scope:
             mismatches.append(
-                f'loaded predictions use prediction scope "{config_prediction_scope}" but "{self._selected_prediction_scope}" is selected'
+                f'loaded predictions use prediction scope "{entry_prediction_scope}" but "{self._selected_prediction_scope}" is selected'
             )
 
-        config_prediction_regions = _normalize_prediction_regions(config.get("prediction_regions"))
-        if self._selected_labels_name is not None and self._selected_labels_name not in config_prediction_regions:
+        entry_prediction_regions = _normalize_prediction_regions(entry.get("prediction_regions"))
+        if self._selected_labels_name is not None and self._selected_labels_name not in entry_prediction_regions:
             mismatches.append(f'loaded predictions do not cover labels element "{self._selected_labels_name}"')
 
         if mismatches:
@@ -1434,18 +1419,17 @@ class ClassifierController:
             self._set_status(f"Classifier: model is stale because {'; '.join(mismatches)}.", kind="warning")
             return
 
-        trained = config.get("trained")
-        if trained is True:
+        if isinstance(entry.get("model_provenance"), Mapping):
             # Counted from the table, which holds the predictions themselves.
-            predicted_count = self._count_predicted_rows(table, config_prediction_regions)
+            predicted_count = self._count_predicted_rows(table, entry_prediction_regions)
             self._set_status(
                 f"Classifier: model is up to date. Loaded predictions for {predicted_count} objects from disk.",
                 kind="success",
             )
             return
 
-        reason = config.get("reason")
-        if trained is False and isinstance(reason, str) and reason:
+        reason = entry.get("reason")
+        if isinstance(reason, str) and reason:
             self._set_status(f"Classifier: {reason}", kind="warning")
             return
 
@@ -1495,6 +1479,65 @@ def _trained_status_message(result: ClassifierTrainingResult, n_predicted_rows: 
             f" {result.n_skipped_labeled_rows} labeled row(s) without finite features were not used for training."
         )
     return message
+
+
+def _build_model_provenance(
+    *,
+    feature_key: str,
+    summary: ClassifierPreparationSummary,
+    training: ClassifierTrainingResult,
+) -> dict[str, object]:
+    """Return how the trained model was obtained: the table holds no estimator.
+
+    Where each key comes from:
+
+    - `feature_key`: the job's feature key;
+    - `model_type`, `rf_params`: the model the worker fits;
+    - `training_scope`, `training_regions`: the summary's training scope, as
+      its mode and its labels elements (as the entry's `prediction_scope` and
+      `prediction_regions` do for the prediction scope);
+    - `n_features`: the summary's column count;
+    - `training_timestamp`, `n_training_labels`, `class_labels_seen`: the
+      training result's fields of the same name.
+    """
+    return {
+        "feature_key": feature_key,
+        "model_type": "RandomForestClassifier",
+        "rf_params": dict(RANDOM_FOREST_PARAMS),
+        "training_scope": summary.training_scope.mode,
+        "training_regions": list(summary.training_scope.regions),
+        "n_features": summary.n_features,
+        "training_timestamp": training.training_timestamp,
+        "n_training_labels": training.n_training_labels,
+        "class_labels_seen": list(training.class_labels_seen),
+    }
+
+
+def _build_widget_config_entry(
+    *,
+    feature_key: str,
+    summary: ClassifierPreparationSummary,
+    prediction_timestamp: str,
+    reason: str | None,
+    model_provenance: dict[str, object] | None,
+) -> dict[str, object]:
+    """Return the widget's `uns["classifier_config"]` entry, for the `pred_class` column.
+
+    `model_provenance` is `None` when nothing was trained, with `reason`
+    saying why. `summary` gives the prediction scope.
+    """
+    return build_classifier_config_entry(
+        source="widget",
+        pred_class_column=PRED_CLASS_COLUMN,
+        pred_confidence_column=PRED_CONFIDENCE_COLUMN,
+        feature_key=feature_key,
+        prediction_regions=summary.prediction_scope.regions,
+        prediction_timestamp=prediction_timestamp,
+        prediction_scope=summary.prediction_scope.mode,
+        classifier_path=None,
+        reason=reason,
+        model_provenance=model_provenance,
+    )
 
 
 def _get_user_class_values(obs: pd.DataFrame) -> pd.Series:
