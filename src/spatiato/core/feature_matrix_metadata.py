@@ -4,20 +4,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-import numpy as np
 import pandas as pd
 from harpy.table.canonical_centers import CANONICAL_OBSM_KEY
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
 from spatiato.core.table_matrix import is_sparse_matrix
-
-try:
-    from scipy.sparse import issparse
-except ImportError:  # pragma: no cover - scipy is expected in the plugin env
-
-    def issparse(value: object) -> bool:
-        return False
-
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -130,37 +121,13 @@ def normalize_feature_columns(feature_metadata: Mapping[str, object]) -> tuple[s
     return columns
 
 
-def normalize_feature_matrix(feature_matrix: Any, n_obs: int, *, copy: bool = True) -> Any:
-    # `copy=True` is the eager-array snapshot path for worker payloads.
-    # If `.obsm` later accepts lazy arrays, callers should explicitly
-    # materialize them before relying on `.copy()` for isolation.
-    if issparse(feature_matrix):
-        if feature_matrix.ndim != 2:
-            raise ValueError("Feature matrices stored in `.obsm` must be 2-dimensional.")
-        if feature_matrix.shape[0] != n_obs:
-            raise ValueError(
-                f"Feature matrix has {feature_matrix.shape[0]} rows but the table has {n_obs} observations."
-            )
-        return feature_matrix.copy() if copy else feature_matrix
-
-    array = np.asarray(feature_matrix, dtype=np.float64)
-    if array.ndim == 1:
-        array = array.reshape(-1, 1)
-    if array.ndim != 2:
-        raise ValueError("Feature matrices stored in `.obsm` must be 2-dimensional.")
-    if array.shape[0] != n_obs:
-        raise ValueError(f"Feature matrix has {array.shape[0]} rows but the table has {n_obs} observations.")
-    return array.copy() if copy else array
-
-
 def feature_matrix_n_features(feature_matrix: Any, n_obs: int) -> int:
     """Return the number of feature columns, checking the matrix from its shape and dtype only.
 
-    Makes the checks of `normalize_feature_matrix(...)` (2-D, one row per
-    observation, numeric values) without reading values, so a lazy or backed
-    matrix stays unread. A 1-D matrix counts as one column. DataFrames are
-    rejected: harpy never writes or updates a feature matrix as one. Raises
-    `ValueError`.
+    Checks that the matrix is 2-D, has one row per observation and holds
+    numeric values, without reading values, so a lazy or backed matrix stays
+    unread. A 1-D matrix counts as one column. DataFrames are rejected: harpy
+    never writes or updates a feature matrix as one. Raises `ValueError`.
     """
     if isinstance(feature_matrix, pd.DataFrame):
         raise ValueError(

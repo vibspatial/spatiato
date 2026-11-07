@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
@@ -21,12 +22,12 @@ from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
     feature_matrix_n_features,
     normalize_feature_columns,
-    normalize_feature_matrix,
     normalize_feature_matrix_source_kind,
 )
 from spatiato.core.object_classification.annotation import USER_CLASS_COLUMN
 from spatiato.core.object_classification.classifier_export import ClassifierExportBundle
 from spatiato.core.spatialdata import get_table, get_table_metadata
+from spatiato.core.table_matrix import read_matrix_rows
 from spatiato.core.validation import normalize_spatialdata_dataframe_column_name
 
 try:
@@ -176,8 +177,12 @@ def apply_classifier(
     table = get_table(sdata, resolved_table_name)
     metadata = get_table_metadata(sdata, resolved_table_name)
     _validate_feature_matrix_compatible_with_bundle(table, resolved_feature_key, bundle)
-    feature_matrix = normalize_feature_matrix(table.obsm[resolved_feature_key], table.n_obs, copy=False)
-    _validate_estimator_matches_feature_matrix(bundle, feature_matrix, resolved_feature_key)
+    feature_matrix = table.obsm[resolved_feature_key]
+    _validate_estimator_matches_feature_matrix(
+        bundle,
+        feature_matrix_n_features(feature_matrix, table.n_obs),
+        resolved_feature_key,
+    )
 
     # Resolve the requested regions against the table metadata so typos fail instead of being skipped silently.
     resolved_prediction_regions = _resolve_prediction_regions(prediction_regions, metadata.regions)
@@ -186,12 +191,11 @@ def apply_classifier(
         metadata.region_key,
         resolved_prediction_regions,
     )
-    feature_valid_row_mask = _get_finite_feature_row_mask(feature_matrix)
-    valid_in_scope_mask = feature_valid_row_mask[raw_prediction_positions]
-    prediction_positions = np.asarray(raw_prediction_positions[valid_in_scope_mask], dtype=np.int64)
+    # Only the prediction rows are read; those without finite features are skipped.
+    predict_features, prediction_finite = _read_rows_with_finite_features(feature_matrix, raw_prediction_positions)
+    prediction_positions = np.asarray(raw_prediction_positions[prediction_finite], dtype=np.int64)
 
     if prediction_positions.size:
-        predict_features = feature_matrix[prediction_positions]
         pred_classes, pred_confidences = _predict_classes_and_confidences(bundle.estimator, predict_features)
     else:
         pred_classes = np.array([], dtype=np.int64)
@@ -324,13 +328,13 @@ def _validate_current_feature_matrix_matches_columns(
 
 def _validate_estimator_matches_feature_matrix(
     bundle: ClassifierExportBundle,
-    feature_matrix: Any,
+    n_features: int,
     feature_key: str,
 ) -> None:
     estimator_feature_count = getattr(bundle.estimator, "n_features_in_", None)
-    if estimator_feature_count is not None and int(estimator_feature_count) != int(feature_matrix.shape[1]):
+    if estimator_feature_count is not None and int(estimator_feature_count) != n_features:
         raise ValueError(
-            f"Feature matrix `{feature_key}` has {int(feature_matrix.shape[1])} column(s), but the classifier "
+            f"Feature matrix `{feature_key}` has {n_features} column(s), but the classifier "
             f"estimator expects {int(estimator_feature_count)} feature column(s)."
         )
 
@@ -394,18 +398,19 @@ def _build_classifier_apply_config(
     *,
     classifier_path: str | Path | None,
 ) -> dict[str, object]:
+    """Return `uns["classifier_apply_config"]`: how these predictions were made, and with which model.
+
+    The prediction counts are not stored: the prediction column within
+    `prediction_regions` holds them, and `ClassifierApplyResult` returns them.
+    """
     return {
-        "applied": True,
         "apply_timestamp": result.applied_at,
         "classifier_path": None if classifier_path is None else str(classifier_path),
-        "source_classifier_config": deepcopy(bundle.source_classifier_config),
-        "table_name": result.table_name,
         "feature_key": result.feature_key,
         "prediction_regions": list(result.prediction_regions),
-        "n_predicted_rows": result.n_predicted_rows,
-        "n_skipped_feature_invalid_rows": result.n_skipped_feature_invalid_rows,
         "pred_class_column": result.pred_class_column,
         "pred_confidence_column": result.pred_confidence_column,
+        "source_classifier_config": deepcopy(bundle.source_classifier_config),
     }
 
 
@@ -429,6 +434,24 @@ def _get_finite_feature_row_mask(feature_matrix: Any) -> BoolArray:
 
     finite_feature_mask = np.isfinite(np.asarray(feature_matrix, dtype=np.float64))
     return np.asarray(finite_feature_mask.all(axis=1), dtype=bool)
+
+
+def _read_rows_with_finite_features(matrix: Any, positions: TableRowPositions) -> tuple[Any, BoolArray]:
+    """Read the rows at `positions` into memory, and return those whose features are all finite, with that mask.
+
+    This is the only place where Object Classification reads feature values:
+    in the widget's classifier worker, and in headless `apply_classifier(...)`.
+    The widget's main thread reads none.
+    """
+    # As in `feature_matrix_n_features(...)`, a 1-D matrix counts as one column.
+    if isinstance(matrix, (np.ndarray, da.Array)) and matrix.ndim == 1:
+        matrix = matrix.reshape(-1, 1)
+    # The feature values of these rows are read into memory here.
+    rows = read_matrix_rows(matrix, positions)
+    if not issparse(rows):
+        rows = np.asarray(rows, dtype=np.float64)
+    finite = _get_finite_feature_row_mask(rows)
+    return rows[finite], finite
 
 
 def _resolve_region_row_positions(obs: pd.DataFrame, region_key: str, regions: tuple[str, ...]) -> TableRowPositions:

@@ -4,6 +4,7 @@ import ast
 from dataclasses import replace
 from pathlib import Path
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
@@ -204,10 +205,17 @@ def test_apply_classifier_from_path_writes_predictions_and_apply_config(
     assert result.n_skipped_feature_invalid_rows == 0
     assert table.obs[PRED_CLASS_COLUMN].astype("string").astype(int).to_numpy().tolist() == expected_classes.tolist()
     assert np.allclose(table.obs[PRED_CONFIDENCE_COLUMN].to_numpy(dtype=np.float64), expected_confidences)
-    assert config["applied"] is True
+    assert set(config) == {
+        "apply_timestamp",
+        "classifier_path",
+        "feature_key",
+        "prediction_regions",
+        "pred_class_column",
+        "pred_confidence_column",
+        "source_classifier_config",
+    }
     assert config["classifier_path"] == str(classifier_path)
     assert config["source_classifier_config"] == bundle.source_classifier_config
-    assert config["table_name"] == "table"
     assert config["feature_key"] == "features_1"
     assert config["prediction_regions"] == ["blobs_labels"]
     assert config["pred_class_column"] == PRED_CLASS_COLUMN
@@ -601,7 +609,6 @@ def test_apply_classifier_from_path_persists_backed_prediction_state(
         table.obs["headless_confidence"].to_numpy(dtype=np.float64),
     )
     assert config["classifier_path"] == str(classifier_path)
-    assert config["table_name"] == "table"
     assert config["feature_key"] == "features_1"
     assert config["pred_class_column"] == "headless_class"
     assert config["pred_confidence_column"] == "headless_confidence"
@@ -798,7 +805,57 @@ def test_apply_classifier_clears_invalid_rows_in_prediction_scope(
     assert table.obs.loc[valid_rows, PRED_CONFIDENCE_COLUMN].between(0.0, 1.0).all()
     assert table.obs.loc[invalid_rows, PRED_CLASS_COLUMN].isna().all()
     assert table.obs.loc[invalid_rows, PRED_CONFIDENCE_COLUMN].isna().all()
-    assert table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["n_skipped_feature_invalid_rows"] == int(invalid_rows.sum())
+
+
+def test_apply_classifier_predicts_the_same_from_a_lazy_matrix(sdata_blobs_multi_region: SpatialData) -> None:
+    _set_deterministic_features(sdata_blobs_multi_region, table_name="table_multi")
+    _set_feature_metadata(sdata_blobs_multi_region, table_name="table_multi")
+    bundle = _make_classifier_bundle(sdata_blobs_multi_region, table_name="table_multi")
+    table = sdata_blobs_multi_region["table_multi"]
+    values = np.asarray(table.obsm["features_1"], dtype=np.float64)
+
+    headless.apply_classifier(sdata_blobs_multi_region, bundle, table_name="table_multi")
+    in_memory_classes = table.obs[PRED_CLASS_COLUMN].astype("string").tolist()
+    in_memory_confidences = table.obs[PRED_CONFIDENCE_COLUMN].to_numpy(dtype=np.float64)
+
+    table.obsm["features_1"] = da.from_array(values, chunks=(7, -1))
+    headless.apply_classifier(sdata_blobs_multi_region, bundle, table_name="table_multi")
+
+    assert table.obs[PRED_CLASS_COLUMN].astype("string").tolist() == in_memory_classes
+    np.testing.assert_array_equal(table.obs[PRED_CONFIDENCE_COLUMN].to_numpy(dtype=np.float64), in_memory_confidences)
+
+
+def _fail_for_the_second_region(block: np.ndarray, block_info: dict | None = None) -> np.ndarray:
+    # Called for every computed block; the second chunk holds the rows of "blobs_labels_2".
+    if block_info is not None and block_info[0]["chunk-location"][0] == 1:
+        raise AssertionError("rows outside the prediction scope must not be read")
+    return block
+
+
+def test_apply_classifier_reads_only_the_prediction_rows(sdata_blobs_multi_region: SpatialData) -> None:
+    _set_deterministic_features(sdata_blobs_multi_region, table_name="table_multi")
+    _set_feature_metadata(sdata_blobs_multi_region, table_name="table_multi")
+    bundle = _make_classifier_bundle(sdata_blobs_multi_region, table_name="table_multi")
+    table = sdata_blobs_multi_region["table_multi"]
+    region_values = table.obs["region"].astype("string").to_numpy()
+    n_first_region = int((region_values == "blobs_labels").sum())
+    # Test setup: the fixture keeps each region's rows contiguous, one chunk per region.
+    assert (region_values[:n_first_region] == "blobs_labels").all()
+    values = np.asarray(table.obsm["features_1"], dtype=np.float64)
+    table.obsm["features_1"] = da.from_array(values, chunks=(n_first_region, -1)).map_blocks(
+        _fail_for_the_second_region,
+        dtype=values.dtype,
+    )
+
+    result = headless.apply_classifier(
+        sdata_blobs_multi_region,
+        bundle,
+        table_name="table_multi",
+        prediction_regions=["blobs_labels"],
+    )
+
+    assert result.n_predicted_rows == n_first_region
+    assert table.obs[PRED_CLASS_COLUMN].iloc[:n_first_region].notna().all()
 
 
 def test_headless_module_avoids_direct_interactive_classifier_imports() -> None:

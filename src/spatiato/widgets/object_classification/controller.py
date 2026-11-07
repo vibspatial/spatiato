@@ -8,11 +8,9 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-import dask.array as da
 import numpy as np
 import pandas as pd
 from qtpy.QtCore import QObject, QTimer
-from scipy.sparse import issparse
 from sklearn.ensemble import RandomForestClassifier
 
 import spatiato.core.object_classification.classifier as _classifier_core
@@ -29,9 +27,9 @@ from spatiato.core.object_classification.annotation import USER_CLASS_COLUMN
 from spatiato.core.object_classification.classifier import (
     PredictionStateChange,
     _get_feature_metadata,
-    _get_finite_feature_row_mask,
     _normalize_prediction_regions,
     _predict_classes_and_confidences,
+    _read_rows_with_finite_features,
     _resolve_region_row_positions,
 )
 from spatiato.core.object_classification.classifier_export import (
@@ -42,7 +40,6 @@ from spatiato.core.object_classification.classifier_export import (
 )
 from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata
-from spatiato.core.table_matrix import read_matrix_rows
 
 
 def _resolve_thread_worker() -> Any:
@@ -472,23 +469,6 @@ def _fit_classifier_job(worker_input: ClassifierWorkerInput) -> ClassifierWorker
         prediction_regions_without_features=prediction_regions_without_features,
         estimator=classifier,
     )
-
-
-def _read_rows_with_finite_features(matrix: Any, positions: TableRowPositions) -> tuple[Any, BoolArray]:
-    """Read the rows at `positions` into memory, and return those whose features are all finite, with that mask.
-
-    This is the only place where Object Classification reads feature values,
-    in the worker; the main thread reads none.
-    """
-    # As in `feature_matrix_n_features(...)`, a 1-D matrix counts as one column.
-    if isinstance(matrix, (np.ndarray, da.Array)) and matrix.ndim == 1:
-        matrix = matrix.reshape(-1, 1)
-    # The feature values of these rows are read into memory here.
-    rows = read_matrix_rows(matrix, positions)
-    if not issparse(rows):
-        rows = np.asarray(rows, dtype=np.float64)
-    finite = _get_finite_feature_row_mask(rows)
-    return rows[finite], finite
 
 
 def _regions_without_finite_rows(row_regions: np.ndarray, finite: BoolArray) -> tuple[str, ...]:
