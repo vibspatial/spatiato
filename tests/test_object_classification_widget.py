@@ -346,7 +346,7 @@ class _DeferredWorker(QObject):
     errored = Signal(object)
     finished = Signal()
 
-    def __init__(self, result: classifier_module.ClassifierJobResult) -> None:
+    def __init__(self, result: classifier_module.ClassifierWorkerResult) -> None:
         super().__init__()
         self._result = result
         self.started = False
@@ -1627,36 +1627,14 @@ def test_widget_invalidates_classifier_when_selected_feature_matrix_is_overwritt
         categories=[1, 2],
     )
     _set_feature_metadata(sdata_blobs)
-    training_scope = classifier_module.ResolvedClassifierScope(
-        mode="selected_segmentation_only",
-        regions=("blobs_labels",),
-        raw_table_row_positions=np.array([0, 1], dtype=np.int64),
-        table_row_positions=np.array([0, 1], dtype=np.int64),
-    )
-    prediction_scope = classifier_module.ResolvedClassifierScope(
-        mode="selected_segmentation_only",
-        regions=("blobs_labels",),
-        raw_table_row_positions=np.array([0, 1], dtype=np.int64),
-        table_row_positions=np.array([0, 1], dtype=np.int64),
-    )
     worker = _DeferredWorker(
-        classifier_module.ClassifierJobResult(
-            job_id=1,
-            feature_key="features_1",
-            labels_name="blobs_labels",
-            table_name="table",
+        classifier_module.ClassifierTrainingResult(
+            trained_at="2026-04-23T09:00:00+00:00",
+            predicted_row_positions=np.array([0, 1], dtype=np.int64),
             pred_classes=np.array([1, 2], dtype=np.int64),
             pred_confidences=np.array([0.9, 0.8], dtype=np.float64),
-            trained_at="2026-04-23T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=classifier_module.ClassifierPreparationSummary(
-                training_scope=training_scope,
-                prediction_scope=prediction_scope,
-                reason="Ready to train.",
-                labeled_count=2,
-                class_labels=(1, 2),
-                n_features=2,
-            ),
+            labeled_count=2,
+            class_labels=(1, 2),
         )
     )
 
@@ -2908,8 +2886,12 @@ def test_widget_disables_sync_for_clean_backed_spatialdata(qtbot, backed_sdata_b
     qtbot.addWidget(widget)
     select_segmentation(widget)
     expected_table_path = Path(backed_sdata_blobs.path) / "tables" / "table"
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert not widget.persistence_controls.write_button.isEnabled()
     assert widget.persistence_controls.reload_button.isEnabled()
@@ -2933,8 +2915,12 @@ def test_widget_marks_persistence_dirty_on_annotation_change_and_clears_it_on_sy
     layer.selected_label = 5
     widget.class_spinbox.setValue(3)
     widget.apply_class_button.click()
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
     assert widget.persistence_controls.write_button.isEnabled()
@@ -2942,8 +2928,12 @@ def test_widget_marks_persistence_dirty_on_annotation_change_and_clears_it_on_sy
     assert "Unsynced local in-memory table changes would be discarded." in reload_tooltip
 
     widget.persistence_controls.write_button.click()
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert widget.persistence_controls.controller.has_unsynced_table_changes is False
     assert not widget.persistence_controls.write_button.isEnabled()
@@ -3010,12 +3000,17 @@ def test_widget_marks_persistence_dirty_after_classifier_writes_results(qtbot, b
     widget.retrain_button.click()
     qtbot.waitUntil(
         lambda: (
-            widget.persistence_controls.controller.has_unsynced_table_changes and table.obs[PRED_CLASS_COLUMN].notna().any()
+            widget.persistence_controls.controller.has_unsynced_table_changes
+            and table.obs[PRED_CLASS_COLUMN].notna().any()
         ),
         timeout=5000,
     )
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
     assert widget.persistence_controls.write_button.isEnabled()
@@ -3272,16 +3267,13 @@ def test_widget_reload_freezes_classifier_worker_and_ignores_late_results(
     workers: list[_DeferredWorker] = []
 
     def fake_create_training_worker(job):
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
+        result = classifier_module.ClassifierTrainingResult(
+            trained_at="2026-04-13T09:00:00+00:00",
+            predicted_row_positions=job.prediction_scope.table_row_positions,
             pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
             pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
+            labeled_count=job.summary.labeled_count,
+            class_labels=job.summary.class_labels,
         )
         worker = _DeferredWorker(result)
         workers.append(worker)
@@ -3302,24 +3294,19 @@ def test_widget_reload_freezes_classifier_worker_and_ignores_late_results(
     obsm = dict(table.obsm)
     uns = dict(table.uns)
     uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table",
-        "roi_mode": "none",
         "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 4,
-        "n_features": 2,
-        "class_labels_seen": [1, 2],
+        "reason": None,
+        "feature_key": "features_1",
+        "prediction_scope": "selected_segmentation_only",
+        "prediction_regions": ["blobs_labels"],
+        "model_type": "RandomForestClassifier",
         "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
         "training_scope": "all",
         "training_regions": ["blobs_labels"],
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "n_predicted_rows": int(table.n_obs),
+        "n_features": 2,
+        "training_timestamp": "2026-04-13T09:00:00+00:00",
+        "n_training_labels": 4,
+        "class_labels_seen": [1, 2],
     }
     _write_disk_table_state(backed_sdata_blobs, obs=obs, obsm=obsm, uns=uns)
 
@@ -3368,16 +3355,13 @@ def test_widget_retrain_button_recovers_after_worker_finishes(qtbot, monkeypatch
     refresh_calls: list[str] = []
 
     def fake_create_training_worker(job):
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
+        result = classifier_module.ClassifierTrainingResult(
+            trained_at="2026-04-13T09:00:00+00:00",
+            predicted_row_positions=job.prediction_scope.table_row_positions,
             pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
             pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
+            labeled_count=job.summary.labeled_count,
+            class_labels=job.summary.class_labels,
         )
         worker = _DeferredWorker(result)
         workers.append(worker)

@@ -197,24 +197,19 @@ def test_persistence_controller_syncs_table_obs_and_colors_to_backed_store(backe
     backed_sdata_blobs["table"].uns[USER_CLASS_COLORS_KEY] = ["#222222"]
     backed_sdata_blobs["table"].uns[PRED_CLASS_COLORS_KEY] = ["#222222"]
     backed_sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table",
-        "roi_mode": "none",
         "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 1,
-        "n_features": 4,
-        "class_labels_seen": [2],
+        "reason": None,
+        "feature_key": "features_1",
+        "prediction_scope": "selected_segmentation_only",
+        "prediction_regions": ["blobs_labels"],
+        "model_type": "RandomForestClassifier",
         "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
         "training_scope": "all",
         "training_regions": ["blobs_labels"],
-        "n_training_rows": backed_sdata_blobs["table"].n_obs,
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "n_predicted_rows": backed_sdata_blobs["table"].n_obs,
+        "n_features": 4,
+        "training_timestamp": "2026-04-13T09:00:00+00:00",
+        "n_training_labels": 1,
+        "class_labels_seen": [2],
     }
     _record_mutation(
         app_state,
@@ -377,24 +372,19 @@ def test_persistence_controller_syncs_multi_region_classifier_config_fields(
     table.uns[USER_CLASS_COLORS_KEY] = ["#111111", "#222222"]
     table.uns[PRED_CLASS_COLORS_KEY] = ["#111111", "#222222"]
     table.uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table_multi",
-        "roi_mode": "none",
         "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": int(table.n_obs),
-        "n_features": int(table.obsm["features_1"].shape[1]),
-        "class_labels_seen": [1, 2],
+        "reason": None,
+        "feature_key": "features_1",
+        "prediction_scope": "all",
+        "prediction_regions": regions,
+        "model_type": "RandomForestClassifier",
         "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
         "training_scope": "all",
         "training_regions": regions,
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "all",
-        "prediction_regions": regions,
-        "n_predicted_rows": int(table.n_obs),
+        "n_features": int(table.obsm["features_1"].shape[1]),
+        "training_timestamp": "2026-04-13T09:00:00+00:00",
+        "n_training_labels": int(table.n_obs),
+        "class_labels_seen": [1, 2],
     }
     _record_mutation(
         app_state,
@@ -413,14 +403,15 @@ def test_persistence_controller_syncs_multi_region_classifier_config_fields(
     config = reread["table_multi"].uns[CLASSIFIER_CONFIG_KEY]
 
     assert table_path == "tables/table_multi"
-    assert config["table_name"] == "table_multi"
     assert config["feature_key"] == "features_1"
     assert config["training_scope"] == "all"
     assert list(config["training_regions"]) == regions
-    assert config["n_training_rows"] == table.n_obs
     assert config["prediction_scope"] == "all"
     assert list(config["prediction_regions"]) == regions
-    assert config["n_predicted_rows"] == table.n_obs
+    assert config["n_training_labels"] == table.n_obs
+    # A trained config has no reason; `None` survives the round trip.
+    assert "reason" in config
+    assert config["reason"] is None
     assert reread["table_multi"].obs[PRED_CLASS_COLUMN].tolist().count(1) == int(
         (region_values == "blobs_labels").sum()
     )

@@ -631,11 +631,9 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
     spatial_query._on_query_ready(old_query_result)
     classifier_job = classifier_jobs[0]
     classifier_worker.returned.emit(
-        classifier_module.ClassifierJobResult(
-            job_id=classifier_job.job_id,
-            feature_key=classifier_job.feature_key,
-            labels_name=classifier_job.labels_name,
-            table_name=classifier_job.table_name,
+        classifier_module.ClassifierTrainingResult(
+            trained_at="2026-07-28T12:00:00+00:00",
+            predicted_row_positions=classifier_job.prediction_scope.table_row_positions,
             pred_classes=np.ones(
                 classifier_job.prediction_scope.table_row_positions.shape,
                 dtype=np.int64,
@@ -645,9 +643,8 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
                 0.9,
                 dtype=np.float64,
             ),
-            trained_at="2026-07-28T12:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=classifier_job.summary,
+            labeled_count=classifier_job.summary.labeled_count,
+            class_labels=classifier_job.summary.class_labels,
         )
     )
     classifier_worker.finished.emit()
