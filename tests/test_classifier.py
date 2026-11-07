@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import time
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
 from qtpy.QtCore import QObject, Signal
+from scipy import sparse
+from sklearn.ensemble import RandomForestClassifier
 from spatialdata import SpatialData
 
 import spatiato.core.object_classification.classifier as classifier_core
@@ -49,6 +52,22 @@ def test_update_table_prediction_state_rejects_rows_outside_clear_scope(
     assert PRED_CLASS_COLUMN not in table.obs
     assert PRED_CONFIDENCE_COLUMN not in table.obs
     assert PRED_CLASS_COLORS_KEY not in table.uns
+
+
+def test_predict_classes_and_confidences_matches_predict_and_predict_proba() -> None:
+    rng = np.random.default_rng(0)
+    features = rng.normal(size=(60, 3))
+    labels = np.where(features[:, 0] > 0, 4, 7)
+    labels[:5] = 9
+    # Few trees make ties between classes likely; argmax resolves them as `predict` does.
+    estimator = RandomForestClassifier(n_estimators=4, random_state=0).fit(features, labels)
+    rows = rng.normal(size=(40, 3))
+
+    pred_classes, pred_confidences = classifier_core._predict_classes_and_confidences(estimator, rows)
+
+    np.testing.assert_array_equal(pred_classes, estimator.predict(rows))
+    np.testing.assert_array_equal(pred_confidences, estimator.predict_proba(rows).max(axis=1))
+    assert pred_classes.dtype == np.int64
 
 
 def test_object_classification_state_validation_is_read_only_for_valid_columns(
@@ -131,7 +150,7 @@ class _DeferredWorker(QObject):
     errored = Signal(object)
     finished = Signal()
 
-    def __init__(self, result: classifier_module.ClassifierJobResult) -> None:
+    def __init__(self, result: classifier_module.ClassifierWorkerResult) -> None:
         super().__init__()
         self._result = result
         self.started = False
@@ -231,18 +250,73 @@ def _resolved_scope(
     labels_name: str = "blobs_labels",
     mode: classifier_module.ClassifierScopeMode = "selected_segmentation_only",
     regions: tuple[str, ...] | None = None,
-    n_rows_in_regions: int | None = None,
 ) -> classifier_module.ResolvedClassifierScope:
-    table_row_positions = np.asarray(positions, dtype=np.int64)
-    raw_table_row_positions = table_row_positions
-    if n_rows_in_regions is not None and n_rows_in_regions != table_row_positions.size:
-        raw_table_row_positions = np.arange(n_rows_in_regions, dtype=np.int64)
     return classifier_module.ResolvedClassifierScope(
         mode=mode,
         regions=(labels_name,) if regions is None else regions,
-        raw_table_row_positions=raw_table_row_positions,
-        table_row_positions=table_row_positions,
+        table_row_positions=np.asarray(positions, dtype=np.int64),
     )
+
+
+def _fake_training_result(
+    job: classifier_module.ClassifierJob,
+    *,
+    pred_class: int = 1,
+    confidence: float = 0.9,
+    trained_at: str = "2026-04-13T09:00:00+00:00",
+) -> classifier_module.ClassifierTrainingResult:
+    """Return a result that predicts `pred_class` for every row of the job's prediction scope."""
+    positions = job.prediction_scope.table_row_positions
+    return classifier_module.ClassifierTrainingResult(
+        trained_at=trained_at,
+        predicted_row_positions=positions,
+        pred_classes=np.full(positions.shape, pred_class, dtype=np.int64),
+        pred_confidences=np.full(positions.shape, confidence, dtype=np.float64),
+        labeled_count=job.summary.labeled_count,
+        class_labels=job.summary.class_labels,
+    )
+
+
+@pytest.mark.parametrize(
+    ("blocker", "kind"),
+    [("Choose a feature matrix.", None), (None, "data")],
+)
+def test_preparation_summary_requires_a_blocker_reason_with_its_kind(blocker: str | None, kind: str | None) -> None:
+    with pytest.raises(ValueError, match="needs both a reason and a kind"):
+        classifier_module.ClassifierPreparationSummary(
+            training_scope=_resolved_scope([0, 1]),
+            prediction_scope=_resolved_scope([0, 1]),
+            labeled_count=0,
+            class_labels=(),
+            n_features=2,
+            training_blocker_reason=blocker,
+            training_blocker_kind=kind,
+        )
+
+
+def _trained_config(
+    *,
+    prediction_scope: str,
+    prediction_regions: list[str],
+    training_regions: list[str],
+    n_features: int,
+) -> dict[str, object]:
+    """Return `uns["classifier_config"]` as the controller writes it after training."""
+    return {
+        "trained": True,
+        "reason": None,
+        "feature_key": "features_1",
+        "prediction_scope": prediction_scope,
+        "prediction_regions": prediction_regions,
+        "model_type": "RandomForestClassifier",
+        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
+        "training_scope": "all",
+        "training_regions": training_regions,
+        "n_features": n_features,
+        "training_timestamp": "2026-04-13T09:00:00+00:00",
+        "n_training_labels": 4,
+        "class_labels_seen": [1, 2],
+    }
 
 
 def test_classifier_controller_trains_on_labeled_rows_and_predicts_active_objects(
@@ -282,8 +356,8 @@ def test_classifier_controller_trains_on_labeled_rows_and_predicts_active_object
     assert pred_class.loc[26] == 2
     assert pd.to_numeric(pred_class.astype("string"), errors="coerce").min() >= 1
     assert pred_confidence.between(0.0, 1.0).all()
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["eligible"] is True
     assert table.uns[CLASSIFIER_CONFIG_KEY]["trained"] is True
+    assert table.uns[CLASSIFIER_CONFIG_KEY]["reason"] is None
     assert table.uns[CLASSIFIER_CONFIG_KEY]["class_labels_seen"] == [1, 2]
     assert controller.status_kind == "success"
     assert table_state_changes == ["changed"]
@@ -355,19 +429,7 @@ def test_classifier_controller_mark_dirty_invalidates_active_worker_and_ignores_
     table_state_changes: list[classifier_module.ClassifierTableStateChange] = []
 
     def fake_create_training_worker(job):
-        worker = _DeferredWorker(
-            classifier_module.ClassifierJobResult(
-                job_id=job.job_id,
-                feature_key=job.feature_key,
-                labels_name=job.labels_name,
-                table_name=job.table_name,
-                pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
-                pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.9, dtype=np.float64),
-                trained_at="2026-07-27T09:00:00+00:00",
-                model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-                summary=job.summary,
-            )
-        )
+        worker = _DeferredWorker(_fake_training_result(job, trained_at="2026-07-27T09:00:00+00:00"))
         workers.append(worker)
         return worker
 
@@ -419,18 +481,7 @@ def test_classifier_controller_refuses_export_while_training(tmp_path, sdata_blo
     workers: dict[int, _DeferredWorker] = {}
 
     def fake_create_training_worker(job):
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
-            pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
-            pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.9, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
-        )
-        worker = _DeferredWorker(result)
+        worker = _DeferredWorker(_fake_training_result(job))
         workers[job.job_id] = worker
         return worker
 
@@ -505,7 +556,7 @@ def test_classifier_controller_blocks_training_without_feature_metadata(sdata_bl
     assert summary is not None
     assert summary.eligible is False
     assert summary.training_blocker_kind == "metadata"
-    assert "Register feature metadata" in summary.reason
+    assert "Register feature metadata" in summary.training_blocker_reason
     assert controller.can_retrain is False
     assert controller.schedule_retrain(immediate=True) is False
     assert CLASSIFIER_CONFIG_KEY not in table.uns
@@ -570,13 +621,12 @@ def test_classifier_controller_selected_region_only_training_scope_ignores_label
     assert job is not None
     assert job.training_scope.regions == ("blobs_labels",)
     assert job.training_scope.n_rows_in_regions == table.n_obs // 2
-    assert job.training_scope.n_eligible_rows == table.n_obs // 2
-    assert job.summary.resolved_training_row_count == table.n_obs // 2
-    assert job.summary.resolved_prediction_row_count == table.n_obs // 2
+    assert job.summary.training_row_count == table.n_obs // 2
+    assert job.summary.prediction_row_count == table.n_obs // 2
     assert job.summary.training_region_count == 1
     assert job.summary.labeled_count == 0
     assert job.summary.eligible is False
-    assert "Need at least 2 labeled samples" in job.summary.reason
+    assert "Need at least 2 labeled samples" in job.summary.training_blocker_reason
 
 
 def test_classifier_controller_defaults_training_scope_to_all_and_can_use_labels_from_other_regions(
@@ -607,18 +657,16 @@ def test_classifier_controller_defaults_training_scope_to_all_and_can_use_labels
     assert job is not None
     assert job.training_scope.regions == ("blobs_labels", "blobs_labels_2")
     assert job.training_scope.n_rows_in_regions == table.n_obs
-    assert job.training_scope.n_eligible_rows == table.n_obs
     assert job.prediction_scope.regions == ("blobs_labels",)
     assert job.prediction_scope.n_rows_in_regions == table.n_obs // 2
-    assert job.prediction_scope.n_eligible_rows == table.n_obs // 2
-    assert job.summary.resolved_training_row_count == table.n_obs
-    assert job.summary.resolved_prediction_row_count == table.n_obs // 2
+    assert job.summary.training_row_count == table.n_obs
+    assert job.summary.prediction_row_count == table.n_obs // 2
     assert job.summary.training_region_count == 2
     assert job.summary.labeled_count == 4
     assert job.summary.eligible is True
 
 
-def test_classifier_controller_default_table_wide_training_excludes_invalid_rows_from_other_regions(
+def test_classifier_controller_table_wide_training_leaves_rows_without_features_to_the_worker(
     sdata_blobs_multi_region: SpatialData,
 ) -> None:
     _set_multi_region_feature_metadata(sdata_blobs_multi_region)
@@ -644,17 +692,21 @@ def test_classifier_controller_default_table_wide_training_excludes_invalid_rows
 
     job = controller._prepare_classifier_job(1)
 
+    # The summary reads no feature values: it counts every row of the scope,
+    # also those of "blobs_labels_2", whose features are NaN. The worker skips them.
     assert job is not None
     assert job.training_scope.regions == ("blobs_labels", "blobs_labels_2")
     assert job.training_scope.n_rows_in_regions == table.n_obs
-    assert job.training_scope.n_eligible_rows == table.n_obs // 2
-    assert job.training_scope.n_excluded_feature_invalid_rows == table.n_obs // 2
     assert job.prediction_scope.regions == ("blobs_labels",)
-    assert job.prediction_scope.n_eligible_rows == table.n_obs // 2
-    assert job.summary.resolved_training_row_count == table.n_obs // 2
-    assert job.summary.resolved_prediction_row_count == table.n_obs // 2
+    assert job.summary.training_row_count == table.n_obs
+    assert job.summary.prediction_row_count == table.n_obs // 2
     assert job.summary.training_region_count == 2
     assert job.summary.eligible is True
+    # The job carries the matrix itself and the labeled rows, not copies.
+    assert job.worker_input is not None
+    assert job.worker_input.feature_matrix is table.obsm["features_1"]
+    assert job.worker_input.train_row_positions.size == 4
+    assert set(job.worker_input.train_row_regions.tolist()) == {"blobs_labels"}
 
 
 def test_classifier_controller_prediction_scope_all_clears_invalid_rows_in_scope(
@@ -708,12 +760,191 @@ def test_classifier_controller_prediction_scope_all_clears_invalid_rows_in_scope
     assert table.obs.loc[invalid_rows, PRED_CONFIDENCE_COLUMN].isna().all()
     assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "all"
     assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_regions"] == ["blobs_labels", "blobs_labels_2"]
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_predicted_rows"] == int(valid_rows.sum())
     assert table.uns[CLASSIFIER_CONFIG_KEY]["training_scope"] == "all"
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_training_rows"] == int(valid_rows.sum())
+    # The worker skipped the rows of "blobs_labels_2", and the status names it.
+    assert f"Updated predictions for {int(valid_rows.sum())} objects" in controller.status_message
+    assert f"Skipped {int(invalid_rows.sum())} row(s) without finite features" in controller.status_message
+    assert '"blobs_labels_2"' in controller.status_message
+    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_training_labels"] == 4
     assert len(table_state_changes) == 1
     assert table_state_changes[0].regions == ("blobs_labels", "blobs_labels_2")
     assert table_state_changes[0].source == "object_classification_inference"
+
+
+def _set_nan_features_for_instances(sdata: SpatialData, instance_ids: set[int]) -> np.ndarray:
+    """Make one feature of the given instances NaN, and return the mask of their rows."""
+    table = sdata["table"]
+    values = np.asarray(table.obsm["features_1"], dtype=np.float64).copy()
+    rows = np.isin(table.obs["instance_id"].to_numpy(dtype=np.int64), list(instance_ids))
+    values[rows, 1] = np.nan
+    table.obsm["features_1"] = values
+    return rows
+
+
+@pytest.mark.parametrize("representation", ["dense", "csr", "csc"])
+def test_classifier_worker_skips_rows_without_finite_features(sdata_blobs: SpatialData, representation: str) -> None:
+    _set_deterministic_features(sdata_blobs)
+    _set_feature_metadata(sdata_blobs)
+    table = sdata_blobs["table"]
+    instance_ids = sorted(int(instance_id) for instance_id in table.obs["instance_id"])
+    # One labeled and one unlabeled row lose their features.
+    labeled_skipped, unlabeled_skipped = instance_ids[2], instance_ids[10]
+    _set_user_classes(sdata_blobs, {instance_ids[0]: 1, instance_ids[1]: 1, labeled_skipped: 1, 24: 2, 25: 2})
+    skipped_rows = _set_nan_features_for_instances(sdata_blobs, {labeled_skipped, unlabeled_skipped})
+    assert int(skipped_rows.sum()) == 2
+    if representation == "csr":
+        table.obsm["features_1"] = sparse.csr_matrix(table.obsm["features_1"])
+    elif representation == "csc":
+        table.obsm["features_1"] = sparse.csc_matrix(table.obsm["features_1"])
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
+    job = controller._prepare_classifier_job(1)
+    assert job is not None
+    assert job.summary.labeled_count == 5
+
+    assert job.worker_input is not None
+    result = classifier_module._fit_classifier_job(job.worker_input)
+
+    assert isinstance(result, classifier_module.ClassifierTrainingResult)
+    np.testing.assert_array_equal(result.predicted_row_positions, np.flatnonzero(~skipped_rows))
+    assert result.pred_classes.shape == (table.n_obs - 2,)
+    assert result.n_skipped_prediction_rows == 2
+    assert result.n_skipped_labeled_rows == 1
+    # The labeled count and classes of the rows used for training.
+    assert result.labeled_count == 4
+    assert result.class_labels == (1, 2)
+    assert result.prediction_regions_without_features == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("train_labels", "must align with `train_row_positions`"),
+        ("train_row_regions", "must align with `train_row_positions`"),
+        ("prediction_row_regions", "must align with `prediction_row_positions`"),
+    ],
+)
+def test_classifier_worker_input_requires_aligned_rows(field: str, message: str) -> None:
+    aligned = {
+        "feature_key": "features_1",
+        "feature_matrix": np.zeros((4, 2)),
+        "train_row_positions": np.array([0, 1], dtype=np.int64),
+        "train_labels": np.array([1, 2], dtype=np.int64),
+        "train_row_regions": np.array(["cells", "cells"], dtype=object),
+        "prediction_row_positions": np.array([0, 1, 2], dtype=np.int64),
+        "prediction_row_regions": np.array(["cells", "cells", "cells"], dtype=object),
+    }
+    classifier_module.ClassifierWorkerInput(**aligned)
+
+    # One element short.
+    with pytest.raises(ValueError, match=message):
+        classifier_module.ClassifierWorkerInput(**{**aligned, field: aligned[field][:-1]})
+
+
+def test_classifier_worker_input_is_derived_from_the_summary_scopes(sdata_blobs_multi_region: SpatialData) -> None:
+    _set_multi_region_feature_metadata(sdata_blobs_multi_region)
+    _set_user_classes_by_region(
+        sdata_blobs_multi_region,
+        {
+            ("blobs_labels", 1): 1,
+            ("blobs_labels_2", 24): 2,
+        },
+    )
+    table = sdata_blobs_multi_region["table_multi"]
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs_multi_region, "blobs_labels", "table_multi", "features_1")
+    summary = controller.describe_current_preparation()
+    assert summary is not None
+
+    worker_input = classifier_module.ClassifierWorkerInput.from_summary(
+        summary,
+        table,
+        feature_key="features_1",
+        region_key="region",
+    )
+
+    # The prediction rows are the prediction scope's own array.
+    assert worker_input.prediction_row_positions is summary.prediction_scope.table_row_positions
+    assert set(worker_input.prediction_row_regions.tolist()) == {"blobs_labels"}
+    # The training rows are the labeled rows of the training scope, with their labels and regions.
+    labeled = np.flatnonzero(table.obs[USER_CLASS_COLUMN].notna().to_numpy())
+    np.testing.assert_array_equal(worker_input.train_row_positions, labeled)
+    assert sorted(worker_input.train_labels.tolist()) == [1, 2]
+    assert sorted(worker_input.train_row_regions.tolist()) == ["blobs_labels", "blobs_labels_2"]
+    assert worker_input.feature_matrix is table.obsm["features_1"]
+
+
+@pytest.mark.parametrize("field", ["pred_classes", "pred_confidences"])
+def test_classifier_training_result_requires_aligned_predictions(field: str) -> None:
+    aligned = {
+        "trained_at": "2026-11-06T09:00:00+00:00",
+        "predicted_row_positions": np.array([0, 1], dtype=np.int64),
+        "pred_classes": np.array([1, 2], dtype=np.int64),
+        "pred_confidences": np.array([0.9, 0.8], dtype=np.float64),
+        "labeled_count": 2,
+        "class_labels": (1, 2),
+    }
+    classifier_module.ClassifierTrainingResult(**aligned)
+
+    # One element short.
+    with pytest.raises(ValueError, match="must align with `predicted_row_positions`"):
+        classifier_module.ClassifierTrainingResult(**{**aligned, field: aligned[field][:-1]})
+
+
+def test_classifier_worker_checks_labeled_rows_again_after_skipping(qtbot, sdata_blobs: SpatialData) -> None:
+    _set_deterministic_features(sdata_blobs)
+    _set_feature_metadata(sdata_blobs)
+    _set_user_classes(sdata_blobs, {1: 1, 2: 1, 24: 2, 25: 2})
+    # Every labeled row of class 2.
+    _set_nan_features_for_instances(sdata_blobs, {24, 25})
+    table = sdata_blobs["table"]
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
+
+    # The summary counts every labeled row, so Train is allowed.
+    assert controller.can_retrain is True
+    controller.retrain_now()
+    qtbot.waitUntil(lambda: table.uns.get(CLASSIFIER_CONFIG_KEY, {}).get("trained") is False, timeout=5000)
+
+    config = table.uns[CLASSIFIER_CONFIG_KEY]
+    assert "Need at least two labeled classes with finite features" in config["reason"]
+    # Nothing was trained, so the fields describing the model are empty.
+    assert config["training_timestamp"] is None
+    assert config["n_training_labels"] == 0
+    assert config["class_labels_seen"] == []
+    assert controller.status_kind == "warning"
+    assert controller.status_message == f"Classifier: {config['reason']}"
+
+
+def test_classifier_worker_reports_a_prediction_scope_without_features(
+    qtbot, sdata_blobs_multi_region: SpatialData
+) -> None:
+    _set_multi_region_feature_metadata(sdata_blobs_multi_region)
+    _set_user_classes_by_region(
+        sdata_blobs_multi_region,
+        {
+            ("blobs_labels_2", 1): 1,
+            ("blobs_labels_2", 2): 1,
+            ("blobs_labels_2", 24): 2,
+            ("blobs_labels_2", 25): 2,
+        },
+    )
+    # Features were not calculated for the labels element to predict.
+    _set_invalid_feature_rows_for_region(sdata_blobs_multi_region, region_name="blobs_labels")
+    table = sdata_blobs_multi_region["table_multi"]
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs_multi_region, "blobs_labels", "table_multi", "features_1")
+
+    # No longer disabled in advance: only the worker reads the feature values.
+    assert controller.can_retrain is True
+    controller.retrain_now()
+    qtbot.waitUntil(lambda: table.uns.get(CLASSIFIER_CONFIG_KEY, {}).get("trained") is False, timeout=5000)
+
+    reason = table.uns[CLASSIFIER_CONFIG_KEY]["reason"]
+    assert "has no usable rows in the prediction scope" in reason
+    assert 'Labels element(s) "blobs_labels" have no rows with finite features' in reason
+    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_training_labels"] == 0
+    assert controller.status_kind == "warning"
 
 
 def test_classifier_controller_default_prediction_scope_leaves_hidden_regions_unchanged(
@@ -736,18 +967,7 @@ def test_classifier_controller_default_prediction_scope_leaves_hidden_regions_un
 
     def fake_create_training_worker(self, job):
         del self
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
-            pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 3, dtype=np.int64),
-            pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.88, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
-        )
-        worker = _DeferredWorker(result)
+        worker = _DeferredWorker(_fake_training_result(job, pred_class=3, confidence=0.88))
         workers[job.job_id] = worker
         return worker
 
@@ -771,10 +991,13 @@ def test_classifier_controller_default_prediction_scope_leaves_hidden_regions_un
     assert table.uns[PRED_CLASS_COLORS_KEY] == default_class_colors([3, 9])
     assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "selected_segmentation_only"
     assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_regions"] == ["blobs_labels"]
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_predicted_rows"] == int(selected_rows.sum())
 
 
-def test_classifier_controller_describes_current_preparation_without_building_worker_arrays(
+def _fail_when_read(block: np.ndarray) -> np.ndarray:
+    raise AssertionError("feature values must not be read on the main thread")
+
+
+def test_classifier_controller_describes_current_preparation_without_reading_feature_values(
     monkeypatch, sdata_blobs_multi_region: SpatialData
 ) -> None:
     _set_multi_region_feature_metadata(sdata_blobs_multi_region)
@@ -787,19 +1010,15 @@ def test_classifier_controller_describes_current_preparation_without_building_wo
             ("blobs_labels_2", 25): 2,
         },
     )
-
-    original_normalize_feature_matrix = classifier_module.normalize_feature_matrix
-
-    def fail_worker_feature_snapshot(feature_matrix, n_obs, *, copy):
-        if copy:
-            raise AssertionError("preparation summary should not construct worker feature arrays")
-        return original_normalize_feature_matrix(feature_matrix, n_obs, copy=copy)
-
-    monkeypatch.setattr(classifier_module, "normalize_feature_matrix", fail_worker_feature_snapshot)
+    # A lazy matrix that fails as soon as any value is read: the summary needs
+    # only its shape and dtype.
+    table = sdata_blobs_multi_region["table_multi"]
+    values = np.asarray(table.obsm["features_1"])
+    table.obsm["features_1"] = da.from_array(values).map_blocks(_fail_when_read, dtype=values.dtype)
 
     def fail_training_worker(*args, **kwargs):
         del args, kwargs
-        raise AssertionError("preparation summary should not construct worker feature arrays")
+        raise AssertionError("preparation summary should not start a training worker")
 
     monkeypatch.setattr(classifier_module.ClassifierController, "_create_training_worker", fail_training_worker)
 
@@ -817,9 +1036,15 @@ def test_classifier_controller_describes_current_preparation_without_building_wo
     assert summary is not None
     assert summary.training_scope.regions == ("blobs_labels", "blobs_labels_2")
     assert summary.prediction_scope.regions == ("blobs_labels", "blobs_labels_2")
-    assert summary.resolved_prediction_row_count == sdata_blobs_multi_region["table_multi"].n_obs
+    assert summary.prediction_row_count == sdata_blobs_multi_region["table_multi"].n_obs
     assert summary.labeled_count == 4
+    assert summary.n_features == values.shape[1]
     assert summary.eligible is True
+    # Preparing the job reads no values either: it carries the matrix itself.
+    job = controller._prepare_classifier_job(1)
+    assert job is not None
+    assert job.worker_input is not None
+    assert job.worker_input.feature_matrix is table.obsm["features_1"]
 
 
 def test_classifier_controller_can_retrain_requires_trainable_preparation(sdata_blobs: SpatialData) -> None:
@@ -861,7 +1086,7 @@ def test_classifier_controller_does_not_create_absent_predictions_when_only_one_
     assert PRED_CLASS_COLUMN not in table.obs
     assert PRED_CONFIDENCE_COLUMN not in table.obs
     assert PRED_CLASS_COLORS_KEY not in table.uns
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["eligible"] is False
+    assert table.uns[CLASSIFIER_CONFIG_KEY]["trained"] is False
     assert "two labeled classes" in table.uns[CLASSIFIER_CONFIG_KEY]["reason"]
     assert controller.status_kind == "warning"
     assert len(table_state_changes) == 1
@@ -923,11 +1148,11 @@ def test_classifier_controller_validates_feature_matrix_shape(qtbot, monkeypatch
     _set_user_classes(sdata_blobs, {1: 1, 24: 2})
     table = sdata_blobs["table"]
 
-    def raise_shape_error(feature_matrix, n_obs, *, copy=True):
-        del feature_matrix, n_obs, copy
+    def raise_shape_error(feature_matrix, n_obs):
+        del feature_matrix, n_obs
         raise ValueError("Feature matrix has 25 rows but the table has 26 observations.")
 
-    monkeypatch.setattr(classifier_module, "normalize_feature_matrix", raise_shape_error)
+    monkeypatch.setattr(classifier_module, "feature_matrix_n_features", raise_shape_error)
 
     controller = ClassifierController(
         debounce_interval_ms=0,
@@ -949,27 +1174,16 @@ def test_classifier_controller_drops_stale_results(qtbot, monkeypatch, sdata_blo
 
     call_log: list[int] = []
 
+    # A real thread worker that knows its job, so the two jobs can differ.
+    @classifier_module.thread_worker(start_thread=False, ignore_errors=True)
     def fake_fit(job):
         call_log.append(job.job_id)
         if job.job_id == 1:
             time.sleep(0.2)
-            pred_class = np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64)
-        else:
-            pred_class = np.full(job.prediction_scope.table_row_positions.shape, 2, dtype=np.int64)
+            return _fake_training_result(job, pred_class=1, trained_at="2026-04-08T12:00:00+00:00")
+        return _fake_training_result(job, pred_class=2, trained_at="2026-04-08T12:00:00+00:00")
 
-        return classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
-            pred_classes=pred_class,
-            pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.9, dtype=np.float64),
-            trained_at="2026-04-08T12:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
-        )
-
-    monkeypatch.setattr(classifier_module, "_fit_classifier_job", fake_fit)
+    monkeypatch.setattr(ClassifierController, "_create_training_worker", lambda self, job: fake_fit(job))
 
     controller = ClassifierController(
         debounce_interval_ms=0,
@@ -1003,21 +1217,12 @@ def test_classifier_controller_bind_is_passive_until_marked_dirty(qtbot, monkeyp
     table_state_changes: list[classifier_module.ClassifierTableStateChange] = []
     prediction_state_changes: list[str] = []
 
+    @classifier_module.thread_worker(start_thread=False, ignore_errors=True)
     def fake_fit(job):
         call_log.append(job.job_id)
-        return classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
-            pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
-            pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.9, dtype=np.float64),
-            trained_at="2026-04-08T12:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
-        )
+        return _fake_training_result(job, trained_at="2026-04-08T12:00:00+00:00")
 
-    monkeypatch.setattr(classifier_module, "_fit_classifier_job", fake_fit)
+    monkeypatch.setattr(ClassifierController, "_create_training_worker", lambda self, job: fake_fit(job))
 
     controller = ClassifierController(
         debounce_interval_ms=0,
@@ -1060,8 +1265,8 @@ def test_classifier_controller_notifies_table_state_change_when_training_errors(
     table_state_changes: list[classifier_module.ClassifierTableStateChange] = []
     prediction_state_changes: list[str] = []
 
-    def raise_fit_error(job):
-        del job
+    def raise_fit_error(worker_input):
+        del worker_input
         raise RuntimeError("boom")
 
     monkeypatch.setattr(classifier_module, "_fit_classifier_job", raise_fit_error)
@@ -1163,18 +1368,7 @@ def test_classifier_controller_shutdown_quits_worker_and_ignores_late_signals(
     workers: list[_DeferredWorker] = []
 
     def fake_create_training_worker(job):
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
-            pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
-            pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.9, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
-        )
-        worker = _DeferredWorker(result)
+        worker = _DeferredWorker(_fake_training_result(job))
         workers.append(worker)
         return worker
 
@@ -1221,23 +1415,13 @@ def test_classifier_controller_invalidates_pending_work_for_selected_feature_mat
     _set_deterministic_features(sdata_blobs)
     _set_feature_metadata(sdata_blobs)
     _set_user_classes(sdata_blobs, {1: 1, 2: 1, 24: 2, 25: 2})
-    result = classifier_module.ClassifierJobResult(
-        job_id=1,
-        feature_key="features_1",
-        labels_name="blobs_labels",
-        table_name="table",
+    result = classifier_module.ClassifierTrainingResult(
+        trained_at="2026-04-13T09:00:00+00:00",
+        predicted_row_positions=np.array([0, 1], dtype=np.int64),
         pred_classes=np.array([1, 2], dtype=np.int64),
         pred_confidences=np.array([0.9, 0.8], dtype=np.float64),
-        trained_at="2026-04-13T09:00:00+00:00",
-        model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-        summary=classifier_module.ClassifierPreparationSummary(
-            training_scope=_resolved_scope([0, 1]),
-            prediction_scope=_resolved_scope([0, 1]),
-            reason="Ready to train.",
-            labeled_count=2,
-            class_labels=(1, 2),
-            n_features=2,
-        ),
+        labeled_count=2,
+        class_labels=(1, 2),
     )
     worker = _DeferredWorker(result)
 
@@ -1268,18 +1452,7 @@ def test_classifier_controller_reset_after_reload_ignores_late_worker_results(
 
     def fake_create_training_worker(self, job):
         del self
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
-            pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
-            pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
-        )
-        worker = _DeferredWorker(result)
+        worker = _DeferredWorker(_fake_training_result(job, confidence=0.91))
         workers[job.job_id] = worker
         return worker
 
@@ -1307,26 +1480,12 @@ def test_classifier_controller_reset_after_reload_ignores_late_worker_results(
         index=table.obs.index,
         dtype="float64",
     )
-    table.uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table",
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 4,
-        "n_features": 2,
-        "class_labels_seen": [1, 2],
-        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
-        "training_scope": "all",
-        "training_regions": ["blobs_labels"],
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "n_predicted_rows": int(table.n_obs),
-    }
+    table.uns[CLASSIFIER_CONFIG_KEY] = _trained_config(
+        prediction_scope="selected_segmentation_only",
+        prediction_regions=["blobs_labels"],
+        training_regions=["blobs_labels"],
+        n_features=2,
+    )
 
     controller.reset_after_reload()
 
@@ -1344,26 +1503,12 @@ def test_classifier_controller_reset_after_reload_marks_stale_when_prediction_sc
     sdata_blobs: SpatialData,
 ) -> None:
     table = sdata_blobs["table"]
-    table.uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table",
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 4,
-        "n_features": 2,
-        "class_labels_seen": [1, 2],
-        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
-        "training_scope": "all",
-        "training_regions": ["blobs_labels"],
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "all",
-        "prediction_regions": ["blobs_labels"],
-        "n_predicted_rows": int(table.n_obs),
-    }
+    table.uns[CLASSIFIER_CONFIG_KEY] = _trained_config(
+        prediction_scope="all",
+        prediction_regions=["blobs_labels"],
+        training_regions=["blobs_labels"],
+        n_features=2,
+    )
 
     controller = ClassifierController(debounce_interval_ms=0)
     controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
@@ -1377,26 +1522,15 @@ def test_classifier_controller_reset_after_reload_accepts_multi_region_predictio
     sdata_blobs_multi_region: SpatialData,
 ) -> None:
     table = sdata_blobs_multi_region["table_multi"]
-    table.uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table_multi",
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 4,
-        "n_features": 4,
-        "class_labels_seen": [1, 2],
-        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
-        "training_scope": "all",
-        "training_regions": ["blobs_labels", "blobs_labels_2"],
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "all",
-        "prediction_regions": ["blobs_labels", "blobs_labels_2"],
-        "n_predicted_rows": int(table.n_obs),
-    }
+    # The loaded count comes from the predictions in the table.
+    table.obs[PRED_CLASS_COLUMN] = pd.Categorical(np.full(table.n_obs, 2, dtype=np.int64), categories=[2])
+    table.obs[PRED_CONFIDENCE_COLUMN] = pd.Series(np.full(table.n_obs, 0.77), index=table.obs.index, dtype="float64")
+    table.uns[CLASSIFIER_CONFIG_KEY] = _trained_config(
+        prediction_scope="all",
+        prediction_regions=["blobs_labels", "blobs_labels_2"],
+        training_regions=["blobs_labels", "blobs_labels_2"],
+        n_features=4,
+    )
 
     controller = ClassifierController(debounce_interval_ms=0)
     controller.bind(
