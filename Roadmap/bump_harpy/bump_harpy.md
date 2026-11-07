@@ -529,7 +529,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3c.7 | No job starts on a busy table (P11, point 6): `TableBusyMarker` gains `table_busy_reasons(...)`; Feature Extraction's `calculate()` and Spatial Query's `start_spatial_query()` refuse while another job keeps the table busy; their widgets disable Calculate and Run with 'Table "T" is busy: …' and refresh on `table_busy_state_changed`; the Spatial Query widget checks the centers again when the table is no longer busy. Tests in the controller, widget and status-card modules; the multi-widget reload test accepts Spatial Query's Run before Feature Extraction's job starts. `docs/development/table_state.md` follows | implemented on 2026-11-06, after 3c.2b. Not covered: a query-only Run does not mark the table busy, and jobs on different tables of one store are not serialized (design point 6) |
    | 3d.1 | Object Classification without scanning the matrix (3d design points 1-8 below): the summary reads only `obs` and `uns`, with the column count from `feature_matrix_n_features(...)`; the job carries the matrix object and the row positions instead of copies; the worker reads its rows with `read_matrix_rows(...)`, skips rows without finite features, checks the labeled count and the classes again, and returns an "ineligible" result with its reason when they no longer suffice; the result carries the counts and the predicted row positions, which the prediction write and `uns["classifier_config"]` use (point 5); the status card and the messages report the rows in the scope before a job, and the rows used and skipped after it. Tests: the controller, widget and multi-widget tests listed with the design points change; new tests as listed with the readiness check | implemented on 2026-11-06. `ResolvedClassifierScope` keeps one position array, named `table_row_positions`, now every row of the scope (the old "raw" positions); `raw_table_row_positions` and the eligible counts go. The summary uses `feature_matrix_n_features(...)`; its two "no usable rows" blockers move to the worker. A leaner contract between the main thread and the worker (settled the same day, after a review of the first version): the worker gets only a `ClassifierWorkerInput` (the matrix, the labeled training rows with their labels, the prediction rows, and the region of every row it reads, so it can name a labels element whose rows it all skipped; its docstring states the accepted risk of point 7) and returns only what it computed, a `ClassifierTrainingResult` (predictions with `predicted_row_positions`, the labeled count and classes used, the skipped counts, the estimator) or a `ClassifierIneligibleResult` (reason, labeled count and classes used). `ClassifierJob` stays on the main thread (job ID, feature key, table, summary, worker input) and is bound to the worker's signals, so the handlers combine it with the result; the summary never reaches the worker, the results echo nothing, and `labels_name`, `model_params` and `_active_job` go. `_apply_ineligible_state(feature_key=, table_name=, summary=)` serves both kinds of ineligibility. `_build_classifier_config(...)` takes `n_predicted_rows`. Tests: 19 existing tests updated (a `_fake_training_result(...)` helper in `test_classifier.py`; two tests wrap a fake in a real thread worker to keep the job); new: the summary and the job read no values (a Dask matrix that fails when computed), the worker skips rows without finite features (dense, CSR, CSC), the labeled rows are checked again after skipping, a prediction scope without features is reported by the worker and names its labels element, and the success status names it too |
    | 3d.2 | Headless `apply_classifier(...)` the same way (3d design points 6 and 9-11 below): `_read_rows_with_finite_features(...)` moves to the core, and `apply_classifier(...)` reads only the prediction rows through it, skipping rows without finite features; the estimator width check uses the shape; `normalize_feature_matrix(...)`, then without callers, is deleted; `uns["classifier_apply_config"]` drops `applied`, `table_name`, `n_predicted_rows` and `n_skipped_feature_invalid_rows`. Tests: headless with a lazy matrix, reading only the prediction rows, and the apply-config assertions | implemented on 2026-11-07: `_read_rows_with_finite_features(...)` is in `core/object_classification/classifier.py`, and the widget's worker and headless `apply_classifier(...)` both read through it; `_validate_estimator_matches_feature_matrix(...)` takes the column count; `normalize_feature_matrix(...)` is gone, and with it `feature_matrix_metadata.py`'s now-unused `numpy` import and `issparse` fallback; `_build_classifier_apply_config(...)` writes the seven kept fields. Tests: the apply-config assertions check the exact field set; new: a lazy matrix predicts the same as a NumPy one, and only the prediction rows are read (a Dask matrix whose chunk for `blobs_labels_2` fails when computed) |
-   | 3d.3 | Consistent classifier configs (3d design points 12 and 13 below): the export bundle keeps only the model's provenance from the training config, in a field renamed from `source_classifier_config` to `model`, and the apply config nests it as `model`; whichever writes the default prediction columns, the widget or headless `apply_classifier(...)`, removes the other's config, also from the store. Tests: the field sets of the bundle's `model` and of the apply config; each writer removes the other's config; headless writing to custom columns leaves `classifier_config` alone | ready (decided on 2026-11-07), after 3d.2 |
+   | 3d.3 | Consistent classifier configs (3d design points 12 and 13 below): the export bundle keeps only the model's provenance from the training config, in a field renamed from `source_classifier_config` to `model_provenance`, and the apply config nests it under the same name; whichever writes the default prediction columns, the widget or headless `apply_classifier(...)`, removes the other's config, also from the store; a reload of a table without `classifier_config` shows the untrained state and asks the user to train, instead of "model is up to date"; the headless docs say that the widget does not see headless run on the viewer's own SpatialData object. Tests: the field sets of the bundle's `model_provenance` and of the apply config; each writer removes the other's config; headless writing to custom columns leaves `classifier_config` alone; a reload after a headless apply, and of a table never trained, shows the untrained state with export unavailable; training again after a headless apply keeps the headless predictions outside the widget's prediction scope | ready (decided on 2026-11-07), after 3d.2 |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
    that order), with 3c.5 and then 3c.6 between 3c.2a and 3c.2b: design
@@ -740,28 +740,52 @@ Spatiato's own table I/O code, is the core of this bump. Order:
        config, with two meanings. Decision: the bundle keeps only
        `feature_key` (the key the model was trained on), `model_type`,
        `rf_params`, `training_scope`, `training_regions`, `n_features`,
-       `training_timestamp`, `n_training_labels` and `class_labels_seen`; its
-       field is renamed from `source_classifier_config` to `model` (next to
-       `estimator`, the fitted model itself); the apply config nests it as
-       `model`. The bundle's readers (`feature_key`, `model_type`,
+       `training_timestamp`, `n_training_labels` and `class_labels_seen`. Its
+       field is renamed from `source_classifier_config` to
+       `model_provenance`, and the apply config nests it under the same name.
+       Not `model`: next to the bundle's `estimator`, the fitted model
+       itself, `model` would read as the model rather than its description.
+       The bundle's readers (`feature_key`, `model_type`,
        `class_labels_seen`) are all in the subset.
-   13. **One config describes the default prediction columns.** The widget
-       writes only `classifier_config`, and headless only
+   13. **One config describes the default prediction columns, and after a
+       headless apply the widget behaves as if nothing was trained.** The
+       widget writes only `classifier_config`, and headless only
        `classifier_apply_config`. When both write `pred_class` and
        `pred_confidence`, the last writer owns the predictions in `obs`, but
        the other config stays and still describes predictions that are gone:
        after a headless apply, the widget's reload status would report the
-       headless predictions as its own. Decision: whichever writes the
-       default prediction columns removes the other's config. The widget,
-       when it writes or clears predictions, removes
-       `uns["classifier_apply_config"]` and lists its path in the table
-       event, so Write deletes it from the store. Headless
-       `apply_classifier(...)`, when it writes the default columns, removes
-       `uns["classifier_config"]`, also from the store when it persists
-       (`write_table_prediction_state(...)` already covers that key). Headless
-       writing to custom columns leaves `classifier_config` alone. Accepted:
-       when the two writers predicted different regions, the removed config's
-       record of the regions not written again goes with it.
+       headless predictions as its own. Decision:
+       - Whichever writes the default prediction columns removes the other's
+         config. The widget, when it writes or clears predictions, removes
+         `uns["classifier_apply_config"]` and lists its path in the table
+         event, so Write deletes it from the store. Headless
+         `apply_classifier(...)`, when it writes the default columns, removes
+         `uns["classifier_config"]`, also from the store when it persists
+         (`write_table_prediction_state(...)` already covers that key).
+         Headless writing to custom columns leaves `classifier_config` alone.
+       - A table without `classifier_config` is untrained for the widget.
+         The reload status is the only place that reads the config; when the
+         config is missing, it now marks the classifier stale and asks the
+         user to train ("no trained model for this table"), instead of
+         reporting "model is up to date", which it does today, also for a
+         table that was never trained. The reload already clears the model
+         snapshot, so export is unavailable. Binding needs no change: a new
+         selection already marks the classifier stale. The headless
+         predictions stay in `obs` as data, because binding and reloading do
+         not change prediction state.
+       - The widget does not see headless run on the viewer's own SpatialData
+         object: headless notifies no app state, and making it do so would
+         couple the core to the UI. Accepted, and documented with the
+         headless API: run headless on the store or on another SpatialData
+         object, and Reload to see its result.
+       - Training again after a headless apply rewrites only the widget's
+         prediction scope and removes the apply config. Predictions headless
+         wrote outside that scope stay in `obs`, described by no config, and
+         the reload status reports a labels element outside the scope as
+         stale ("loaded predictions do not cover labels element ..."). The
+         same holds the other way round, for widget predictions outside a
+         later headless apply. Accepted: clearing the default columns on
+         every row instead would delete output the user asked for.
 
    Readiness check for 3c.2 (2026-11-05, against harpy 0.5.3). Today the
    centers worker computes without changing anything, and the main thread
@@ -2128,9 +2152,15 @@ Settled on 2026-11-07:
   `n_skipped_feature_invalid_rows`.
 - Step 3d.3, design points 12 and 13 (see "Migration Plan", step 3): the
   export bundle keeps only the model's provenance from the training config,
-  as `model`, and the apply config nests it as `model`; whichever writes the
-  default prediction columns, the widget or headless, removes the other's
-  config.
+  in a field named `model_provenance`, and the apply config nests it under
+  the same name (not `model`, which next to the bundle's `estimator` would
+  read as the fitted model itself); whichever writes the default prediction
+  columns, the widget or headless, removes the other's config. After a
+  headless apply, the widget behaves as if nothing was trained: a reload
+  without `classifier_config` asks the user to train. The widget does not
+  see headless run on the viewer's own SpatialData object (documented), and
+  training again keeps the headless predictions outside the widget's
+  prediction scope.
 
 Settled on 2026-11-06:
 
