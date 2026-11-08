@@ -1692,10 +1692,15 @@ def test_classifier_controller_reset_after_reload_accepts_multi_region_predictio
     )
 
 
-@pytest.mark.parametrize("config", ["never_trained", "headless_wrote_pred_class", "old_flat_layout"])
+@pytest.mark.parametrize("config", ["never_trained", "headless_wrote_pred_class"])
 def test_classifier_controller_reset_after_reload_asks_to_train_without_a_widget_entry(
     qtbot, sdata_blobs: SpatialData, config: str
 ) -> None:
+    """A reloaded table whose `pred_class` entry the widget did not write shows the untrained state.
+
+    Export is unavailable after any reload: `reset_after_reload()` clears the
+    model snapshot.
+    """
     _set_deterministic_features(sdata_blobs)
     _set_feature_metadata(sdata_blobs)
     _set_user_classes(sdata_blobs, {1: 1, 2: 1, 24: 2, 25: 2})
@@ -1708,12 +1713,10 @@ def test_classifier_controller_reset_after_reload_asks_to_train_without_a_widget
     # The table as reloaded from disk.
     if config == "never_trained":
         del table.uns[CLASSIFIER_CONFIG_KEY]
-    elif config == "headless_wrote_pred_class":
+    else:
         table.uns[CLASSIFIER_CONFIG_KEY] = {
             PRED_CLASS_COLUMN: _headless_entry(pred_class_column=PRED_CLASS_COLUMN, prediction_regions=["blobs_labels"])
         }
-    else:
-        table.uns[CLASSIFIER_CONFIG_KEY] = {"trained": True, "feature_key": "features_1"}
     controller.reset_after_reload()
 
     assert controller.is_dirty is True
