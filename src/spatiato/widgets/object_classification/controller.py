@@ -1529,7 +1529,6 @@ def _build_widget_config_entry(
     return build_classifier_config_entry(
         source="widget",
         pred_class_column=PRED_CLASS_COLUMN,
-        pred_confidence_column=PRED_CONFIDENCE_COLUMN,
         feature_key=feature_key,
         prediction_regions=summary.prediction_scope.regions,
         prediction_timestamp=prediction_timestamp,

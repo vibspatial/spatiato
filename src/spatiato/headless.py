@@ -100,16 +100,16 @@ def apply_classifier(
     feature_key: str | None = None,
     prediction_regions: Sequence[str] | None = None,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
     classifier_path: str | Path | None = None,
 ) -> ClassifierApplyResult:
     """Apply an exported classifier to an existing feature matrix.
 
     The target table must already contain a compatible feature matrix in
     `.obsm`. When `feature_key` is omitted, the source feature key stored in the
-    classifier is used. Predictions are written in place to `table.obs` using
-    `pred_class_column` and `pred_confidence_column`, and how they were made
-    is recorded in `table.uns["classifier_config"][pred_class_column]`. That
+    classifier is used. Predictions are written in place to `table.obs`: the
+    classes to `pred_class_column`, and their confidences to
+    `f"{pred_class_column}_confidence"`. How they were made is recorded in
+    `table.uns["classifier_config"][pred_class_column]`. That
     entry replaces the one of whoever wrote the column before; for the default
     `pred_class`, that may be the Object Classification widget, which then
     has no model of its own for these predictions. If `sdata` is backed by
@@ -135,9 +135,8 @@ def apply_classifier(
         Optional table regions to classify. If omitted, all regions declared in
         the table metadata are classified.
     pred_class_column
-        Column in `table.obs` that will receive predicted class labels.
-    pred_confidence_column
-        Column in `table.obs` that will receive prediction confidences.
+        Column in `table.obs` that will receive predicted class labels. The
+        prediction confidences go to `f"{pred_class_column}_confidence"`.
     classifier_path
         Optional artifact path to record in the `classifier_config` entry;
         this does not affect prediction.
@@ -152,7 +151,6 @@ def apply_classifier(
         feature_key=feature_key,
         prediction_regions=prediction_regions,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=classifier_path,
     )
     _write_backed_prediction_state_if_needed(sdata, result)
@@ -167,7 +165,6 @@ def apply_classifier_from_path(
     feature_key: str | None = None,
     prediction_regions: Sequence[str] | None = None,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
 ) -> ClassifierApplyResult:
     """Load a classifier artifact from disk and apply it to an existing feature matrix.
 
@@ -184,7 +181,6 @@ def apply_classifier_from_path(
         feature_key=feature_key,
         prediction_regions=prediction_regions,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=path,
     )
 
@@ -200,7 +196,6 @@ def apply_classifier_with_feature_extraction(
     image_name: str | Sequence[str] | None = None,
     overwrite_feature_key: bool = False,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
     classifier_path: str | Path | None = None,
 ) -> ClassifierApplyResult:
     """Compute the classifier feature matrix on a target dataset, then apply it.
@@ -250,9 +245,8 @@ def apply_classifier_with_feature_extraction(
         `sdata` is backed by zarr, the stored matrix decides, not unsaved
         changes in memory.
     pred_class_column
-        Column in `table.obs` that will receive predicted class labels.
-    pred_confidence_column
-        Column in `table.obs` that will receive prediction confidences.
+        Column in `table.obs` that will receive predicted class labels. The
+        prediction confidences go to `f"{pred_class_column}_confidence"`.
     classifier_path
         Optional artifact path to record in the `classifier_config` entry;
         this does not affect feature extraction or prediction.
@@ -278,7 +272,6 @@ def apply_classifier_with_feature_extraction(
         feature_key=resolved_target.feature_key,
         prediction_regions=tuple(triplet.labels_name for triplet in resolved_target.triplets),
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=classifier_path,
     )
 
@@ -294,7 +287,6 @@ def apply_classifier_with_feature_extraction_from_path(
     image_name: str | Sequence[str] | None = None,
     overwrite_feature_key: bool = False,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
 ) -> ClassifierApplyResult:
     """Load a classifier artifact, compute target features, and apply it.
 
@@ -334,9 +326,8 @@ def apply_classifier_with_feature_extraction_from_path(
         `sdata` is backed by zarr, the stored matrix decides, not unsaved
         changes in memory.
     pred_class_column
-        Column in `table.obs` that will receive predicted class labels.
-    pred_confidence_column
-        Column in `table.obs` that will receive prediction confidences.
+        Column in `table.obs` that will receive predicted class labels. The
+        prediction confidences go to `f"{pred_class_column}_confidence"`.
 
     The returned `ClassifierApplyResult` summarizes the rows that were written
     and any in-scope rows skipped because of invalid feature values.
@@ -352,7 +343,6 @@ def apply_classifier_with_feature_extraction_from_path(
         image_name=image_name,
         overwrite_feature_key=overwrite_feature_key,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=path,
     )
 

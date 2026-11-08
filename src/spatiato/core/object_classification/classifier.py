@@ -46,9 +46,19 @@ if TYPE_CHECKING:
 BoolArray = NDArray[np.bool_]
 TableRowPositions = NDArray[np.int64]
 
+
+def prediction_confidence_column(pred_class_column: str) -> str:
+    """Return the confidence column that goes with the prediction class column `pred_class_column`.
+
+    It is derived, not chosen, as the palette is (`f"{pred_class_column}_colors"`),
+    so two class columns can never share one confidence column.
+    """
+    return f"{pred_class_column}_confidence"
+
+
 PRED_CLASS_COLUMN = "pred_class"
 PRED_CLASS_COLORS_KEY = f"{PRED_CLASS_COLUMN}_colors"
-PRED_CONFIDENCE_COLUMN = "pred_confidence"
+PRED_CONFIDENCE_COLUMN = prediction_confidence_column(PRED_CLASS_COLUMN)
 CLASSIFIER_CONFIG_KEY = "classifier_config"
 ClassifierConfigSource = Literal["widget", "apply_classifier"]
 
@@ -154,7 +164,6 @@ def build_classifier_config_entry(
     *,
     source: ClassifierConfigSource,
     pred_class_column: str,
-    pred_confidence_column: str,
     feature_key: str,
     prediction_regions: Sequence[str],
     prediction_timestamp: str,
@@ -171,7 +180,9 @@ def build_classifier_config_entry(
     entry of its `pred_class_column`. Whoever writes a column replaces its
     entry (`store_classifier_config_entry(...)`), so no writer removes
     another's entry. The prediction counts are not stored: the class column
-    within `prediction_regions` holds them.
+    within `prediction_regions` holds them. The entry also records the
+    confidence column, `prediction_confidence_column(pred_class_column)`, so
+    it describes itself.
 
     Parameters
     ----------
@@ -179,8 +190,6 @@ def build_classifier_config_entry(
         Who wrote the columns: `"widget"` or `"apply_classifier"`.
     pred_class_column
         The column of predicted classes, and the entry's key.
-    pred_confidence_column
-        The column of prediction confidences.
     feature_key
         The `obsm` key of the matrix the predictions were computed from.
     prediction_regions
@@ -204,7 +213,7 @@ def build_classifier_config_entry(
     return {
         "source": source,
         "pred_class_column": pred_class_column,
-        "pred_confidence_column": pred_confidence_column,
+        "pred_confidence_column": prediction_confidence_column(pred_class_column),
         "feature_key": feature_key,
         "prediction_regions": list(prediction_regions),
         "prediction_timestamp": prediction_timestamp,
@@ -241,21 +250,17 @@ def apply_classifier(
     feature_key: str | None = None,
     prediction_regions: Sequence[str] | None = None,
     pred_class_column: str = PRED_CLASS_COLUMN,
-    pred_confidence_column: str = PRED_CONFIDENCE_COLUMN,
     classifier_path: str | Path | None = None,
 ) -> ClassifierApplyResult:
-    """Apply an exported classifier bundle to an existing compatible feature matrix."""
+    """Apply an exported classifier bundle to an existing compatible feature matrix.
+
+    The confidences go to `prediction_confidence_column(pred_class_column)`.
+    """
     resolved_table_name = _normalize_nonempty_str(table_name, "table_name")
     resolved_feature_key = (
         bundle.feature_key if feature_key is None else _normalize_nonempty_str(feature_key, "feature_key")
     )
     resolved_pred_class_column = normalize_spatialdata_dataframe_column_name(pred_class_column, "pred_class_column")
-    resolved_pred_confidence_column = normalize_spatialdata_dataframe_column_name(
-        pred_confidence_column,
-        "pred_confidence_column",
-    )
-    if resolved_pred_class_column == resolved_pred_confidence_column:
-        raise ValueError("pred_class_column and pred_confidence_column must be different.")
 
     table = get_table(sdata, resolved_table_name)
     metadata = get_table_metadata(sdata, resolved_table_name)
@@ -294,14 +299,12 @@ def apply_classifier(
         pred_classes=pred_classes,
         pred_confidences=pred_confidences,
         pred_class_column=resolved_pred_class_column,
-        pred_confidence_column=resolved_pred_confidence_column,
     )
     store_classifier_config_entry(
         table,
         build_classifier_config_entry(
             source="apply_classifier",
             pred_class_column=result.pred_class_column,
-            pred_confidence_column=result.pred_confidence_column,
             feature_key=result.feature_key,
             prediction_regions=result.prediction_regions,
             prediction_timestamp=result.applied_at,
@@ -325,7 +328,6 @@ def _write_classifier_predictions(
     pred_classes: np.ndarray,
     pred_confidences: np.ndarray,
     pred_class_column: str = PRED_CLASS_COLUMN,
-    pred_confidence_column: str = PRED_CONFIDENCE_COLUMN,
 ) -> ClassifierApplyResult:
     prediction_state_change = _update_table_prediction_state(
         table,
@@ -334,7 +336,6 @@ def _write_classifier_predictions(
         pred_classes=pred_classes,
         pred_confidences=pred_confidences,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
     )
 
     return ClassifierApplyResult(
@@ -346,7 +347,7 @@ def _write_classifier_predictions(
             raw_prediction_table_row_positions.size - prediction_table_row_positions.size
         ),
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
+        pred_confidence_column=prediction_confidence_column(pred_class_column),
         prediction_state_change=prediction_state_change,
         applied_at=datetime.now(UTC).isoformat(),
     )
@@ -567,7 +568,6 @@ def _clear_predictions_for_row_positions(
     prediction_table_row_positions: TableRowPositions,
     *,
     pred_class_column: str = PRED_CLASS_COLUMN,
-    pred_confidence_column: str = PRED_CONFIDENCE_COLUMN,
 ) -> PredictionStateChange:
     """Clear stale predictions when no replacement result can be produced.
 
@@ -587,18 +587,17 @@ def _clear_predictions_for_row_positions(
     prediction_table_row_positions
         Table row positions whose existing predictions must be cleared.
     pred_class_column
-        Observation column containing categorical prediction classes.
-    pred_confidence_column
-        Observation column containing floating-point prediction confidence.
+        Observation column containing categorical prediction classes. Its
+        confidence column is `prediction_confidence_column(pred_class_column)`.
 
     Returns
     -------
     PredictionStateChange
         Flags identifying the prediction columns or palette that changed.
     """
-    # Clearing removes existing prediction values; it must not create
-    # ``pred_class`` or ``pred_confidence`` merely because clear was requested.
-    if pred_class_column not in table.obs and pred_confidence_column not in table.obs:
+    # Clearing removes existing prediction values; it must not create the
+    # class or confidence column merely because clear was requested.
+    if pred_class_column not in table.obs and prediction_confidence_column(pred_class_column) not in table.obs:
         return PredictionStateChange(
             pred_class_changed=False,
             pred_confidence_changed=False,
@@ -612,7 +611,6 @@ def _clear_predictions_for_row_positions(
         pred_classes=np.array([], dtype=np.int64),
         pred_confidences=np.array([], dtype=np.float64),
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
     )
 
 
@@ -624,7 +622,6 @@ def _update_table_prediction_state(
     pred_classes: np.ndarray,
     pred_confidences: np.ndarray,
     pred_class_column: str,
-    pred_confidence_column: str,
 ) -> PredictionStateChange:
     """Conditionally mutate in-memory prediction columns and their palette.
 
@@ -647,9 +644,9 @@ def _update_table_prediction_state(
         Replacement confidence values aligned one-to-one with
         ``prediction_row_positions``.
     pred_class_column
-        Observation column containing categorical prediction classes.
-    pred_confidence_column
-        Observation column containing floating-point prediction confidence.
+        Observation column containing categorical prediction classes. The
+        floating-point confidences go to
+        `prediction_confidence_column(pred_class_column)`.
 
     Returns
     -------
@@ -665,6 +662,7 @@ def _update_table_prediction_state(
     prediction state as a no-op must return before invoking this mutation
     boundary.
     """
+    pred_confidence_column = prediction_confidence_column(pred_class_column)
     has_pred_class = pred_class_column in table.obs
     has_pred_confidence = pred_confidence_column in table.obs
     if has_pred_class != has_pred_confidence:
