@@ -530,7 +530,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | 3d.1 | Object Classification without scanning the matrix (3d design points 1-8 below): the summary reads only `obs` and `uns`, with the column count from `feature_matrix_n_features(...)`; the job carries the matrix object and the row positions instead of copies; the worker reads its rows with `read_matrix_rows(...)`, skips rows without finite features, checks the labeled count and the classes again, and returns an "ineligible" result with its reason when they no longer suffice; the result carries the counts and the predicted row positions, which the prediction write and `uns["classifier_config"]` use (point 5); the status card and the messages report the rows in the scope before a job, and the rows used and skipped after it. Tests: the controller, widget and multi-widget tests listed with the design points change; new tests as listed with the readiness check | implemented on 2026-11-06. `ResolvedClassifierScope` keeps one position array, named `table_row_positions`, now every row of the scope (the old "raw" positions); `raw_table_row_positions` and the eligible counts go. The summary uses `feature_matrix_n_features(...)`; its two "no usable rows" blockers move to the worker. A leaner contract between the main thread and the worker (settled the same day, after a review of the first version): the worker gets only a `ClassifierWorkerInput` (the matrix, the labeled training rows with their labels, the prediction rows, and the region of every row it reads, so it can name a labels element whose rows it all skipped; its docstring states the accepted risk of point 7) and returns only what it computed, a `ClassifierTrainingResult` (predictions with `predicted_row_positions`, the labeled count and classes used, the skipped counts, the estimator) or a `ClassifierIneligibleResult` (reason, labeled count and classes used). `ClassifierJob` stays on the main thread (job ID, feature key, table, summary, worker input) and is bound to the worker's signals, so the handlers combine it with the result; the summary never reaches the worker, the results echo nothing, and `labels_name`, `model_params` and `_active_job` go. `_apply_ineligible_state(feature_key=, table_name=, summary=)` serves both kinds of ineligibility. `_build_classifier_config(...)` takes `n_predicted_rows`. Tests: 19 existing tests updated (a `_fake_training_result(...)` helper in `test_classifier.py`; two tests wrap a fake in a real thread worker to keep the job); new: the summary and the job read no values (a Dask matrix that fails when computed), the worker skips rows without finite features (dense, CSR, CSC), the labeled rows are checked again after skipping, a prediction scope without features is reported by the worker and names its labels element, and the success status names it too |
    | 3d.2 | Headless `apply_classifier(...)` the same way (3d design points 6 and 9-11 below): `_read_rows_with_finite_features(...)` moves to the core, and `apply_classifier(...)` reads only the prediction rows through it, skipping rows without finite features; the estimator width check uses the shape; `normalize_feature_matrix(...)`, then without callers, is deleted; `uns["classifier_apply_config"]` drops `applied`, `table_name`, `n_predicted_rows` and `n_skipped_feature_invalid_rows`. Tests: headless with a lazy matrix, reading only the prediction rows, and the apply-config assertions | implemented on 2026-11-07: `_read_rows_with_finite_features(...)` is in `core/object_classification/classifier.py`, and the widget's worker and headless `apply_classifier(...)` both read through it; `_validate_estimator_matches_feature_matrix(...)` takes the column count; `normalize_feature_matrix(...)` is gone, and with it `feature_matrix_metadata.py`'s now-unused `numpy` import and `issparse` fallback; `_build_classifier_apply_config(...)` writes the seven kept fields. Tests: the apply-config assertions check the exact field set; new: a lazy matrix predicts the same as a NumPy one, and only the prediction rows are read (a Dask matrix whose chunk for `blobs_labels_2` fails when computed) |
    | 3d.3 | One shared classifier config (3d design points 12 and 13 below): `uns["classifier_config"]` maps each prediction class column to one entry, written by the widget (`"pred_class"`) and by headless `apply_classifier(...)` (its `pred_class_column`): `source`, `pred_class_column`, `pred_confidence_column`, `feature_key`, `prediction_regions`, `prediction_timestamp`, `prediction_scope` (widget), `classifier_path` (headless), `reason`, and `model_provenance` (`None` when nothing was trained); whoever writes a column replaces its entry; `trained` and `uns["classifier_apply_config"]` go. The export bundle's `source_classifier_config` becomes `model_provenance`, the entry's provenance as is; the bundle schema version becomes 2, checked before the payload fields. The reload status reads the `"pred_class"` entry and shows the untrained state, asking the user to train, when the entry is missing or headless wrote it. The headless docs say that the widget does not see headless run on the viewer's own SpatialData object. From the readiness check (2026-11-07): a failed training writes no entry, since it wrote no column (its status shows the error; the metadata-only table event and its `"object_classification_metadata"` source go); one entry builder in the core, used by both writers, takes every field as a required keyword; the model snapshot keeps `model_provenance` instead of the whole config, and drops its unread `trained_at`; `prediction_timestamp` is the training result's `trained_at` (the time of writing when nothing was trained) for the widget, and `applied_at` for headless. Tests: the entry's field set for both writers; the bundle's `model_provenance`, and a version-1 file refused; each writer replaces the other's `"pred_class"` entry and leaves other entries alone; a backed headless apply persists its entry; a reload after a headless apply, and of a table never trained, shows the untrained state with export unavailable; training again after a headless apply keeps the headless predictions outside the widget's prediction scope | implemented on 2026-11-07: `build_classifier_config_entry(...)`, `store_classifier_config_entry(...)` and `get_classifier_config_entry(...)` in `core/object_classification/classifier.py`; the controller builds its entry with `_build_widget_config_entry(...)` and `_build_model_provenance(...)`, and `ClassifierTableStateChangeSource` keeps only `"object_classification_inference"`; `CLASSIFIER_APPLY_CONFIG_KEY` and `_build_classifier_apply_config(...)` are gone; README and the headless docstrings describe the entry and the Reload. Tests: the widget's entry field set; headless's entry, also through the store with its `None` fields; a custom-column apply leaves the widget's entry alone, and a default-column apply replaces it but not another column's; the widget replaces headless's `pred_class` entry, keeps a custom column's entry and the predictions outside its scope; a failed training writes no entry and no table event; a reload without a widget entry (never trained, headless wrote `pred_class`) asks to train with export unavailable; a version-1 bundle file is refused |
-   | 3d.4 | The confidence column follows from the class column (3d design point 14 below): `f"{pred_class_column}_confidence"`; the default becomes `pred_class_confidence` (`PRED_CONFIDENCE_COLUMN`); the four headless functions lose `pred_confidence_column`. Tests: the tests that name the confidence column follow; headless writes `<class column>_confidence` | ready (decided on 2026-11-07), after 3d.3 |
+   | 3d.4 | The confidence column follows from the class column (3d design point 14 below): `f"{pred_class_column}_confidence"`, through one helper, `prediction_confidence_column(...)`; the default becomes `pred_class_confidence` (`PRED_CONFIDENCE_COLUMN`); the four headless functions and the core `apply_classifier(...)` lose `pred_confidence_column`, and the internal writers derive it; a table with the old `pred_confidence` is refused by the existing pair checks, without migration; the color-by tooltip, `viewer_styling.py`'s docstrings and the README follow. Tests: the tests that name the confidence column follow (8 literal names in the widget and Spatial Query modules, 16 parameter uses, mostly headless); new: headless writes `<class column>_confidence`, and a custom class column touches neither `pred_confidence` nor `pred_class_confidence` | ready (readiness check on 2026-11-08), after 3d.3 |
 
    3c.1-3c.6 are committed separately, 3c.2 in its three parts (a, b, c, in
    that order), with 3c.5 and then 3c.6 between 3c.2a and 3c.2b: design
@@ -830,12 +830,44 @@ Spatiato's own table I/O code, is the core of this bump. Order:
        `f"{pred_class_column}_confidence"`, as the palette is
        `f"{pred_class_column}_colors"`. Configuring it separately adds code
        for little gain, and lets two prediction columns write one confidence
-       column. The widget's default becomes `pred_class_confidence`
-       (`PRED_CONFIDENCE_COLUMN`, which is also a "color by" choice and one
-       of Spatial Query's reserved columns), and the four headless functions
-       lose `pred_confidence_column`. Old tables keep a stale
-       `pred_confidence` column, without migration. Separate from 3d.3,
-       whose entries record whichever confidence column is in use.
+       column. Today that happens by default: headless given only a custom
+       `pred_class_column` writes its confidences to `pred_confidence`. It
+       then either fails the pair check (`pred_confidence` exists, the
+       custom class column does not), or leaves `pred_confidence` without
+       `pred_class`, which the widget refuses to bind. The widget's default
+       becomes `pred_class_confidence` (`PRED_CONFIDENCE_COLUMN`, which is
+       also a "color by" choice, shown by its name, and one of Spatial
+       Query's reserved columns), and the four headless functions lose
+       `pred_confidence_column`. Separate from 3d.3, whose entries record
+       whichever confidence column is in use.
+
+       Readiness check (2026-11-08), settled the same day:
+       - One helper, `prediction_confidence_column(pred_class_column)`, in
+         `core/object_classification/classifier.py`;
+         `PRED_CONFIDENCE_COLUMN` is
+         `prediction_confidence_column(PRED_CLASS_COLUMN)`.
+       - The internal writers `_write_classifier_predictions(...)`,
+         `_clear_predictions_for_row_positions(...)` and
+         `_update_table_prediction_state(...)` drop their
+         `pred_confidence_column` parameter and derive it, so no caller can
+         pass a mismatched pair.
+       - The core `apply_classifier(...)` drops the parameter and its "must
+         be different" check, which can no longer fail.
+         `ClassifierApplyResult.pred_confidence_column` and the entry's field
+         stay: they report the column.
+       - Accepted: a class column named like `a_confidence` is also the
+         confidence column of a class column `a`. No guard: it needs two
+         runs with deliberately chosen names.
+       - Accepted, without migration: a table with `pred_class` and the old
+         `pred_confidence` has `pred_class` without `pred_class_confidence`,
+         so the existing pair checks refuse it. The widget shows a binding
+         error naming the missing column, and headless cannot write the
+         default columns, until the user drops `pred_class` or renames
+         `pred_confidence` by hand. Such a table's stale `pred_confidence`
+         shows as an ordinary column in Spatial Query's choices.
+       - The color-by tooltip uses the constant instead of the literal
+         `"pred_confidence"`; `viewer_styling.py`'s docstrings and the
+         README follow.
 
    Readiness check for 3c.2 (2026-11-05, against harpy 0.5.3). Today the
    centers worker computes without changing anything, and the main thread
@@ -2218,6 +2250,11 @@ Settled on 2026-11-07:
 - Step 3d.4, design point 14: the confidence column is
   `f"{pred_class_column}_confidence"`, so the default becomes
   `pred_class_confidence` and headless loses `pred_confidence_column`.
+  From the readiness check (2026-11-08): one helper derives the name, and
+  the internal writers derive it too, so no pair can mismatch; a table with
+  the old `pred_confidence` is refused by the existing pair checks until the
+  user fixes it by hand (no migration); a class column named like
+  `a_confidence` colliding with `a`'s confidence column is accepted.
 
 Settled on 2026-11-06:
 
