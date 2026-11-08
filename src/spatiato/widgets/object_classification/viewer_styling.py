@@ -259,7 +259,7 @@ class ViewerStylingController:
         """Refresh one user-class feature value without repainting label colors.
 
         This is the direct-annotation fast path for prediction color modes:
-        annotation changes `user_class`, while `pred_class`/`pred_confidence`
+        annotation changes `user_class`, while `pred_class`/`pred_class_confidence`
         colors are refreshed only when the classifier writes predictions.
         """
         if self._labels_layer is None:
@@ -332,7 +332,7 @@ class ViewerStylingController:
         """Return normalized labels features for the selected segmentation region.
 
         The returned rows are indexed by label/instance id and include
-        `user_class`, `pred_class`, and `pred_confidence`. This is scoped to the
+        `user_class`, `pred_class`, and `pred_class_confidence`. This is scoped to the
         currently selected labels element, not necessarily the complete table.
         """
         region_rows = self._get_region_rows_by_instance()
@@ -424,10 +424,7 @@ class ViewerStylingController:
             column_name=category_column,
             categories=categories,
         )
-        return {
-            class_id: _rgba_array(color)
-            for class_id, color in zip(categories, colors, strict=True)
-        }
+        return {class_id: _rgba_array(color) for class_id, color in zip(categories, colors, strict=True)}
 
 
 def _read_class_categories(

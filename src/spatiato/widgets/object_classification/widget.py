@@ -1434,7 +1434,7 @@ class ObjectClassificationWidget(QWidget):
         elif self.selected_color_by == COLOR_BY_PRED_CLASS:
             tooltip = 'Color the labels layer by "pred_class" using the stable user-class palette.'
         elif self.selected_color_by == COLOR_BY_PRED_CONFIDENCE:
-            tooltip = 'Color the labels layer by continuous "pred_confidence" values.'
+            tooltip = f'Color the labels layer by continuous "{COLOR_BY_PRED_CONFIDENCE}" values.'
         else:
             tooltip = "Choose how to color the labels layer."
 
