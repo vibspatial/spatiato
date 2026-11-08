@@ -197,19 +197,28 @@ def test_persistence_controller_syncs_table_obs_and_colors_to_backed_store(backe
     backed_sdata_blobs["table"].uns[USER_CLASS_COLORS_KEY] = ["#222222"]
     backed_sdata_blobs["table"].uns[PRED_CLASS_COLORS_KEY] = ["#222222"]
     backed_sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY] = {
-        "trained": True,
-        "reason": None,
-        "feature_key": "features_1",
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "model_type": "RandomForestClassifier",
-        "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
-        "training_scope": "all",
-        "training_regions": ["blobs_labels"],
-        "n_features": 4,
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_training_labels": 1,
-        "class_labels_seen": [2],
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": ["blobs_labels"],
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": "selected_segmentation_only",
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
+                "training_scope": "all",
+                "training_regions": ["blobs_labels"],
+                "n_features": 4,
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": 1,
+                "class_labels_seen": [2],
+            },
+        }
     }
     _record_mutation(
         app_state,
@@ -238,8 +247,11 @@ def test_persistence_controller_syncs_table_obs_and_colors_to_backed_store(backe
     assert reread["table"].obs[PRED_CONFIDENCE_COLUMN].max() == 0.95
     assert list(reread["table"].uns[USER_CLASS_COLORS_KEY]) == ["#222222"]
     assert list(reread["table"].uns[PRED_CLASS_COLORS_KEY]) == ["#222222"]
-    assert reread["table"].uns[CLASSIFIER_CONFIG_KEY]["feature_key"] == "features_1"
-    assert reread["table"].uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "selected_segmentation_only"
+    assert reread["table"].uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]["feature_key"] == "features_1"
+    assert (
+        reread["table"].uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]["prediction_scope"]
+        == "selected_segmentation_only"
+    )
     assert sorted(reread["table"].obsm.keys()) == ["features_1", "features_2"]
 
 
@@ -372,19 +384,28 @@ def test_persistence_controller_syncs_multi_region_classifier_config_fields(
     table.uns[USER_CLASS_COLORS_KEY] = ["#111111", "#222222"]
     table.uns[PRED_CLASS_COLORS_KEY] = ["#111111", "#222222"]
     table.uns[CLASSIFIER_CONFIG_KEY] = {
-        "trained": True,
-        "reason": None,
-        "feature_key": "features_1",
-        "prediction_scope": "all",
-        "prediction_regions": regions,
-        "model_type": "RandomForestClassifier",
-        "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
-        "training_scope": "all",
-        "training_regions": regions,
-        "n_features": int(table.obsm["features_1"].shape[1]),
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_training_labels": int(table.n_obs),
-        "class_labels_seen": [1, 2],
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": regions,
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": "all",
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
+                "training_scope": "all",
+                "training_regions": regions,
+                "n_features": int(table.obsm["features_1"].shape[1]),
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": int(table.n_obs),
+                "class_labels_seen": [1, 2],
+            },
+        }
     }
     _record_mutation(
         app_state,
@@ -400,18 +421,18 @@ def test_persistence_controller_syncs_multi_region_classifier_config_fields(
 
     table_path = controller.write_table_state()
     reread = read_zarr(backed_sdata_blobs_multi_region.path)
-    config = reread["table_multi"].uns[CLASSIFIER_CONFIG_KEY]
+    entry = reread["table_multi"].uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]
 
     assert table_path == "tables/table_multi"
-    assert config["feature_key"] == "features_1"
-    assert config["training_scope"] == "all"
-    assert list(config["training_regions"]) == regions
-    assert config["prediction_scope"] == "all"
-    assert list(config["prediction_regions"]) == regions
-    assert config["n_training_labels"] == table.n_obs
-    # A trained config has no reason; `None` survives the round trip.
-    assert "reason" in config
-    assert config["reason"] is None
+    assert entry["feature_key"] == "features_1"
+    assert entry["model_provenance"]["training_scope"] == "all"
+    assert list(entry["model_provenance"]["training_regions"]) == regions
+    assert entry["prediction_scope"] == "all"
+    assert list(entry["prediction_regions"]) == regions
+    assert entry["model_provenance"]["n_training_labels"] == table.n_obs
+    # A trained entry has no reason; `None` survives the round trip.
+    assert "reason" in entry
+    assert entry["reason"] is None
     assert reread["table_multi"].obs[PRED_CLASS_COLUMN].tolist().count(1) == int(
         (region_values == "blobs_labels").sum()
     )

@@ -632,7 +632,7 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
     classifier_job = classifier_jobs[0]
     classifier_worker.returned.emit(
         classifier_module.ClassifierTrainingResult(
-            trained_at="2026-07-28T12:00:00+00:00",
+            training_timestamp="2026-07-28T12:00:00+00:00",
             predicted_row_positions=classifier_job.prediction_scope.table_row_positions,
             pred_classes=np.ones(
                 classifier_job.prediction_scope.table_row_positions.shape,
@@ -643,8 +643,8 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
                 0.9,
                 dtype=np.float64,
             ),
-            labeled_count=classifier_job.summary.labeled_count,
-            class_labels=classifier_job.summary.class_labels,
+            n_training_labels=classifier_job.summary.labeled_count,
+            class_labels_seen=classifier_job.summary.class_labels,
         )
     )
     classifier_worker.finished.emit()

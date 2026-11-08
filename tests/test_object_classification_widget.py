@@ -1629,12 +1629,12 @@ def test_widget_invalidates_classifier_when_selected_feature_matrix_is_overwritt
     _set_feature_metadata(sdata_blobs)
     worker = _DeferredWorker(
         classifier_module.ClassifierTrainingResult(
-            trained_at="2026-04-23T09:00:00+00:00",
+            training_timestamp="2026-04-23T09:00:00+00:00",
             predicted_row_positions=np.array([0, 1], dtype=np.int64),
             pred_classes=np.array([1, 2], dtype=np.int64),
             pred_confidences=np.array([0.9, 0.8], dtype=np.float64),
-            labeled_count=2,
-            class_labels=(1, 2),
+            n_training_labels=2,
+            class_labels_seen=(1, 2),
         )
     )
 
@@ -3268,12 +3268,12 @@ def test_widget_reload_freezes_classifier_worker_and_ignores_late_results(
 
     def fake_create_training_worker(job):
         result = classifier_module.ClassifierTrainingResult(
-            trained_at="2026-04-13T09:00:00+00:00",
+            training_timestamp="2026-04-13T09:00:00+00:00",
             predicted_row_positions=job.prediction_scope.table_row_positions,
             pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
             pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            labeled_count=job.summary.labeled_count,
-            class_labels=job.summary.class_labels,
+            n_training_labels=job.summary.labeled_count,
+            class_labels_seen=job.summary.class_labels,
         )
         worker = _DeferredWorker(result)
         workers.append(worker)
@@ -3294,19 +3294,28 @@ def test_widget_reload_freezes_classifier_worker_and_ignores_late_results(
     obsm = dict(table.obsm)
     uns = dict(table.uns)
     uns[CLASSIFIER_CONFIG_KEY] = {
-        "trained": True,
-        "reason": None,
-        "feature_key": "features_1",
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "model_type": "RandomForestClassifier",
-        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
-        "training_scope": "all",
-        "training_regions": ["blobs_labels"],
-        "n_features": 2,
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_training_labels": 4,
-        "class_labels_seen": [1, 2],
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": ["blobs_labels"],
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": "selected_segmentation_only",
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
+                "training_scope": "all",
+                "training_regions": ["blobs_labels"],
+                "n_features": 2,
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": 4,
+                "class_labels_seen": [1, 2],
+            },
+        }
     }
     _write_disk_table_state(backed_sdata_blobs, obs=obs, obsm=obsm, uns=uns)
 
@@ -3356,12 +3365,12 @@ def test_widget_retrain_button_recovers_after_worker_finishes(qtbot, monkeypatch
 
     def fake_create_training_worker(job):
         result = classifier_module.ClassifierTrainingResult(
-            trained_at="2026-04-13T09:00:00+00:00",
+            training_timestamp="2026-04-13T09:00:00+00:00",
             predicted_row_positions=job.prediction_scope.table_row_positions,
             pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
             pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            labeled_count=job.summary.labeled_count,
-            class_labels=job.summary.class_labels,
+            n_training_labels=job.summary.labeled_count,
+            class_labels_seen=job.summary.class_labels,
         )
         worker = _DeferredWorker(result)
         workers.append(worker)
@@ -3494,7 +3503,7 @@ def test_widget_retrains_classifier_after_annotation_changes(qtbot, sdata_blobs:
     assert pred_class.loc[24] == 2
     assert "adata" not in layer.metadata
     assert "model is up to date" in widget.classifier_feedback.text()
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["trained"] is True
+    assert table.uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]["model_provenance"] is not None
     assert any(
         isinstance(event, TableStateChangedEvent)
         and event.source == "object_classification_inference"
