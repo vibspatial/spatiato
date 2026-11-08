@@ -225,27 +225,33 @@ def test_apply_classifier_can_write_custom_prediction_columns(sdata_blobs: Spati
     _set_deterministic_features(sdata_blobs)
     _set_feature_metadata(sdata_blobs)
     classifier = _make_classifier_bundle(sdata_blobs)
-    # The widget's entry describes `pred_class`, which this apply leaves alone.
+    table = sdata_blobs["table"]
+    # The widget's predictions and entry, which this apply leaves alone.
+    table.obs[PRED_CLASS_COLUMN] = pd.Categorical(np.full(table.n_obs, 7, dtype=np.int64), categories=[7])
+    table.obs[PRED_CONFIDENCE_COLUMN] = pd.Series(np.full(table.n_obs, 0.66), index=table.obs.index, dtype="float64")
     widget_entry = {"source": "widget", "pred_class_column": PRED_CLASS_COLUMN}
-    sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY] = {PRED_CLASS_COLUMN: widget_entry}
+    table.uns[CLASSIFIER_CONFIG_KEY] = {PRED_CLASS_COLUMN: widget_entry}
 
     result = headless.apply_classifier(
         sdata_blobs,
         classifier=classifier,
         table_name="table",
         pred_class_column="headless_class",
-        pred_confidence_column="headless_confidence",
     )
 
-    table = sdata_blobs["table"]
+    # The confidences go to the class column's own confidence column.
     assert result.pred_class_column == "headless_class"
-    assert result.pred_confidence_column == "headless_confidence"
+    assert result.pred_confidence_column == "headless_class_confidence"
     assert "headless_class" in table.obs
-    assert "headless_confidence" in table.obs
+    assert "headless_class_confidence" in table.obs
     entry = table.uns[CLASSIFIER_CONFIG_KEY]["headless_class"]
     assert entry["classifier_path"] is None
     assert entry["pred_class_column"] == "headless_class"
-    assert entry["pred_confidence_column"] == "headless_confidence"
+    assert entry["pred_confidence_column"] == "headless_class_confidence"
+    # The default columns and their entry are untouched, and no `pred_confidence` appears.
+    assert table.obs[PRED_CLASS_COLUMN].eq(7).all()
+    assert table.obs[PRED_CONFIDENCE_COLUMN].eq(0.66).all()
+    assert "pred_confidence" not in table.obs
     assert table.uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN] == widget_entry
 
 
@@ -543,7 +549,6 @@ def test_apply_classifier_with_feature_extraction_writes_predictions(sdata_blobs
         feature_key="computed_area",
         coordinate_system="global",
         pred_class_column="with_features_class",
-        pred_confidence_column="with_features_confidence",
     )
 
     table = sdata_blobs["table"]
@@ -551,7 +556,7 @@ def test_apply_classifier_with_feature_extraction_writes_predictions(sdata_blobs
     assert result.pred_class_column == "with_features_class"
     assert "computed_area" in table.obsm
     assert "with_features_class" in table.obs
-    assert "with_features_confidence" in table.obs
+    assert "with_features_class_confidence" in table.obs
     assert table.uns[CLASSIFIER_CONFIG_KEY]["with_features_class"]["feature_key"] == "computed_area"
 
 
@@ -606,7 +611,6 @@ def test_apply_classifier_from_path_persists_backed_prediction_state(
         classifier_path,
         table_name="table",
         pred_class_column="headless_class",
-        pred_confidence_column="headless_confidence",
     )
 
     table = backed_sdata_blobs["table"]
@@ -616,22 +620,22 @@ def test_apply_classifier_from_path_persists_backed_prediction_state(
 
     assert result.table_name == "table"
     assert "headless_class" in disk_table.obs
-    assert "headless_confidence" in disk_table.obs
+    assert "headless_class_confidence" in disk_table.obs
     assert "headless_class_colors" in disk_table.uns
     assert (
         disk_table.obs["headless_class"].astype("string").tolist()
         == table.obs["headless_class"].astype("string").tolist()
     )
     assert np.allclose(
-        disk_table.obs["headless_confidence"].to_numpy(dtype=np.float64),
-        table.obs["headless_confidence"].to_numpy(dtype=np.float64),
+        disk_table.obs["headless_class_confidence"].to_numpy(dtype=np.float64),
+        table.obs["headless_class_confidence"].to_numpy(dtype=np.float64),
     )
     # The whole entry round-trips through the store, including its `None` fields.
     assert entry["source"] == "apply_classifier"
     assert entry["classifier_path"] == str(classifier_path)
     assert entry["feature_key"] == "features_1"
     assert entry["pred_class_column"] == "headless_class"
-    assert entry["pred_confidence_column"] == "headless_confidence"
+    assert entry["pred_confidence_column"] == "headless_class_confidence"
     assert entry["prediction_scope"] is None
     assert entry["reason"] is None
     assert entry["model_provenance"]["class_labels_seen"].tolist() == [1, 2]
@@ -651,7 +655,6 @@ def test_apply_classifier_with_feature_extraction_from_path_persists_backed_feat
         table_name="table",
         labels_name="blobs_labels",
         pred_class_column="with_features_class",
-        pred_confidence_column="with_features_confidence",
     )
 
     reread = read_zarr(backed_sdata_blobs.path)
@@ -664,7 +667,7 @@ def test_apply_classifier_with_feature_extraction_from_path_persists_backed_feat
         bundle.feature_columns
     )
     assert "with_features_class" in disk_table.obs
-    assert "with_features_confidence" in disk_table.obs
+    assert "with_features_class_confidence" in disk_table.obs
     entry = disk_table.uns[CLASSIFIER_CONFIG_KEY]["with_features_class"]
     assert entry["classifier_path"] == str(classifier_path)
     assert entry["feature_key"] == "area_features"

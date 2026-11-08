@@ -548,7 +548,7 @@ def test_widget_populates_segmentation_dropdown_from_spatialdata(qtbot, sdata_bl
     assert [widget.color_by_combo.itemText(index) for index in range(widget.color_by_combo.count())] == [
         "user_class",
         "pred_class",
-        "pred_confidence",
+        "pred_class_confidence",
     ]
     assert widget.selected_segmentation_name is None
     assert widget.selected_spatialdata is sdata_blobs
@@ -2673,7 +2673,7 @@ def test_widget_user_class_annotation_updates_feature_only_in_prediction_color_m
         assert full_refresh_calls == []
 
     run_annotation_in_color_mode("pred_class")
-    run_annotation_in_color_mode("pred_confidence")
+    run_annotation_in_color_mode("pred_class_confidence")
 
 
 def test_widget_user_class_annotation_falls_back_to_full_refresh_when_prediction_feature_refresh_fails(
@@ -3576,7 +3576,7 @@ def test_widget_colors_confidence_continuously_in_pred_confidence_mode(qtbot, sd
     qtbot.addWidget(widget)
     select_segmentation(widget)
 
-    widget.color_by_combo.setCurrentIndex(widget.color_by_combo.findData("pred_confidence"))
+    widget.color_by_combo.setCurrentIndex(widget.color_by_combo.findData("pred_class_confidence"))
 
     assert isinstance(layer.colormap, DirectLabelColormap)
     assert not np.allclose(layer.colormap.color_dict[1], layer.colormap.color_dict[24])
@@ -3604,7 +3604,7 @@ def test_widget_exposes_label_metadata_in_napari_status_bar(qtbot, sdata_blobs: 
     assert "instance_id: 5" in status["value"]
     assert "user_class: 4" in status["value"]
     assert "pred_class: 2" in status["value"]
-    assert "pred_confidence: 0.95" in status["value"]
+    assert "pred_class_confidence: 0.95" in status["value"]
 
 
 def test_widget_retrain_button_triggers_manual_retraining(qtbot, monkeypatch, sdata_blobs: SpatialData) -> None:

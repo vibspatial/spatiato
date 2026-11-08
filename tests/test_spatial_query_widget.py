@@ -499,7 +499,7 @@ def test_spatial_query_shell_lists_user_class_but_excludes_classifier_outputs(
     table.obs["user_class"] = pd.Categorical([1] * table.n_obs, categories=[1])
     table.uns["user_class_colors"] = ["#ff0000"]
     table.obs["pred_class"] = pd.Categorical([1] * table.n_obs, categories=[1])
-    table.obs["pred_confidence"] = np.ones(table.n_obs, dtype=np.float64)
+    table.obs["pred_class_confidence"] = np.ones(table.n_obs, dtype=np.float64)
     obs_before = table.obs.copy(deep=True)
     uns_before = copy.deepcopy(table.uns)
     viewer = _Viewer()
@@ -514,7 +514,7 @@ def test_spatial_query_shell_lists_user_class_but_excludes_classifier_outputs(
     ]
     assert "user_class" in available_columns
     assert "pred_class" not in available_columns
-    assert "pred_confidence" not in available_columns
+    assert "pred_class_confidence" not in available_columns
 
     widget.column_mode_combo.setCurrentIndex(widget.column_mode_combo.findData("existing"))
     widget.existing_column_combo.setCurrentIndex(widget.existing_column_combo.findData("user_class"))
@@ -570,7 +570,7 @@ def test_spatial_query_shell_rejects_reserved_object_classification_new_columns(
     widget.apply_annotation_context(_context(sdata_blobs))
     _select_labels(widget)
 
-    for column_name in ("user_class", "pred_class", "pred_confidence"):
+    for column_name in ("user_class", "pred_class", "pred_class_confidence"):
         widget.new_column_edit.setText(column_name)
         assert widget.selected_column_name is None
         assert widget.run_button.isEnabled() is False

@@ -46,7 +46,6 @@ def test_update_table_prediction_state_rejects_rows_outside_clear_scope(
             pred_classes=np.array([1], dtype=np.int64),
             pred_confidences=np.array([0.9], dtype=np.float64),
             pred_class_column=PRED_CLASS_COLUMN,
-            pred_confidence_column=PRED_CONFIDENCE_COLUMN,
         )
 
     assert PRED_CLASS_COLUMN not in table.obs

@@ -32,7 +32,7 @@ def test_compatible_annotation_column_discovery_uses_shared_contract_and_table_o
     table.obs["empty"] = pd.Categorical([pd.NA] * table.n_obs, categories=[])
     table.obs["user_class"] = pd.Categorical([pd.NA] * table.n_obs, categories=[])
     table.obs["pred_class"] = pd.Categorical([1] * table.n_obs, categories=[1])
-    table.obs["pred_confidence"] = pd.Categorical(["high"] * table.n_obs, categories=["high"])
+    table.obs["pred_class_confidence"] = pd.Categorical(["high"] * table.n_obs, categories=["high"])
     table.obs["invalid_integer_category"] = pd.Categorical([0] * table.n_obs, categories=[0])
     table.obs[1] = pd.Categorical(["ignored"] * table.n_obs, categories=["ignored"])
 
@@ -195,7 +195,7 @@ def test_prediction_columns_and_new_object_classification_columns_are_rejected(
             column_mode="existing",
         )
 
-    for column_name in ("user_class", "pred_class", "pred_confidence"):
+    for column_name in ("user_class", "pred_class", "pred_class_confidence"):
         if column_name in table.obs:
             table.obs.pop(column_name)
         with pytest.raises(ValueError, match="reserved for Object Classification"):
