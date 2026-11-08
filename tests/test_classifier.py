@@ -263,17 +263,17 @@ def _fake_training_result(
     *,
     pred_class: int = 1,
     confidence: float = 0.9,
-    trained_at: str = "2026-04-13T09:00:00+00:00",
+    training_timestamp: str = "2026-04-13T09:00:00+00:00",
 ) -> classifier_module.ClassifierTrainingResult:
     """Return a result that predicts `pred_class` for every row of the job's prediction scope."""
     positions = job.prediction_scope.table_row_positions
     return classifier_module.ClassifierTrainingResult(
-        trained_at=trained_at,
+        training_timestamp=training_timestamp,
         predicted_row_positions=positions,
         pred_classes=np.full(positions.shape, pred_class, dtype=np.int64),
         pred_confidences=np.full(positions.shape, confidence, dtype=np.float64),
-        labeled_count=job.summary.labeled_count,
-        class_labels=job.summary.class_labels,
+        n_training_labels=job.summary.labeled_count,
+        class_labels_seen=job.summary.class_labels,
     )
 
 
@@ -294,6 +294,36 @@ def test_preparation_summary_requires_a_blocker_reason_with_its_kind(blocker: st
         )
 
 
+_ENTRY_FIELDS = {
+    "source",
+    "pred_class_column",
+    "pred_confidence_column",
+    "feature_key",
+    "prediction_regions",
+    "prediction_timestamp",
+    "prediction_scope",
+    "classifier_path",
+    "reason",
+    "model_provenance",
+}
+_MODEL_PROVENANCE_FIELDS = {
+    "feature_key",
+    "model_type",
+    "rf_params",
+    "training_scope",
+    "training_regions",
+    "n_features",
+    "training_timestamp",
+    "n_training_labels",
+    "class_labels_seen",
+}
+
+
+def _widget_entry(table) -> dict[str, object]:
+    """Return the `uns["classifier_config"]` entry of `pred_class`, or `{}` before one is written."""
+    return table.uns.get(CLASSIFIER_CONFIG_KEY, {}).get(PRED_CLASS_COLUMN, {})
+
+
 def _trained_config(
     *,
     prediction_scope: str,
@@ -303,19 +333,46 @@ def _trained_config(
 ) -> dict[str, object]:
     """Return `uns["classifier_config"]` as the controller writes it after training."""
     return {
-        "trained": True,
-        "reason": None,
-        "feature_key": "features_1",
-        "prediction_scope": prediction_scope,
-        "prediction_regions": prediction_regions,
-        "model_type": "RandomForestClassifier",
-        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
-        "training_scope": "all",
-        "training_regions": training_regions,
-        "n_features": n_features,
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_training_labels": 4,
-        "class_labels_seen": [1, 2],
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": prediction_regions,
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": prediction_scope,
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
+                "training_scope": "all",
+                "training_regions": training_regions,
+                "n_features": n_features,
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": 4,
+                "class_labels_seen": [1, 2],
+            },
+        }
+    }
+
+
+def _headless_entry(*, pred_class_column: str, prediction_regions: list[str]) -> dict[str, object]:
+    """Return a `uns["classifier_config"]` entry as headless `apply_classifier(...)` writes it."""
+    entry = _trained_config(
+        prediction_scope="all",
+        prediction_regions=prediction_regions,
+        training_regions=["blobs_labels"],
+        n_features=2,
+    )[PRED_CLASS_COLUMN]
+    return {
+        **entry,
+        "source": "apply_classifier",
+        "pred_class_column": pred_class_column,
+        "pred_confidence_column": f"{pred_class_column}_confidence",
+        "prediction_scope": None,
+        "classifier_path": "classifier.spatiato-classifier.joblib",
     }
 
 
@@ -356,9 +413,20 @@ def test_classifier_controller_trains_on_labeled_rows_and_predicts_active_object
     assert pred_class.loc[26] == 2
     assert pd.to_numeric(pred_class.astype("string"), errors="coerce").min() >= 1
     assert pred_confidence.between(0.0, 1.0).all()
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["trained"] is True
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["reason"] is None
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["class_labels_seen"] == [1, 2]
+    # One entry, for the column the widget wrote.
+    assert set(table.uns[CLASSIFIER_CONFIG_KEY]) == {PRED_CLASS_COLUMN}
+    entry = _widget_entry(table)
+    assert set(entry) == _ENTRY_FIELDS
+    assert set(entry["model_provenance"]) == _MODEL_PROVENANCE_FIELDS
+    assert entry["source"] == "widget"
+    assert entry["pred_class_column"] == PRED_CLASS_COLUMN
+    assert entry["pred_confidence_column"] == PRED_CONFIDENCE_COLUMN
+    assert entry["feature_key"] == "features_1"
+    assert entry["prediction_timestamp"] == entry["model_provenance"]["training_timestamp"]
+    assert entry["classifier_path"] is None
+    assert entry["reason"] is None
+    assert entry["model_provenance"]["feature_key"] == "features_1"
+    assert entry["model_provenance"]["class_labels_seen"] == [1, 2]
     assert controller.status_kind == "success"
     assert table_state_changes == ["changed"]
     assert prediction_state_changes == ["changed"]
@@ -391,7 +459,7 @@ def test_classifier_controller_exports_trained_classifier_bundle(
     assert loaded.feature_names == ("synthetic_size", "synthetic_position")
     assert loaded.n_features == 2
     assert loaded.class_labels_seen == (1, 2)
-    assert loaded.source_classifier_config == table.uns[CLASSIFIER_CONFIG_KEY]
+    assert loaded.model_provenance == _widget_entry(table)["model_provenance"]
     assert loaded.source_feature_metadata == table.uns[_FEATURE_MATRICES_KEY]["features_1"]
     assert np.array_equal(loaded.estimator.predict(feature_matrix), bundle.estimator.predict(feature_matrix))
 
@@ -429,7 +497,7 @@ def test_classifier_controller_mark_dirty_invalidates_active_worker_and_ignores_
     table_state_changes: list[classifier_module.ClassifierTableStateChange] = []
 
     def fake_create_training_worker(job):
-        worker = _DeferredWorker(_fake_training_result(job, trained_at="2026-07-27T09:00:00+00:00"))
+        worker = _DeferredWorker(_fake_training_result(job, training_timestamp="2026-07-27T09:00:00+00:00"))
         workers.append(worker)
         return worker
 
@@ -746,11 +814,7 @@ def test_classifier_controller_prediction_scope_all_clears_invalid_rows_in_scope
     invalid_rows = region_values == "blobs_labels_2"
 
     qtbot.waitUntil(
-        lambda: (
-            CLASSIFIER_CONFIG_KEY in table.uns
-            and table.uns[CLASSIFIER_CONFIG_KEY].get("trained") is True
-            and controller.status_kind == "success"
-        ),
+        lambda: _widget_entry(table).get("model_provenance") is not None and controller.status_kind == "success",
         timeout=5000,
     )
 
@@ -758,14 +822,15 @@ def test_classifier_controller_prediction_scope_all_clears_invalid_rows_in_scope
     assert table.obs.loc[valid_rows, PRED_CONFIDENCE_COLUMN].between(0.0, 1.0).all()
     assert table.obs.loc[invalid_rows, PRED_CLASS_COLUMN].isna().all()
     assert table.obs.loc[invalid_rows, PRED_CONFIDENCE_COLUMN].isna().all()
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "all"
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_regions"] == ["blobs_labels", "blobs_labels_2"]
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["training_scope"] == "all"
+    entry = _widget_entry(table)
+    assert entry["prediction_scope"] == "all"
+    assert entry["prediction_regions"] == ["blobs_labels", "blobs_labels_2"]
+    assert entry["model_provenance"]["training_scope"] == "all"
     # The worker skipped the rows of "blobs_labels_2", and the status names it.
     assert f"Updated predictions for {int(valid_rows.sum())} objects" in controller.status_message
     assert f"Skipped {int(invalid_rows.sum())} row(s) without finite features" in controller.status_message
     assert '"blobs_labels_2"' in controller.status_message
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_training_labels"] == 4
+    assert entry["model_provenance"]["n_training_labels"] == 4
     assert len(table_state_changes) == 1
     assert table_state_changes[0].regions == ("blobs_labels", "blobs_labels_2")
     assert table_state_changes[0].source == "object_classification_inference"
@@ -811,8 +876,8 @@ def test_classifier_worker_skips_rows_without_finite_features(sdata_blobs: Spati
     assert result.n_skipped_prediction_rows == 2
     assert result.n_skipped_labeled_rows == 1
     # The labeled count and classes of the rows used for training.
-    assert result.labeled_count == 4
-    assert result.class_labels == (1, 2)
+    assert result.n_training_labels == 4
+    assert result.class_labels_seen == (1, 2)
     assert result.prediction_regions_without_features == ()
 
 
@@ -877,18 +942,24 @@ def test_classifier_worker_input_is_derived_from_the_summary_scopes(sdata_blobs_
 @pytest.mark.parametrize("field", ["pred_classes", "pred_confidences"])
 def test_classifier_training_result_requires_aligned_predictions(field: str) -> None:
     aligned = {
-        "trained_at": "2026-11-06T09:00:00+00:00",
+        "training_timestamp": "2026-11-06T09:00:00+00:00",
         "predicted_row_positions": np.array([0, 1], dtype=np.int64),
         "pred_classes": np.array([1, 2], dtype=np.int64),
         "pred_confidences": np.array([0.9, 0.8], dtype=np.float64),
-        "labeled_count": 2,
-        "class_labels": (1, 2),
+        "n_training_labels": 2,
+        "class_labels_seen": (1, 2),
     }
     classifier_module.ClassifierTrainingResult(**aligned)
 
     # One element short.
     with pytest.raises(ValueError, match="must align with `predicted_row_positions`"):
         classifier_module.ClassifierTrainingResult(**{**aligned, field: aligned[field][:-1]})
+
+
+def _set_existing_predictions(table) -> None:
+    """Give `table` prediction columns, as an earlier run would have written them."""
+    table.obs[PRED_CLASS_COLUMN] = pd.Categorical(np.full(table.n_obs, 1, dtype=np.int64), categories=[1, 2])
+    table.obs[PRED_CONFIDENCE_COLUMN] = pd.Series(np.full(table.n_obs, 0.5), index=table.obs.index, dtype="float64")
 
 
 def test_classifier_worker_checks_labeled_rows_again_after_skipping(qtbot, sdata_blobs: SpatialData) -> None:
@@ -898,22 +969,23 @@ def test_classifier_worker_checks_labeled_rows_again_after_skipping(qtbot, sdata
     # Every labeled row of class 2.
     _set_nan_features_for_instances(sdata_blobs, {24, 25})
     table = sdata_blobs["table"]
+    _set_existing_predictions(table)
     controller = ClassifierController(debounce_interval_ms=0)
     controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
 
     # The summary counts every labeled row, so Train is allowed.
     assert controller.can_retrain is True
     controller.retrain_now()
-    qtbot.waitUntil(lambda: table.uns.get(CLASSIFIER_CONFIG_KEY, {}).get("trained") is False, timeout=5000)
+    qtbot.waitUntil(lambda: bool(_widget_entry(table).get("reason")), timeout=5000)
 
-    config = table.uns[CLASSIFIER_CONFIG_KEY]
-    assert "Need at least two labeled classes with finite features" in config["reason"]
-    # Nothing was trained, so the fields describing the model are empty.
-    assert config["training_timestamp"] is None
-    assert config["n_training_labels"] == 0
-    assert config["class_labels_seen"] == []
+    entry = _widget_entry(table)
+    assert "Need at least two labeled classes with finite features" in entry["reason"]
+    # Nothing was trained, so there is no model to describe.
+    assert entry["model_provenance"] is None
+    assert set(entry) == _ENTRY_FIELDS
+    assert table.obs[PRED_CLASS_COLUMN].isna().all()
     assert controller.status_kind == "warning"
-    assert controller.status_message == f"Classifier: {config['reason']}"
+    assert controller.status_message == f"Classifier: {entry['reason']}"
 
 
 def test_classifier_worker_reports_a_prediction_scope_without_features(
@@ -938,13 +1010,12 @@ def test_classifier_worker_reports_a_prediction_scope_without_features(
     # No longer disabled in advance: only the worker reads the feature values.
     assert controller.can_retrain is True
     controller.retrain_now()
-    qtbot.waitUntil(lambda: table.uns.get(CLASSIFIER_CONFIG_KEY, {}).get("trained") is False, timeout=5000)
+    qtbot.waitUntil(lambda: "has no usable rows in the prediction scope" in controller.status_message, timeout=5000)
 
-    reason = table.uns[CLASSIFIER_CONFIG_KEY]["reason"]
-    assert "has no usable rows in the prediction scope" in reason
-    assert 'Labels element(s) "blobs_labels" have no rows with finite features' in reason
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["n_training_labels"] == 0
+    assert 'Labels element(s) "blobs_labels" have no rows with finite features' in controller.status_message
     assert controller.status_kind == "warning"
+    # No prediction column was ever written, so there is no entry to describe one.
+    assert CLASSIFIER_CONFIG_KEY not in table.uns
 
 
 def test_classifier_controller_default_prediction_scope_leaves_hidden_regions_unchanged(
@@ -989,8 +1060,61 @@ def test_classifier_controller_default_prediction_scope_leaves_hidden_regions_un
     assert table.obs.loc[hidden_rows, PRED_CONFIDENCE_COLUMN].eq(0.55).all()
     assert list(table.obs[PRED_CLASS_COLUMN].cat.categories) == [3, 9]
     assert table.uns[PRED_CLASS_COLORS_KEY] == default_class_colors([3, 9])
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "selected_segmentation_only"
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["prediction_regions"] == ["blobs_labels"]
+    assert _widget_entry(table)["prediction_scope"] == "selected_segmentation_only"
+    assert _widget_entry(table)["prediction_regions"] == ["blobs_labels"]
+
+
+def test_classifier_controller_training_replaces_the_pred_class_entry_and_keeps_other_entries(
+    monkeypatch, sdata_blobs_multi_region: SpatialData
+) -> None:
+    """Training replaces headless's `classifier_config["pred_class"]` entry with the widget's own.
+
+    The entry of a custom column stays, and so do headless's predictions
+    outside the widget's prediction scope.
+    """
+    _set_multi_region_feature_metadata(sdata_blobs_multi_region)
+    _set_user_classes_by_region(
+        sdata_blobs_multi_region,
+        {
+            ("blobs_labels", 1): 1,
+            ("blobs_labels", 2): 1,
+            ("blobs_labels", 24): 2,
+            ("blobs_labels", 25): 2,
+        },
+    )
+    table = sdata_blobs_multi_region["table_multi"]
+    # As headless leaves the table: `pred_class` predicted for both labels
+    # elements, and entries for `pred_class` and for a custom column.
+    table.obs[PRED_CLASS_COLUMN] = pd.Categorical(np.full(table.n_obs, 9, dtype=np.int64), categories=[3, 9])
+    table.obs[PRED_CONFIDENCE_COLUMN] = pd.Series(np.full(table.n_obs, 0.55), index=table.obs.index, dtype="float64")
+    both_regions = ["blobs_labels", "blobs_labels_2"]
+    custom_entry = _headless_entry(pred_class_column="my_pred", prediction_regions=both_regions)
+    table.uns[CLASSIFIER_CONFIG_KEY] = {
+        PRED_CLASS_COLUMN: _headless_entry(pred_class_column=PRED_CLASS_COLUMN, prediction_regions=both_regions),
+        "my_pred": custom_entry,
+    }
+    workers: dict[int, _DeferredWorker] = {}
+
+    def fake_create_training_worker(self, job):
+        del self
+        worker = _DeferredWorker(_fake_training_result(job, pred_class=3, confidence=0.88))
+        workers[job.job_id] = worker
+        return worker
+
+    monkeypatch.setattr(ClassifierController, "_create_training_worker", fake_create_training_worker)
+
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs_multi_region, "blobs_labels", "table_multi", "features_1")
+    assert controller.retrain_now() is True
+    workers[1].emit_returned()
+
+    # The widget's entry replaces headless's for `pred_class`; the custom column's entry stays.
+    assert _widget_entry(table)["source"] == "widget"
+    assert _widget_entry(table)["prediction_regions"] == ["blobs_labels"]
+    assert table.uns[CLASSIFIER_CONFIG_KEY]["my_pred"] == custom_entry
+    # Headless's predictions outside the widget's prediction scope stay.
+    hidden_rows = table.obs["region"].astype("string") == "blobs_labels_2"
+    assert table.obs.loc[hidden_rows, PRED_CLASS_COLUMN].astype("string").eq("9").all()
 
 
 def _fail_when_read(block: np.ndarray) -> np.ndarray:
@@ -1086,18 +1210,37 @@ def test_classifier_controller_does_not_create_absent_predictions_when_only_one_
     assert PRED_CLASS_COLUMN not in table.obs
     assert PRED_CONFIDENCE_COLUMN not in table.obs
     assert PRED_CLASS_COLORS_KEY not in table.uns
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["trained"] is False
-    assert "two labeled classes" in table.uns[CLASSIFIER_CONFIG_KEY]["reason"]
+    # Clearing absent columns wrote nothing: no entry, and no table change.
+    assert CLASSIFIER_CONFIG_KEY not in table.uns
+    assert "two labeled classes" in controller.status_message
     assert controller.status_kind == "warning"
-    assert len(table_state_changes) == 1
-    assert table_state_changes[0].regions == ("blobs_labels",)
-    assert table_state_changes[0].source == "object_classification_inference"
-    assert table_state_changes[0].paths == frozenset(
-        {
-            TableComponentPath("uns", (CLASSIFIER_CONFIG_KEY,)),
-        }
-    )
+    assert table_state_changes == []
     assert prediction_state_changes == []
+
+
+def test_classifier_controller_records_the_latest_reason_when_the_scope_is_already_cleared(
+    qtbot, sdata_blobs: SpatialData
+) -> None:
+    _set_deterministic_features(sdata_blobs)
+    _set_feature_metadata(sdata_blobs)
+    table = sdata_blobs["table"]
+    _set_existing_predictions(table)
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
+
+    # The summary blocks Train, and the scope's predictions are cleared.
+    _set_user_classes(sdata_blobs, {1: 1, 2: 1})
+    controller.schedule_retrain(immediate=True)
+    assert "two labeled classes" in _widget_entry(table)["reason"]
+    assert table.obs[PRED_CLASS_COLUMN].isna().all()
+
+    # The worker finds a new reason; clearing the scope again changes nothing.
+    _set_user_classes(sdata_blobs, {1: 1, 2: 1, 24: 2, 25: 2})
+    _set_nan_features_for_instances(sdata_blobs, {24, 25})
+    controller.retrain_now()
+    qtbot.waitUntil(lambda: "with finite features" in _widget_entry(table)["reason"], timeout=5000)
+
+    assert _widget_entry(table)["model_provenance"] is None
 
 
 def test_classifier_controller_clears_existing_predictions_without_removing_vocabulary(
@@ -1163,7 +1306,8 @@ def test_classifier_controller_validates_feature_matrix_shape(qtbot, monkeypatch
     assert PRED_CLASS_COLUMN not in table.obs
     assert PRED_CONFIDENCE_COLUMN not in table.obs
     assert PRED_CLASS_COLORS_KEY not in table.uns
-    assert "rows but the table has" in table.uns[CLASSIFIER_CONFIG_KEY]["reason"]
+    assert "rows but the table has" in controller.status_message
+    assert CLASSIFIER_CONFIG_KEY not in table.uns
     assert controller.status_kind == "warning"
 
 
@@ -1180,8 +1324,8 @@ def test_classifier_controller_drops_stale_results(qtbot, monkeypatch, sdata_blo
         call_log.append(job.job_id)
         if job.job_id == 1:
             time.sleep(0.2)
-            return _fake_training_result(job, pred_class=1, trained_at="2026-04-08T12:00:00+00:00")
-        return _fake_training_result(job, pred_class=2, trained_at="2026-04-08T12:00:00+00:00")
+            return _fake_training_result(job, pred_class=1, training_timestamp="2026-04-08T12:00:00+00:00")
+        return _fake_training_result(job, pred_class=2, training_timestamp="2026-04-08T12:00:00+00:00")
 
     monkeypatch.setattr(ClassifierController, "_create_training_worker", lambda self, job: fake_fit(job))
 
@@ -1220,7 +1364,7 @@ def test_classifier_controller_bind_is_passive_until_marked_dirty(qtbot, monkeyp
     @classifier_module.thread_worker(start_thread=False, ignore_errors=True)
     def fake_fit(job):
         call_log.append(job.job_id)
-        return _fake_training_result(job, trained_at="2026-04-08T12:00:00+00:00")
+        return _fake_training_result(job, training_timestamp="2026-04-08T12:00:00+00:00")
 
     monkeypatch.setattr(ClassifierController, "_create_training_worker", lambda self, job: fake_fit(job))
 
@@ -1256,7 +1400,7 @@ def test_classifier_controller_bind_is_passive_until_marked_dirty(qtbot, monkeyp
     assert prediction_state_changes == ["changed"]
 
 
-def test_classifier_controller_notifies_table_state_change_when_training_errors(
+def test_classifier_controller_leaves_the_table_alone_when_training_errors(
     qtbot, monkeypatch, sdata_blobs: SpatialData
 ) -> None:
     _set_deterministic_features(sdata_blobs)
@@ -1281,14 +1425,13 @@ def test_classifier_controller_notifies_table_state_change_when_training_errors(
 
     qtbot.waitUntil(lambda: controller.status_kind == "error", timeout=5000)
 
-    assert len(table_state_changes) == 1
-    assert table_state_changes[0].regions == ()
-    assert table_state_changes[0].source == "object_classification_metadata"
+    # A failed training wrote no column, so it writes no entry either.
+    assert table_state_changes == []
     assert prediction_state_changes == []
-    assert sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY]["trained"] is False
-    assert "boom" in sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY]["reason"]
-    assert sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY]["training_scope"] == "all"
-    assert sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "selected_segmentation_only"
+    assert CLASSIFIER_CONFIG_KEY not in sdata_blobs["table"].uns
+    assert "boom" in controller.status_message
+    assert controller.is_dirty is True
+    assert controller.can_export_classifier is False
 
 
 def test_classifier_controller_freeze_for_reload_cancels_pending_debounce(
@@ -1416,12 +1559,12 @@ def test_classifier_controller_invalidates_pending_work_for_selected_feature_mat
     _set_feature_metadata(sdata_blobs)
     _set_user_classes(sdata_blobs, {1: 1, 2: 1, 24: 2, 25: 2})
     result = classifier_module.ClassifierTrainingResult(
-        trained_at="2026-04-13T09:00:00+00:00",
+        training_timestamp="2026-04-13T09:00:00+00:00",
         predicted_row_positions=np.array([0, 1], dtype=np.int64),
         pred_classes=np.array([1, 2], dtype=np.int64),
         pred_confidences=np.array([0.9, 0.8], dtype=np.float64),
-        labeled_count=2,
-        class_labels=(1, 2),
+        n_training_labels=2,
+        class_labels_seen=(1, 2),
     )
     worker = _DeferredWorker(result)
 
@@ -1547,3 +1690,34 @@ def test_classifier_controller_reset_after_reload_accepts_multi_region_predictio
         controller.status_message
         == f"Classifier: model is up to date. Loaded predictions for {table.n_obs} objects from disk."
     )
+
+
+@pytest.mark.parametrize("config", ["never_trained", "headless_wrote_pred_class", "old_flat_layout"])
+def test_classifier_controller_reset_after_reload_asks_to_train_without_a_widget_entry(
+    qtbot, sdata_blobs: SpatialData, config: str
+) -> None:
+    _set_deterministic_features(sdata_blobs)
+    _set_feature_metadata(sdata_blobs)
+    _set_user_classes(sdata_blobs, {1: 1, 2: 1, 24: 2, 25: 2})
+    table = sdata_blobs["table"]
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
+    controller.retrain_now()
+    qtbot.waitUntil(lambda: controller.can_export_classifier, timeout=5000)
+
+    # The table as reloaded from disk.
+    if config == "never_trained":
+        del table.uns[CLASSIFIER_CONFIG_KEY]
+    elif config == "headless_wrote_pred_class":
+        table.uns[CLASSIFIER_CONFIG_KEY] = {
+            PRED_CLASS_COLUMN: _headless_entry(pred_class_column=PRED_CLASS_COLUMN, prediction_regions=["blobs_labels"])
+        }
+    else:
+        table.uns[CLASSIFIER_CONFIG_KEY] = {"trained": True, "feature_key": "features_1"}
+    controller.reset_after_reload()
+
+    assert controller.is_dirty is True
+    assert (
+        controller.status_message == "Classifier: no trained model for this table. Click Train Classifier to train one."
+    )
+    assert controller.can_export_classifier is False
