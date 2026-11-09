@@ -202,9 +202,10 @@ class ClassifierWorkerInput:
 
     The input carries the feature matrix object and the row positions to read,
     not copies. The worker reads only the labeled rows of the training scope
-    and the rows of the prediction scope, with `read_matrix_rows(...)`. For a
-    lazy or backed matrix, only these rows reach memory: an unlabeled row is
-    read only to be predicted, and a row outside both scopes is never read.
+    and the rows of the prediction scope, with `read_matrix_rows(...)`, which
+    returns only those rows. For a lazy or backed matrix, it reads only the
+    stored chunks or blocks that contain one of them, and a backed CSC matrix
+    whole. An unlabeled row is read only to be predicted.
 
     Parameters
     ----------
@@ -1414,12 +1415,16 @@ class ClassifierController:
         if self._selected_labels_name is not None and self._selected_labels_name not in entry_prediction_regions:
             mismatches.append(f'loaded predictions do not cover labels element "{self._selected_labels_name}"')
 
+        model_provenance = entry.get("model_provenance")
+        if isinstance(model_provenance, Mapping):
+            mismatches.extend(self._reloaded_model_mismatches(table, model_provenance))
+
         if mismatches:
             self._is_dirty = True
             self._set_status(f"Classifier: model is stale because {'; '.join(mismatches)}.", kind="warning")
             return
 
-        if isinstance(entry.get("model_provenance"), Mapping):
+        if isinstance(model_provenance, Mapping):
             # Counted from the table, which holds the predictions themselves.
             predicted_count = self._count_predicted_rows(table, entry_prediction_regions)
             self._set_status(
@@ -1428,12 +1433,49 @@ class ClassifierController:
             )
             return
 
+        # Without `model_provenance`, the entry records that nothing was
+        # trained and the prediction scope was cleared, so the model is stale,
+        # as it was before the reload.
+        self._is_dirty = True
         reason = entry.get("reason")
         if isinstance(reason, str) and reason:
             self._set_status(f"Classifier: {reason}", kind="warning")
             return
 
         self._update_idle_status()
+
+    def _reloaded_model_mismatches(self, table: AnnData, model_provenance: Mapping[str, object]) -> list[str]:
+        """Compare how a reloaded model was trained with the current selection and feature matrix.
+
+        Annotations changed since training are not detected, nor other feature
+        columns of the same width: the entry does not record which labels and
+        columns the model was trained on. Compare those too once
+        https://github.com/vibspatial/spatiato/issues/133 is resolved.
+        """
+        mismatches: list[str] = []
+        training_scope = model_provenance.get("training_scope")
+        if not isinstance(training_scope, str):
+            mismatches.append("loaded predictions do not describe their training scope")
+        elif training_scope != self._selected_training_scope:
+            mismatches.append(
+                f'loaded predictions use training scope "{training_scope}" but "{self._selected_training_scope}" is selected'
+            )
+
+        trained_n_features = model_provenance.get("n_features")
+        if self._selected_feature_key is None or not isinstance(trained_n_features, (int, np.integer)):
+            return mismatches
+        try:
+            # Only the matrix's shape is read.
+            n_features = feature_matrix_n_features(table.obsm[self._selected_feature_key], table.n_obs)
+        except (KeyError, ValueError):
+            # The summary reports a missing or unusable matrix.
+            return mismatches
+        if n_features != int(trained_n_features):
+            mismatches.append(
+                f"loaded predictions were made from {int(trained_n_features)} feature column(s) but "
+                f'feature matrix "{self._selected_feature_key}" has {n_features}'
+            )
+        return mismatches
 
     def _resolve_classifier_scopes(
         self,
