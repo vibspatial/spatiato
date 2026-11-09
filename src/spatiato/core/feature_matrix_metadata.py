@@ -285,6 +285,9 @@ def register_feature_matrix_metadata(
     metadata: dict[str, object] = {
         "feature_columns": list(resolved_feature_columns),
         "schema_version": FEATURE_MATRIX_METADATA_SCHEMA_VERSION,
+        # The layout, not where the values live: any dense matrix, also a lazy
+        # or backed one, is "numpy", as harpy records its dense feature
+        # matrices. Nothing in Spatiato reads this field.
         "backend": "sparse" if is_sparse_matrix(raw_feature_matrix) else "numpy",
         # `feature_matrix_n_features(...)` above guarantees a dtype.
         "dtype": str(raw_feature_matrix.dtype),
