@@ -5,6 +5,7 @@ from html import unescape
 from types import SimpleNamespace
 
 import dask
+import dask.array as da
 import dask.dataframe as dd
 import geopandas as gpd
 import numpy as np
@@ -513,14 +514,10 @@ def test_image_card_reconstructs_overlay_row_for_replacement_binding(
         )
     )
     card.overlay_channel_color_requested.connect(
-        lambda image_name, channel_index, color: stale_color_requests.append(
-            (image_name, channel_index, color)
-        )
+        lambda image_name, channel_index, color: stale_color_requests.append((image_name, channel_index, color))
     )
     card.overlay_channel_remove_requested.connect(
-        lambda image_name, channel_index: stale_remove_requests.append(
-            (image_name, channel_index)
-        )
+        lambda image_name, channel_index: stale_remove_requests.append((image_name, channel_index))
     )
     first_row.visibility_change_requested.emit(False)
     first_row.color_change_requested.emit("#123456")
@@ -2101,7 +2098,44 @@ def test_viewer_widget_confirmed_spatialdata_replacement_loads_new_session(
     assert widget.app_state.sdata is replacement_sdata
 
 
-def test_viewer_widget_open_spatialdata_shows_error_when_loading_fails(qtbot, monkeypatch) -> None:
+def test_viewer_widget_open_spatialdata_opens_table_matrices_lazily(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+    sdata_blobs: SpatialData,
+) -> None:
+    """Open reads a real store with harpy's reader, so table matrices are Dask arrays."""
+    store_path = tmp_path / "blobs.zarr"
+    sdata_blobs.write(store_path)
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    qtbot.addWidget(widget)
+    monkeypatch.setattr(
+        viewer_widget_module.QFileDialog,
+        "getExistingDirectory",
+        lambda *args, **kwargs: str(store_path),
+    )
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.open_sdata_button.click()
+
+    sdata = widget.app_state.sdata
+    assert sdata is not None
+    assert sdata.is_backed()
+    table = sdata.tables["table"]
+    assert isinstance(table.X, da.Array)
+    assert sorted(table.obsm.keys()) == ["features_1", "features_2"]
+    for key in table.obsm:
+        assert isinstance(table.obsm[key], da.Array)
+
+
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_viewer_widget_open_spatialdata_shows_error_when_loading_fails(
+    qtbot,
+    monkeypatch,
+    error_type: type[Exception],
+) -> None:
+    """Open reports any failure of the reader as feedback, not only `OSError` and `ValueError`."""
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
 
@@ -2114,7 +2148,7 @@ def test_viewer_widget_open_spatialdata_shows_error_when_loading_fails(qtbot, mo
     )
 
     def raise_read_error(path: str) -> object:
-        raise ValueError(f"bad store at {path}")
+        raise error_type(f"bad store at {path}")
 
     monkeypatch.setattr(viewer_widget_module, "read_zarr", raise_read_error)
 

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 import pandas as pd
+from harpy.io import read_zarr
 from pandas.api.types import is_bool_dtype, is_numeric_dtype, is_object_dtype, is_string_dtype
 from qtpy.QtCore import QSignalBlocker, Qt
 from qtpy.QtWidgets import (
@@ -18,7 +19,6 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from spatialdata import read_zarr
 
 from spatiato._app_state import (
     CoordinateSystemChangedEvent,
@@ -437,8 +437,10 @@ class ViewerWidget(QWidget):
             return
 
         try:
+            # harpy's reader opens every table matrix lazily, as Dask arrays
+            # that read from the store; `obs`, `var` and `uns` are read into memory.
             sdata = read_zarr(selected_path)
-        except (OSError, ValueError) as error:
+        except Exception as error:  # noqa: BLE001 - this UI boundary must report every load failure.
             self._set_action_feedback(
                 title="SpatialData Load Error",
                 lines=[f"Could not load SpatialData store: {error}"],

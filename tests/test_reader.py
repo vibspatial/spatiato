@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import dask.array as da
+from spatialdata import SpatialData
+
 import spatiato._reader as reader_module
 
 
@@ -63,7 +66,9 @@ def test_reader_loads_spatialdata_into_spatiato_app_state(tmp_path, monkeypatch)
     viewer_dock_raised: list[str] = []
 
     class _FakeWindow:
-        def add_plugin_dock_widget(self, plugin_name: str, widget_name: str, tabify: bool = False) -> tuple[object, object]:
+        def add_plugin_dock_widget(
+            self, plugin_name: str, widget_name: str, tabify: bool = False
+        ) -> tuple[object, object]:
             window_calls.append((plugin_name, widget_name, tabify))
             dock_widget = type("FakeDockWidget", (), {"raise_": lambda self: viewer_dock_raised.append(widget_name)})()
             return dock_widget, object()
@@ -98,6 +103,36 @@ def test_reader_loads_spatialdata_into_spatiato_app_state(tmp_path, monkeypatch)
         ("spatiato", "Object Classification", True),
     ]
     assert viewer_dock_raised == ["Viewer"]
+
+
+def test_reader_opens_table_matrices_lazily(tmp_path, monkeypatch, sdata_blobs: SpatialData) -> None:
+    """The napari reader opens a real store with harpy's reader, so table matrices are Dask arrays."""
+    store_path = tmp_path / "blobs.zarr"
+    sdata_blobs.write(store_path)
+    recorded_sdata: list[SpatialData] = []
+
+    class _FakeState:
+        sdata = None
+
+        def set_sdata(self, sdata: SpatialData, *, discard_current: bool = False) -> None:
+            del discard_current
+            recorded_sdata.append(sdata)
+
+    fake_viewer = type("FakeViewer", (), {"window": object()})()
+    monkeypatch.setattr(reader_module.napari, "current_viewer", lambda: fake_viewer)
+    monkeypatch.setattr(reader_module, "get_or_create_app_state", lambda _viewer: _FakeState())
+
+    reader = reader_module.get_reader(str(store_path))
+    assert reader is not None
+    reader(str(store_path))
+
+    (sdata,) = recorded_sdata
+    table = sdata.tables["table"]
+    assert sdata.is_backed()
+    assert isinstance(table.X, da.Array)
+    assert sorted(table.obsm.keys()) == ["features_1", "features_2"]
+    for key in table.obsm:
+        assert isinstance(table.obsm[key], da.Array)
 
 
 def test_reader_cancelled_replacement_preserves_current_session(tmp_path, monkeypatch) -> None:
