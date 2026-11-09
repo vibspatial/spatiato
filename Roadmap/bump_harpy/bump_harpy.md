@@ -1055,7 +1055,7 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    | Sub-step | Content | Status |
    |---|---|---|
    | 4a | Writes through harpy (P5, step-4 design points 1-4 below): `write_table_components(...)` keeps its signature and result, and maps the paths onto `hp.tb.io.add_table_components(...)`, or onto `remove_table_components(...)` when every path is absent; harpy reopens what it writes into the attached table, lazily for `obsm`; `write_table_prediction_state(...)` is deleted and headless calls `write_table_components(...)`; Write reports every error. Tests: a write and a delete in one call; a failed write leaves the store and the attached table unchanged and acknowledges nothing (the existing test patches the harpy call instead of `ad.io.write_elem`); a written `obsm` key is attached lazily afterwards and reads the written values; headless persistence as before | implemented on 2026-11-08: `write_table_components(...)` builds the components and deletions and calls `hp.tb.io.add_table_components(...)` (or `remove_table_components(...)`); a new `_require_backed_table(...)` refuses a table stored anywhere but `tables/<table_name>`; the disk-parent helpers, the consolidation and `write_table_prediction_state(...)` are gone; headless lists one `obs` path and the `uns` keys in memory; the controls catch `Exception` around Write, so their `TableBusyError` import goes; `docs/development/table_state.md` describes the write. Tests: the failed-write test injects a failure while harpy installs the published paths, and checks that the store and the attached table are unchanged and nothing is acknowledged; new: a write and a delete in one call, with the written `obsm` reopened as a Dask view holding the written values; Write reports an `OSError` as feedback. No existing test changed because of a dtype round trip. Renamed the same day: `write_table_components(...)` is now `persist_table_components(...)`, and its result `TableComponentPersistResult`, since it takes paths and makes the store follow memory, unlike either harpy function; it pairs with `reload_table_components(...)` |
-   | 4b | Reload through harpy (P4, step-4 design point 5 below): `build_full_table_reload_paths(...)` and `reload_table_components(...)` read with `hp.tb.io.read_table_components(..., mode="lazy", missing="omit")`; `_resolve_backed_table_group(...)`, `_read_disk_path(...)` and the `zarr` and `ad.io` imports go. Tests: a reload keeps `obsm` lazy; a key missing on disk leaves memory; the reload binding check and the rollback as before | ready (decided on 2026-11-08), after 4a |
+   | 4b | Reload through harpy (P4, step-4 design point 5 below): `build_full_table_reload_paths(...)` and `reload_table_components(...)` read with `hp.tb.io.read_table_components(..., mode="lazy", missing="omit")`, and `build_full_table_reload_paths(...)` lists the `obs` columns from memory instead of reading `obs` (design point 5c); `_resolve_backed_table_group(...)`, `_read_disk_path(...)` and the `zarr` and `ad.io` imports go. Tests: a column that exists only on disk still arrives after a full reload (the existing snapshot test); after a full reload, `obsm` entries are Dask arrays holding the values on disk; a key deleted on disk is removed from memory; a request that includes `spatialdata_attrs` (design point 5a); new, since no test covered it: a failing `TableModel.validate` after the install restores the previous `obs`, `obsm` and `uns` objects; the existing reload binding tests unchanged | ready (decided on 2026-11-08; re-checked on 2026-11-09 against the code after 4a, design points 5a-5d below) |
 
    1. **Path mapping (4a).** Any `("obs", col)` becomes `("obs",)`, the
       whole dataframe, as today. A path present in memory is a replacement;
@@ -1103,12 +1103,55 @@ Spatiato's own table I/O code, is the core of this bump. Order:
       check, without overlapping a requested path. The reload binding check,
       `TableModel.validate` and the in-memory rollback stay.
 
+      Re-checked on 2026-11-09, against the code after 4a and harpy 0.5.3:
+
+      - **5a. `spatialdata_attrs` once.** harpy refuses duplicate and nested
+        paths in one request ("Component paths must be unique and
+        non-overlapping"), and a full reload lists `spatialdata_attrs` among
+        the top-level `uns` keys. The request holds `("obs",)`, `("uns",
+        "spatialdata_attrs")`, every `("obsm", key)` and every `uns` path not
+        under `spatialdata_attrs`; a requested path under `spatialdata_attrs`
+        is taken from the attrs value read, with `_read_mapping_path(...)`.
+      - **5b. A non-mapping parent on disk fails the reload.** For a nested
+        `uns` path whose parent on disk is not a mapping, harpy raises
+        `ValueError`, also with `missing="omit"`, where `_read_disk_path(...)`
+        treated the path as missing and removed it from memory. Accepted: only
+        a store damaged outside Spatiato does this, and the reload fails with
+        harpy's message before anything is installed.
+      - **5c. Listing the keys for a full reload.** The reload installs only
+        the paths it is given, so `build_full_table_reload_paths(...)` also
+        lists the keys that exist only on disk. harpy has no call that lists
+        keys only, so it reads `("obsm",)` (lazily) and `("uns",)` in one
+        call and keeps their keys. It no longer reads `obs` (revised the same
+        day): requesting any `obs` path reloads the whole `obs`, the reload
+        reports the columns of memory and disk together, and the request's
+        paths are used only by the reload (the participants check only the
+        dataset and the table), so the `obs` columns in memory suffice. `obs`
+        is then read once per reload instead of twice (0.13 s at 1M rows).
+        Accepted: `uns` is decoded twice, here and in the reload, and a Dask
+        array is built for every `obsm` entry only to list its key, which
+        reads only metadata. Considered and not taken: a full reload that
+        reads the `obs`, `obsm` and `uns` roots once, in the reload, and
+        derives the reloaded paths from what it read. It removes every double
+        read, but turns the request's exact paths into "full reload plus dirty
+        paths", in `TableReloadRequest` and the persistence controller, for
+        little gain.
+      - **5d. Memory follows the store, as today.** A full reload lists the
+        keys and `obs` columns in memory as well as on disk. One that exists
+        only in memory is absent from what harpy returns (`missing="omit"`),
+        or from the `obs` read, so it is removed from memory and its dirty
+        state is cleared. Reload's Write / Discard / Cancel prompt protects
+        what Spatiato recorded as dirty; changes made outside Spatiato's
+        tracking, such as in the napari console or a notebook, are dropped
+        without asking.
+
    Accepted: the adapter reopens every written component, not only `obsm`.
    After each Write, the attached `obs`, which Spatiato always writes whole,
    and each written `uns` entry are copies read back from the store (harpy
    always decodes dataframes and `uns` into memory). That costs a read of
-   `obs` per Write; the objects are new, though their values are those just
-   written (Spatiato has no identity-based caches on them); and what the
+   `obs` per Write; the objects are new, and their values come back as
+   stored, so a list in `uns` becomes a numpy array (Spatiato has no
+   identity-based caches on them); and what the
    encoding normalizes, such as a dtype, shows in memory right after the
    Write instead of after the next Reload, so memory matches the store.
    harpy stages a write in a temporary directory next to the store
@@ -1411,7 +1454,8 @@ Direction: cover them with the P2 helper and add tests per consumer.
 
 ### P4. Reload drops laziness
 
-Status: decided on 2026-11-08, as step 4b (see "Migration Plan", step 4).
+Status: decided on 2026-11-08, as step 4b (see "Migration Plan", step 4);
+re-checked on 2026-11-09 against the code after 4a.
 
 `reload_table_components(...)` uses `ad.io.read_elem`, so "Reload Table State"
 replaces a lazy feature matrix with an in-memory copy.
@@ -2298,6 +2342,18 @@ Settled on 2026-11-05:
 - P10: reload preparation in two passes (3c.5, before 3c.2b). First every
   participant may block the reload, without side effects; only then do they
   invalidate their work.
+
+Settled on 2026-11-09:
+
+- Step 4b readiness re-check (see "Migration Plan", step 4, design points
+  5a-5d): the reload request reads `spatialdata_attrs` once and takes
+  requested paths below it from that value; a non-mapping parent on disk
+  fails the reload with harpy's error; a full reload lists the `obs` columns
+  from memory and the `obsm` and `uns` keys by reading `obsm` (lazily) and
+  `uns`, so `obs` is read once per reload. Reading the three roots once, in
+  the reload, was considered and not taken: it would change
+  `TableReloadRequest` from exact paths to "full reload plus dirty paths". A
+  test for the in-memory rollback of a reload is added, since none existed.
 
 Settled on 2026-11-08:
 
