@@ -230,6 +230,9 @@ class TablePersistenceControls(QWidget):
     ) -> bool:
         """Write captured dirty components and optionally present the outcome."""
         try:
+            # Writes on the main thread, so napari waits until the write is done.
+            # A worker would also need every table edit locked while it runs:
+            # https://github.com/vibspatial/spatiato/issues/132
             self._controller.write_table_state()
         except Exception as error:  # noqa: BLE001 - this UI boundary must report every write failure, also harpy's.
             self.set_feedback(str(error), error=True)

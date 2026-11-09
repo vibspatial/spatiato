@@ -209,8 +209,20 @@ Publishing an event never makes a path clean by itself.
    `TableBusyError`, and the controls show it), so callers other than the
    button are guarded too.
 3. Otherwise it takes a dirty snapshot and writes exactly those paths to the
-   store, on the main thread. Without dirty paths there is nothing to write,
-   and the table is left as it is.
+   store, on the main thread (moving it to a worker:
+   [#132](https://github.com/vibspatial/spatiato/issues/132)). Without dirty
+   paths there is nothing to write,
+   and the table is left as it is. `persist_table_components(...)` writes
+   through harpy's `hp.tb.io.add_table_components(...)`: a path in memory
+   is written, one absent from memory is deleted from the store, and any
+   `obs` path writes the whole `obs`. The attached table stays the same
+   AnnData object, but harpy replaces what it wrote with what it reads back
+   from the store: `obs` becomes a new dataframe, `uns` a new dict, and, when
+   an `obsm` entry is written, `obsm` a new mapping whose written entries are
+   lazy views of the store. Values come back as stored, so a list in `uns`
+   becomes a numpy array, as after a reload. A failed
+   write is rolled back, in the store and in memory, and acknowledges
+   nothing.
 4. `acknowledge_table_write(snapshot, persisted_paths=...)` makes each written
    path clean if its token is still the one in the snapshot.
 5. When the table as a whole becomes clean, `table_dirty_state_changed`
@@ -338,7 +350,7 @@ SpatialData object (by identity) and table name with its own before acting.
   [`src/spatiato/widgets/persistence/controls.py`](../../src/spatiato/widgets/persistence/controls.py),
   `PersistenceController` in
   [`src/spatiato/widgets/persistence/controller.py`](../../src/spatiato/widgets/persistence/controller.py),
-  `write_table_components` and `reload_table_components` in
+  `persist_table_components` and `reload_table_components` in
   [`src/spatiato/core/persistence.py`](../../src/spatiato/core/persistence.py).
 - Busy marks: `calculate` and `_clear_job` in
   [`widgets/feature_extraction/controller.py`](../../src/spatiato/widgets/feature_extraction/controller.py),
