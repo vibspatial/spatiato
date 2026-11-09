@@ -1,11 +1,10 @@
 # Labels layers: coloring and rendering
 
-This document describes how Spatiato colors napari Labels layers, and why it
-replaces parts of napari's labels colormap. It covers which colormap a layer
-gets, how napari turns a slice of label ids into colors on the GPU, which of
-those steps Spatiato overrides and what each override fixes, and how a color
-change reaches the screen. It is an internal developer contract, not user
-documentation.
+This document describes how Spatiato colors napari Labels layers. It covers
+which colormap a layer gets, how napari turns a slice of label ids into colors
+on the GPU, what Spatiato's compact colormap is and how it keeps building and
+drawing fast for large tables, and how a color change reaches the screen. It
+is an internal developer contract, not user documentation.
 
 Not covered here: how a table column is chosen and validated for coloring, how
 annotations are written to the table ([`classifier.md`](classifier.md),
@@ -27,7 +26,7 @@ annotations are written to the table ([`classifier.md`](classifier.md),
   slice").
 - **Texture code:** a small integer, one per distinct color, that napari
   draws instead of a high-bit label id. Texture codes are uint8 for up to 255
-  colors, uint16 above.
+  colors, uint16 above. See "Texture codes" for an example.
 - **Data texture:** the current slice as uploaded to the GPU, one value per
   pixel: texture codes for high-bit labels, label ids for low-bit labels.
 - **Color lookup texture:** the table on the GPU that the shader uses to turn
@@ -61,23 +60,60 @@ not in the palette) gets the missing color, and an object without a table row
 is transparent. Object Classification draws objects without a row in the
 neutral color instead when no table is bound, so they do not disappear.
 
-**Why a compact colormap.** napari's `DirectLabelColormap` keeps one
-`label id -> RGBA` entry per label, validates every entry when it is built,
-and derives more per-label mappings from it. For tables with hundreds of
-thousands of objects, building and restyling that is slow and memory heavy.
-`CompactLabelColormap` is a `DirectLabelColormap` that holds a compact mapping
-instead: napari's model is built with a tiny color dict, and the napari hooks
-that read colors are reimplemented over the compact arrays. One RGBA row per
-color is also what makes the row-scoped annotation updates below possible.
-
 ## How napari draws a slice
+
+napari does not send a color per pixel to the GPU. It sends two textures
+(arrays stored in GPU memory): the **data texture**, one number per pixel,
+and the **color lookup texture**, a table from number to RGBA. A small GPU
+program, the shader, then colors every pixel at once with
+`color = lookup[number]`.
+
+### Texture codes
+
+For low-bit labels, the numbers in the data texture are the label ids
+themselves: a lookup with one row per possible label id (256 or 65,536 rows)
+fits on the GPU. A high-bit label id can be in the billions, far too many rows.
+But many labels share a color, so napari numbers the distinct colors and puts
+those numbers, the **texture codes**, in the data texture instead of the label
+ids. The lookup then needs only one row per color.
+
+For example, a table that colors cells by type:
+
+```text
+color lookup texture               compact mapping
+(texture code -> RGBA)             (label id -> value -> texture code)
+  0  transparent  (no table row)       101 -> tumor  -> 2
+  1  transparent  (background)         102 -> tumor  -> 2
+  2  red          (tumor)              103 -> stroma -> 3
+  3  green        (stroma)           75115 -> stroma -> 3
+  4  grey         (missing value)
+```
+
+A slice, before and after recoding:
+
+```text
+label ids (int32)               data texture: texture codes (uint8)
+  0    0  101  101                1  1  2  2
+103  103  101  999                3  3  2  0
+```
+
+Label 999 has no table row, so it gets code 0 and is transparent. The GPU
+receives the uint8 array on the right and the five-row lookup; the pixels of
+label 101 have code 2 and are drawn red.
+
+Turning label ids into texture codes, the **recoding**, happens on the CPU in
+the colormap's `_data_to_texture`, for every new slice.
+
+### When it runs
 
 A new slice is computed when the displayed z or time step changes, on a
 refresh, and, for multiscale data, on every pan or zoom that changes the
 visible region or resolution level. With async slicing, napari reads the slice
 data in a worker thread, but turns it into the data texture on the Qt main
 thread, so everything below the dtype branch runs on the main thread, for
-every new slice of every visible labels layer (and its thumbnail).
+every new slice of every visible labels layer (and its thumbnail). The viewer
+cannot respond while it runs, so the speed of the recoding decides how smooth
+panning and zooming feel.
 
 ```mermaid
 flowchart TD
@@ -94,35 +130,79 @@ flowchart TD
     lookup --> shader
 ```
 
-A high-bit label id cannot index a GPU table directly: the table would need
-billions of rows. So for high-bit labels napari recodes every slice on the CPU
-into texture codes, and the color lookup texture has one row per color. For
-low-bit labels a table with one row per possible label id fits on the GPU, so
-napari skips the recoding.
-
 The two textures are updated by different triggers. A refresh recomputes and
 uploads the **data texture**. Only a colormap event
 (`layer.events.colormap`, also emitted when `layer.colormap` is assigned)
 rebuilds and uploads the **color lookup texture**.
 
-## What Spatiato changes, and why
+## The compact colormap
 
-**Recoding high-bit slices with a dense table** (`CompactLabelColormap`,
-[#130](https://github.com/vibspatial/spatiato/issues/130)). For a direct
-colormap, napari recodes a high-bit slice with a parallel numba loop that
-looks up every pixel in a typed dict (`label id -> texture code`). napari's
-`DirectLabelColormap` builds that dict from its per-label colors;
-`CompactLabelColormap` builds it from the compact arrays instead. A hash
-lookup per pixel is much slower than the arithmetic napari's random colormap
-uses on primary layers, so panning and zooming styled layers was visibly
-slower. `CompactLabelColormap` now recodes high-bit slices itself, with the
-dense table and a parallel gather: array indexing instead of hashing. The
-typed dict is still used for `map` (thumbnails and single-label colors) and in
-the fallback cases below. Values outside the dense table (label ids above the
-largest table id, negative ids) get the default texture code, as with
-napari's lookup.
+`CompactLabelColormap` is the colormap of every table-styled layer. It is a
+napari `DirectLabelColormap`, so napari draws it as a direct colormap, but it
+does not hold napari's per-label colors. It holds a compact mapping: the
+table's label ids, one texture code per label id, and one RGBA row per color,
+as in the example in "Texture codes". The napari hooks that read colors are
+implemented over these arrays.
 
-napari's own path is kept where the dense table does not apply:
+### Why napari's direct colormap does not scale
+
+A labels colormap costs time twice: when it is built, once per styling or
+refresh, and when it draws, once for every new slice. napari's
+`DirectLabelColormap` is slow at both for tables with hundreds of thousands
+of objects:
+
+- **Building.** It takes one `label id -> RGBA` entry per label. In Python
+  loops over every label, it then validates each entry, counts the colors,
+  and groups the labels by color to find their texture codes. For 500,000
+  labels (synthetic, five colors) that takes about 2.5 s on the main thread
+  and keeps over 100 MB of Python objects.
+- **Drawing.** It recodes a high-bit slice through a numba typed dict from
+  label id to texture code, for the example `{0: 1, 101: 2, 102: 2, 103: 3,
+  75115: 3}`. A parallel loop looks up every pixel in the dict; a label id
+  that is not in it gets code 0. Every lookup hashes the label id and searches
+  the dict, millions of times per slice: about 10 ms for a 5.2 Mpx slice of
+  synthetic labels. napari's random colormap computes its codes with
+  arithmetic instead (about 1.6 ms), so a styled layer would pan and zoom
+  visibly worse than the primary layer of the same labels element.
+
+### Building: texture codes from the table
+
+`CompactLabelColormap` never builds per-label colors. Each category or color
+bin is one color, so the texture codes come straight from the table column,
+computed with numpy. napari's model is built with a three-entry color dict.
+The color count and the `label id -> texture code` view that napari reads are
+derived from the arrays, and the typed dict, where it is still needed, is
+filled from them in one numba function. The same 500,000 labels take about
+20 ms and under 1 MB.
+
+One RGBA row per color also makes annotation cheap: changing an object's
+class changes one texture code (see "Getting a color change onto the
+screen").
+
+### Drawing: a dense table and a gather
+
+For high-bit slices, `CompactLabelColormap` recodes with the dense table
+instead of the dict ([#130](https://github.com/vibspatial/spatiato/issues/130)):
+a plain array in which the position is the label id and the value is the
+texture code. For the example:
+
+```text
+position:  0  1  2  …  101  102  103  …  999  …  75115
+code:      1  0  0  …    2    2    3  …    0  …      3
+```
+
+The table is built for the colormap's first slice, and again after an
+annotation edit. Recoding a slice is then `code = table[label id]` for every
+pixel: reading a table at positions given by another array, a **gather**.
+That is one memory read per pixel instead of a hash lookup, and numba runs it
+on all CPU cores. Label ids beyond the end of the table, and negative ids, get
+code 0, as with the dict. A 5.2 Mpx slice takes about 1 ms, on par with the
+primary layer.
+
+The dense table's size follows the largest label id in the table, not the
+number of objects: 75 KB in the example, with uint8 codes, but 100 MB for
+label ids up to 100 million. napari's own path is used where the dense table
+does not apply:
 
 - low-bit labels, scalars and napari's "show selected label" mode;
 - a negative background value;
@@ -132,23 +212,34 @@ napari's own path is kept where the dense table does not apply:
 
 The last three are logged once per colormap (the negative background only at
 debug level), so a slower layer can be explained. Colors are the same on both
-paths.
+paths. The typed dict is also used for `map` (thumbnails and single-label
+colors).
 
-**252 continuous bins** (`_CONTINUOUS_LABEL_BINS`). A continuous mapping has
-the bins plus three rows (default, background, missing). 252 bins is the most
-that keeps texture codes, and so the data texture, in uint8.
+## Other decisions
 
-**A reserved missing row.** A categorical mapping always has a missing-value
-row, even when no row is missing yet. Clearing an object's class then never
-adds a row, so it never needs a colormap event on high-bit labels.
+### 252 continuous bins
 
-**A neutral colormap** (`NeutralLabelColormap`). It holds only the default
-color and the background, and recodes a high-bit slice with one comparison
-against the background value instead of napari's per-pixel lookup. It is not
-a `CompactLabelColormap`, because that type marks table-styled layers: the
-row-scoped annotation update requires it.
+`_CONTINUOUS_LABEL_BINS`. A continuous mapping has the bins plus three rows
+(default, background, missing). 252 bins is the most that keeps texture codes,
+and so the data texture, in uint8.
 
-**napari's numba colormap backend.** Building a `CompactLabelColormap`
+### A reserved missing row
+
+A categorical mapping always has a missing-value row, even when no row is
+missing yet. Clearing an object's class then never adds a row, so it never
+needs a colormap event on high-bit labels.
+
+### A neutral colormap
+
+`NeutralLabelColormap` holds only the default color and the background, and
+recodes a high-bit slice with one comparison against the background value
+instead of napari's per-pixel lookup. It is not a `CompactLabelColormap`,
+because that type marks table-styled layers: the row-scoped annotation update
+requires it.
+
+### napari's numba colormap backend
+
+Building a `CompactLabelColormap`
 switches napari to its numba colormap backend for the session. The compact
 colormap implements only that backend's hooks; napari's numpy backend would
 need a per-label `label id -> texture code` array (`_array_map`), which the
@@ -204,7 +295,8 @@ the colormap:
 
 - the dense table;
 - one numba typed dict per labels dtype, for napari's per-pixel path:
-  thumbnails and single-label colors (`map`), and the fallback cases above;
+  thumbnails and single-label colors (`map`), and the slices where the dense
+  table does not apply;
 - napari's low-bit `label id -> RGBA` arrays, which become the color lookup
   texture for low-bit labels.
 
