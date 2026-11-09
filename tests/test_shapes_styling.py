@@ -15,7 +15,7 @@ from spatialdata import SpatialData
 from spatialdata.models import TableModel
 
 from spatiato.core._color_source import ShapeColumnColorSourceSpec, TableColorSourceSpec
-from spatiato.core.spatialdata import SpatialDataTableMetadata
+from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table_var_matrix
 from spatiato.viewer._styling import continuous_colors_for_values
 from spatiato.viewer.shapes_styling import (
     SHAPES_EDGE_ALPHA,
@@ -137,10 +137,12 @@ def test_align_table_color_source_to_shapes_rows_allows_partial_coverage_and_dup
     assert aligned.rendered_row_has_table_row.tolist() == [True, True, True, True, False]
 
 
+@pytest.mark.parametrize("var_layer", [None, "counts"])
 @pytest.mark.parametrize(("x_format", "mode"), FORMATS_AND_MODES)
-def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_region_rows(
+def test_align_table_color_source_to_shapes_rows_extracts_var_values_from_region_rows(
     x_format: str,
     mode: str,
+    var_layer: str | None,
     tmp_path,
 ) -> None:
     geodataframe = gpd.GeoDataFrame(
@@ -148,8 +150,10 @@ def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_regi
         geometry=[_polygon(0), _polygon(2)],
         index=pd.Index(["cell_1", "cell_2"], name="instance_id"),
     )
+    values = np.asarray([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
     table = ad.AnnData(
-        X=matrix_in_format(np.asarray([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]), x_format),
+        # For a layer, `X` holds the negated values, so a read from `X` would give other values.
+        X=matrix_in_format(values if var_layer is None else -values, x_format),
         obs=pd.DataFrame(
             {
                 "region": ["cells", "other", "cells"],
@@ -159,18 +163,22 @@ def test_align_table_color_source_to_shapes_rows_extracts_x_var_values_from_regi
         ),
         var=pd.DataFrame(index=["GeneA", "GeneB"]),
     )
+    if var_layer is not None:
+        table.layers[var_layer] = matrix_in_format(values, x_format)
     path = tmp_path / "table.zarr"
     parsed_table = TableModel.parse(table, region=["cells", "other"], region_key="region", instance_key="instance_id")
     SpatialData(tables={"table": parsed_table}).write(path)
-    # Small sparse blocks put the two "cells" rows of a lazy CSR `X` in different blocks.
+    # Small sparse blocks put the two "cells" rows of a lazy CSR matrix in different blocks.
     stored_table = hp.tb.io.read_table(path, table_name="table", mode=mode, sparse_chunks=2)
-    # Test setup: harpy's reader attaches `X` in the representation under test.
-    assert isinstance(stored_table.X, MATRIX_TYPE_BY_FORMAT_AND_MODE[x_format, mode])
+    # Test setup: harpy's reader attaches the matrix in the representation under test.
+    stored_matrix = get_table_var_matrix(stored_table, var_layer)
+    assert isinstance(stored_matrix, MATRIX_TYPE_BY_FORMAT_AND_MODE[x_format, mode])
     style_spec = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="GeneB",
         value_kind="continuous",
+        var_layer=var_layer,
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -833,7 +841,7 @@ def test_apply_table_color_source_to_shapes_layer_uses_positive_integer_instance
     assert pd.isna(layer.features["instance_id__value"].iloc[2])
 
 
-def test_apply_table_color_source_to_shapes_layer_colors_sparse_x_var_continuously() -> None:
+def test_apply_table_color_source_to_shapes_layer_colors_sparse_var_continuously() -> None:
     from scipy import sparse
 
     geodataframe = gpd.GeoDataFrame(
@@ -855,7 +863,7 @@ def test_apply_table_color_source_to_shapes_layer_colors_sparse_x_var_continuous
     layer = _make_shapes_layer(("cell_1", "cell_2", "cell_3"), source_shapes_index_feature_name="instance_id")
     style_spec = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="GeneB",
         value_kind="continuous",
     )
@@ -1290,7 +1298,7 @@ def test_build_styled_shapes_layer_name_returns_stable_shape_column_variant_name
         value_kind="categorical",
     )
 
-    assert build_styled_shapes_layer_name("cell_boundaries", style_spec) == "cell_boundaries[shapes_column:cell_type]"
+    assert build_styled_shapes_layer_name("cell_boundaries", style_spec) == "cell_boundaries[column: cell_type]"
 
 
 def test_build_styled_shapes_layer_name_returns_stable_table_variant_names() -> None:
@@ -1302,10 +1310,18 @@ def test_build_styled_shapes_layer_name_returns_stable_table_variant_names() -> 
     )
     x_style = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="GeneA",
         value_kind="continuous",
     )
+    layer_style = TableColorSourceSpec(
+        table_name="table",
+        source_kind="var",
+        value_key="GeneA",
+        value_kind="continuous",
+        var_layer="counts",
+    )
 
-    assert build_styled_shapes_layer_name("cell_boundaries", obs_style) == "cell_boundaries[obs:cell_type]"
-    assert build_styled_shapes_layer_name("cell_boundaries", x_style) == "cell_boundaries[X:GeneA]"
+    assert build_styled_shapes_layer_name("cell_boundaries", obs_style) == "cell_boundaries[obs: cell_type]"
+    assert build_styled_shapes_layer_name("cell_boundaries", x_style) == "cell_boundaries[vars (X): GeneA]"
+    assert build_styled_shapes_layer_name("cell_boundaries", layer_style) == "cell_boundaries[vars (counts): GeneA]"
