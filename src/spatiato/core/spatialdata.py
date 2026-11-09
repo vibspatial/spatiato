@@ -308,33 +308,69 @@ def get_table_obs_color_source_options(sdata: SpatialData, table_name: str) -> l
     return options
 
 
-def get_table_x_var_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
-    """Return colorable `X[:, var_name]` sources for one linked table."""
+def get_table_var_layers(sdata: SpatialData, table_name: str) -> tuple[str | None, ...]:
+    """Return the matrices of one linked table whose vars can color: `None` for `X`, then the layer names.
+
+    `X` comes first, when it is set; anndata also lists it among the layers,
+    as `layers[None]`. The layer names follow, sorted: harpy's lazy reader
+    returns them in no fixed order.
+    """
+    table = get_table(sdata, table_name)
+    x_layer: tuple[str | None, ...] = () if table.X is None else (None,)
+    return x_layer + tuple(sorted(key for key in table.layers.keys() if key is not None))
+
+
+def get_table_var_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
+    """Return one colorable var source per var name of one linked table, read from its first matrix.
+
+    The first matrix is `X` when it is set, else the first layer
+    (`get_table_var_layers(...)`). Every matrix has the same vars, so the same
+    var in another matrix is `dataclasses.replace(source, var_layer=layer)`. A
+    table without any matrix has no var sources.
+    """
+    var_layers = get_table_var_layers(sdata, table_name)
+    if not var_layers:
+        return []
+
     table = get_table(sdata, table_name)
     return [
         TableColorSourceSpec(
             table_name=table_name,
-            source_kind="x_var",
+            source_kind="var",
             value_key=str(var_name),
             value_kind="continuous",
+            var_layer=var_layers[0],
         )
         for var_name in table.var_names
     ]
 
 
+def get_table_var_matrix(table: AnnData, layer: str | None) -> Any:
+    """Return the matrix a var source reads, as attached: `X` for `layer=None`, else `layers[layer]`.
+
+    No value is read here, so a lazy or backed matrix stays lazy.
+    """
+    if layer is None:
+        if table.X is None:
+            raise ValueError("The selected table has no `X`.")
+        return table.X
+    if layer not in table.layers:
+        raise ValueError(f'Layer "{layer}" is not available in the selected table.')
+    return table.layers[layer]
+
+
 def get_table_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
     """Return all colorable table-backed sources for one linked table."""
-    return get_table_obs_color_source_options(sdata, table_name) + get_table_x_var_color_source_options(
-        sdata, table_name
-    )
+    return get_table_obs_color_source_options(sdata, table_name) + get_table_var_color_source_options(sdata, table_name)
 
 
 def get_shape_column_color_source_options(sdata: SpatialData, shapes_name: str) -> list[ShapeColumnColorSourceSpec]:
     """Return colorable columns stored directly on a shapes GeoDataFrame.
 
     This discovers values that can color `sdata.shapes[shapes_name]` from the
-    shapes element itself. Linked AnnData table `.obs` and `X[:, var]` sources
-    are discovered separately with `get_table_color_source_options(...)`.
+    shapes element itself. Linked AnnData table sources, `.obs` columns and the
+    vars of `X` or a layer, are discovered separately with
+    `get_table_color_source_options(...)`.
     """
     shapes = sdata.shapes[shapes_name]
     geometry_column_name = _get_geometry_column_name(shapes)
