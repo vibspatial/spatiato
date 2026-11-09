@@ -23,7 +23,7 @@ from spatiato.core.object_classification.classifier_export import (
     ClassifierExportBundle,
     read_classifier_export_bundle,
 )
-from spatiato.core.persistence import write_table_prediction_state
+from spatiato.core.persistence import TableComponentPath, persist_table_components
 from spatiato.core.spatialdata import _get_element_coordinate_systems, get_table
 from spatiato.core.validation import normalize_spatialdata_name
 
@@ -529,12 +529,11 @@ def _write_backed_prediction_state_if_needed(sdata: SpatialData, result: Classif
     if not sdata.is_backed() or sdata.path is None:
         return
 
-    write_table_prediction_state(
-        sdata,
-        table_name=result.table_name,
-        uns_keys=(
-            USER_CLASS_COLORS_KEY,
-            f"{result.pred_class_column}_colors",
-            CLASSIFIER_CONFIG_KEY,
-        ),
-    )
+    # Any `obs` path writes the whole `obs`, so one covers both prediction
+    # columns. Only the `uns` keys in memory are listed: a missing one would be
+    # deleted from the store.
+    table = get_table(sdata, result.table_name)
+    uns_keys = (USER_CLASS_COLORS_KEY, f"{result.pred_class_column}_colors", CLASSIFIER_CONFIG_KEY)
+    paths = {TableComponentPath("obs", (result.pred_class_column,))}
+    paths.update(TableComponentPath("uns", (key,)) for key in uns_keys if key in table.uns)
+    persist_table_components(sdata, table_name=result.table_name, paths=frozenset(paths))

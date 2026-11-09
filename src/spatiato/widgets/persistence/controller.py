@@ -15,9 +15,9 @@ from spatiato.core.persistence import (
     TableComponentPath,
     TableComponentReloadResult,
     build_full_table_reload_paths,
+    persist_table_components,
     reload_table_components,
     resolve_table_path,
-    write_table_components,
 )
 from spatiato.core.spatialdata import get_table, get_table_metadata
 
@@ -106,7 +106,7 @@ class PersistenceController:
         if not snapshot.paths:
             # Nothing to write: the store already has every recorded change.
             return self._resolve_table_path(sdata, get_table(sdata, table_name), table_name)
-        result = write_table_components(
+        result = persist_table_components(
             sdata,
             table_name=table_name,
             paths=snapshot.paths,

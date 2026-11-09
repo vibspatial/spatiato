@@ -17,7 +17,6 @@ from qtpy.QtWidgets import (
 
 from spatiato._app_state import (
     SpatiatoAppState,
-    TableBusyError,
     TableBusyStateChangedEvent,
     TableDirtyStateChangedEvent,
 )
@@ -232,7 +231,7 @@ class TablePersistenceControls(QWidget):
         """Write captured dirty components and optionally present the outcome."""
         try:
             self._controller.write_table_state()
-        except (ValueError, TableBusyError) as error:
+        except Exception as error:  # noqa: BLE001 - this UI boundary must report every write failure, also harpy's.
             self.set_feedback(str(error), error=True)
             return False
 
