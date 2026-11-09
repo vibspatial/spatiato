@@ -3,7 +3,10 @@
 Status: implemented on 2026-11-09 on `feature/lazy_feature_matrix`. Tracks
 https://github.com/vibspatial/spatiato/issues/130. The fix below was checked
 against the current code with a scratch prototype (results under "Prototype
-Results"). Decisions are listed at the end.
+Results"). Decisions are listed near the end. "Follow-up: Contour Mode" at the
+end covers a related slowdown with `contour > 0`
+(https://github.com/vibspatial/spatiato/issues/136); its fix is decided but
+not implemented yet.
 
 ## Problem
 
@@ -452,3 +455,281 @@ always uses the typed dict. A napari change that uses a dense array in the
 numba backend when the keys are small would fix this for every
 `DirectLabelColormap`. That is a longer-term option; the override above does
 not depend on it.
+
+## Follow-up: Contour Mode
+
+Status: investigated and decided on 2026-11-09 (see "Decision"), not
+implemented yet. Tracks https://github.com/vibspatial/spatiato/issues/136.
+Reported after the fix above: with `contour > 0`, a styled
+labels layer becomes slow again, possibly slower than a primary layer with the
+same contour.
+
+### Where the time goes
+
+With `contour >= 1`, napari adds a step before the recoding:
+
+```text
+Labels._raw_to_displayed
+  -> Labels._calculate_contour                 (2D slices only)
+    -> get_contours                            (napari/layers/labels/_labels_utils.py)
+      -> scipy ndi.grey_dilation  (cross footprint)
+      -> scipy ndi.grey_erosion   (diamond of radius `contour`)
+  -> colormap._data_to_texture(contoured_slice)
+```
+
+`get_contours` keeps a pixel when the maximum over its cross neighbourhood
+differs from the minimum over the diamond, and sets every other pixel to the
+background value. It runs single-threaded on the Qt main thread for every new
+slice of every labels layer, whatever its colormap. For multiscale data napari
+also runs it on the (small) thumbnail level, because `to_displayed` in
+`napari/layers/_scalar_field/_slice.py` applies `_raw_to_displayed` to both.
+
+Measured per slice (median of `Labels._raw_to_displayed`, synthetic labels as
+in "Prototype Results", napari 0.7.1, Apple silicon):
+
+| Slice | napari default | Styled | Neutral |
+|---|---|---|---|
+| 5.2 Mpx, contour 0 | 1.6 ms | 1.4 ms | 0.6 ms |
+| 5.2 Mpx, contour 1 | 74 ms | 74 ms | 75 ms |
+| 5.2 Mpx, contour 2 | 102 ms | 103 ms | 102 ms |
+| 20.9 Mpx, contour 1 | 293 ms | 293 ms | 294 ms |
+
+- Recoding the contoured slice takes under 1 ms for all three colormaps, so
+  nearly all the time is in `get_contours`.
+- The thumbnail costs little: a 32 × 32 `colormap.map` takes about 0.3 ms for
+  the styled colormap.
+- napari 0.9.1 calls the same `get_contours`; only the border it adds around
+  the slice before computing contours differs.
+
+So contour mode costs about 50× plain recoding for any labels layer. After the
+fix, the contrast is simply larger on styled layers.
+
+### Styled versus primary
+
+A styled layer being slower than a primary layer with the same contour was not
+reproduced:
+
+- styled and primary layers are built by the same `_build_labels_layer`
+  (`viewer/adapter.py`) from the same element, so contours are computed on
+  identical input;
+- Spatiato does not listen to contour or slicing events on labels layers;
+  `sync_labels_display_after_colormap_change` (`viewer/labels_async.py`) runs
+  once per colormap change, not while panning.
+
+Still to check on the real data: time
+`layer._raw_to_displayed(layer._slice.image.raw)` for the styled and the
+primary layer at the same position and `contour`. Two labels layers visible at
+once each pay the contour cost, and a different zoom or field of view changes
+the slice size.
+
+### Prototype: numba contours
+
+The same rule, rewritten: because the diamond contains the cross, a pixel is
+kept when any 4-neighbour differs from it, or (for `contour > 1`) any pixel in
+the diamond is smaller than it. Borders follow scipy's `'reflect'` mode.
+Parallel over rows:
+
+```python
+@njit(cache=True, inline="always")
+def _reflect(i, n):
+    # scipy.ndimage 'reflect' (half-sample symmetric): -1 -> 0, n -> n - 1.
+    period = 2 * n
+    i = i % period
+    if i < 0:
+        i += period
+    if i >= n:
+        i = period - 1 - i
+    return i
+
+
+@njit(parallel=True, cache=True)
+def _contours_2d(labels, thickness, background, out):
+    h, w = labels.shape
+    for y in prange(h):
+        for x in range(w):
+            v = labels[y, x]
+            boundary = (
+                labels[_reflect(y - 1, h), x] != v
+                or labels[_reflect(y + 1, h), x] != v
+                or labels[y, _reflect(x - 1, w)] != v
+                or labels[y, _reflect(x + 1, w)] != v
+            )
+            if not boundary and thickness > 1:
+                for dy in range(-thickness, thickness + 1):
+                    r = thickness - abs(dy)
+                    yy = _reflect(y + dy, h)
+                    for dx in range(-r, r + 1):
+                        if labels[yy, _reflect(x + dx, w)] < v:
+                            boundary = True
+                            break
+                    if boundary:
+                        break
+            out[y, x] = v if boundary else background
+    return out
+```
+
+Output was identical to `get_contours` for int32, int64, uint32 and uint16
+data; shapes from 1 × 1 to 300 × 411; contour 1, 2, 3 and 5; background 0 and
+2; and both full slice sizes below.
+
+| Slice | napari (scipy) | numba prototype |
+|---|---|---|
+| 5.2 Mpx, contour 1 | 77 ms | 4 ms |
+| 5.2 Mpx, contour 2 | 103 ms | 21 ms |
+| 20.9 Mpx, contour 1 | 319 ms | 17 ms |
+| 20.9 Mpx, contour 2 | 411 ms | 84 ms |
+
+Thicker contours can get faster: the diamond loop reflects every index, which
+only pixels near the slice edge need.
+
+### Options
+
+The contour step belongs to napari's `Labels` layer, not to the colormap, so
+the colormap override above cannot reach it.
+
+1. **Replace `_calculate_contour` on each layer Spatiato builds**, as an
+   instance attribute set in `_build_labels_layer`. The smallest change, and
+   the layer stays a plain `Labels`. It overrides a private napari method, and
+   it is less visible than a class.
+2. **A `Labels` subclass (`SpatiatoLabels`)** that overrides
+   `_calculate_contour`. One visible class, and the natural place for later
+   layer-specific behaviour (trimming the layer controls, blocking painting
+   modes). It must override `_type_string`: napari derives the layer type from
+   the class name (`napari/layers/base/base.py`), and `"spatiatolabels"` would
+   break the layer-list icon, the labels entries in the layer-list context
+   menu, Duplicate layer and napari's writers. Everything else in napari
+   (vispy visual, layer controls, key bindings) already resolves a subclass
+   through `isinstance` or the class MRO.
+3. **Patch `napari.layers.labels.labels.get_contours` globally.** One line,
+   same output, but it changes napari for every labels layer in the session,
+   including other plugins' layers. Not done from a plugin.
+4. **Outlines inside the Spatiato colormaps**: keep napari's `contour` at 0
+   and detect edges in `_data_to_texture`. No change to `Labels`, but it needs
+   its own control, does not cover napari's random colormap on primary layers,
+   and is wrong on the small painted patches `_data_to_texture` also receives.
+5. **Outlines as data in a separate layer**, computed lazily with dask (one
+   chunk at a time, with overlap) by the numba kernel. The only option that
+   moves the work off the Qt main thread: with async slicing, napari loads the
+   slice data in a worker thread (`__call__` in
+   `napari/layers/_scalar_field/_slice.py`), while `to_displayed`, which runs
+   the contour step, stays on the main thread. A feature rather than a fix: an
+   extra layer, dask work and caching, its own control, and the outline
+   thickness is fixed per resolution level.
+6. **Draw outlines on the GPU**, with a shader that compares neighbouring
+   texels. Almost no CPU cost, but it replaces napari's labels visual. Better
+   proposed upstream.
+7. **Upstream in napari.** Speed up `get_contours` with numba, as napari
+   already does for its label colormaps (`_accelerated_cmap.py`). Every napari
+   user benefits and Spatiato needs no workaround, but it waits on a napari
+   release.
+
+### Decision
+
+Decided on 2026-11-09:
+
+- Option 1 now, on the current branch.
+- Option 7 (upstream) as well. Once every napari version Spatiato supports
+  ships fast contours, remove the override.
+- Trimming the labels layer controls (color mode, shuffle, brush size, label,
+  blending, contiguous, show selected, ...) is a separate feature and not part
+  of this change. Option 2 is the likely vehicle for it.
+- The investigation is kept in two Spatiato issues, so it is not lost:
+  - https://github.com/vibspatial/spatiato/issues/136: contour rendering, with
+    all seven options, the plan, the reproducer and the acceptance criteria.
+    The change below only partly addresses it; the upstream fix (option 7)
+    is still open there.
+  - https://github.com/vibspatial/spatiato/issues/137: trimming the labels
+    layer controls, with the findings on subclassing `Labels`, the options
+    and the open questions.
+
+### Proposed Fix: Per-Layer `_calculate_contour`
+
+New module `viewer/labels_contours.py`:
+
+- the numba kernel from "Prototype: numba contours" (`_reflect`,
+  `_contours_2d`);
+- `labels_contours(labels, thickness, background)`: the same contract as
+  napari's `get_contours` for 2D integer arrays (a new array of the same dtype);
+- `_calculate_labels_contour(layer, labels, data_slice)`: the replacement for
+  `Labels._calculate_contour`;
+- `install_fast_labels_contours(layer)`: sets
+  `layer._calculate_contour = MethodType(_calculate_labels_contour, layer)`.
+
+`_build_labels_layer` (`viewer/adapter.py`) calls
+`install_fast_labels_contours` on the layer it builds. It builds every
+Spatiato labels layer, primary and styled, so all of them get it, including a
+primary layer in the neutral style.
+
+```python
+def _calculate_labels_contour(layer, labels, data_slice):
+    background = layer.colormap.background_value
+    if (
+        layer.contour < 1
+        or not isinstance(labels, np.ndarray)
+        or labels.ndim != 2
+        or labels.dtype.kind not in "iu"
+        or not _fits_dtype(background, labels.dtype)
+    ):
+        # Contours off, 3D, or input the kernel does not handle: napari's path.
+        return Labels._calculate_contour(layer, labels, data_slice)
+    expanded_slice = _expand_slice(data_slice, labels.shape, layer.contour)
+    contours = labels_contours(labels[expanded_slice], layer.contour, background)
+    # Trim the border back off.
+    return contours[
+        tuple(
+            slice(s.start - e.start, s.stop - e.start)
+            for s, e in zip(data_slice, expanded_slice, strict=True)
+        )
+    ]
+```
+
+- Calling `Labels._calculate_contour(layer, ...)` (the class function, not the
+  instance attribute) keeps napari's behaviour for `contour < 1` (returns
+  `None`) and for 3D (napari's warning).
+- `_expand_slice` is a small local copy of napari's `expand_slice`
+  (`napari/layers/labels/_labels_utils.py`), to avoid one more private import.
+- Full slices, which is every pan and zoom: the expansion is clipped to the
+  slice, so the output is identical to napari's.
+- Partial slices only come from painting (`_partial_labels_refresh`). The
+  border is `max(1, contour)` pixels, the same as napari 0.9.1; napari 0.7.1
+  uses 1. The result equals computing contours on the full slice and cropping.
+  With `contour >= 2` this can differ from napari 0.7.1 near the edge of the
+  painted region, where a 1-pixel border is too narrow for the diamond
+  erosion.
+- Multiscale thumbnails also go through `_raw_to_displayed`, so they use the
+  kernel too.
+- `_calculate_contour` has the same signature in napari 0.7.1 and 0.9.1.
+
+### Tests
+
+In a new `tests/test_labels_contours.py`, plus one adapter test:
+
+- `labels_contours` equals napari's `get_contours` for int8 to uint64 data,
+  shapes from 1 × 1 to 37 × 53, contour 1, 2, 3 and 5, background 0 and a
+  non-zero background, and non-contiguous input (`data[:, ::2]`).
+- Through the layer: after `install_fast_labels_contours`,
+  `_raw_to_displayed` equals a plain napari `Labels` with the same colormap,
+  for contour 0, 1 and 2, with a styled, a neutral and napari's default
+  colormap.
+- Partial `data_slice`: equals the full-slice result cropped (contour 1 and
+  2), and equals napari's for contour 1.
+- `contour = 0` and a 3D slice give napari's result.
+- Fast path is used: with `napari.layers.labels.labels.get_contours`
+  monkeypatched to raise, an installed layer still renders with contour 1 and
+  2. This also catches napari renaming `_calculate_contour`, which would
+  silently bring back the slow path.
+- `_build_labels_layer` installs it: the built layer's `_calculate_contour`
+  is `_calculate_labels_contour`.
+
+### Things to Watch
+
+- **Private API.** `_calculate_contour` is private. The fast-path test is the
+  guard.
+- **First compile.** The first contoured slice pays a numba compile on the
+  main thread per data dtype. With `cache=True` this is paid once per
+  environment, like the colormap kernels.
+- **Duplicate layer.** napari's Duplicate layer rebuilds a plain `Labels`
+  from `as_layer_data_tuple()`, so the copy has napari's contour speed.
+- **Thick contours.** 21 ms for contour 2 on a 5.2 Mpx slice. Skipping the
+  index reflection for pixels away from the slice edge should bring this down
+  if needed.
