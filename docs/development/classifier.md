@@ -86,14 +86,14 @@ the main thread prepares the job and writes its result.
 flowchart TD
     w_start(["Train Classifier,<br/>or an annotation change with Auto-train on"]) --> w_schedule["schedule_retrain<br/>Train: at once;<br/>Auto-train: 300 ms after the last change"]
     w_schedule --> w_summary["Main thread: the summary,<br/>from obs, uns and the matrix's shape"]
-    w_summary --> w_blocker{"Blocked?"}
+    w_summary -- "ClassifierJob<br/>(with the summary)" --> w_blocker{"Blocked?"}
     w_blocker -- metadata --> w_status[/"Status only;<br/>the table is unchanged"/]
     w_blocker -- data --> w_ineligible["_apply_ineligible_state:<br/>clear the prediction scope;<br/>record the reason if pred_class exists"]
-    w_blocker -- no --> w_worker["Worker thread: _fit_classifier_job<br/>reads the labeled training rows and the prediction rows,<br/>skips rows without finite features, fits, predicts"]
-    w_worker -- too few usable rows --> w_ineligible
-    w_worker -- trained --> w_apply["Main thread: _on_worker_returned<br/>writes pred_class, its confidence and colors,<br/>stores the entry and the model snapshot"]
-    w_ineligible -- pred_class exists --> w_event["record_table_mutation:<br/>the changed paths become dirty"]
-    w_apply --> w_event
+    w_blocker -- "no: only its<br/>ClassifierWorkerInput" --> w_worker["Worker thread: _fit_classifier_job<br/>reads the labeled training rows and the prediction rows,<br/>skips rows without finite features, fits, predicts"]
+    w_worker -- "too few usable rows:<br/>ClassifierIneligibleResult" --> w_ineligible
+    w_worker -- "trained:<br/>ClassifierTrainingResult" --> w_apply["Main thread: _on_worker_returned<br/>writes pred_class, its confidence and colors,<br/>stores the entry and the model snapshot"]
+    w_ineligible -- "pred_class exists:<br/>ClassifierTableStateChange" --> w_event["record_table_mutation:<br/>the changed paths become dirty"]
+    w_apply -- ClassifierTableStateChange --> w_event
 ```
 
 Train is enabled only while the summary is eligible and no job runs, so a
@@ -109,11 +109,13 @@ SpatialData is backed. It wraps the core `apply_classifier(...)` in
 
 ```mermaid
 flowchart TD
-    h_entry(["apply_classifier<br/>(also via the _from_path and<br/>_with_feature_extraction variants)"]) --> h_check["Check the bundle<br/>against the feature matrix,<br/>resolve the prediction regions"]
+    h_entry(["apply_classifier<br/>(also via the _from_path and<br/>_with_feature_extraction variants)"]) -- ClassifierExportBundle --> h_check["Check the bundle<br/>against the feature matrix,<br/>resolve the prediction regions"]
     h_check --> h_predict["Read the prediction rows,<br/>skip rows without finite features,<br/>predict"]
     h_predict --> h_write["Write the prediction columns,<br/>created if missing, and the entry"]
-    h_write --> h_backed{"Backed?"}
+    h_write -- ClassifierApplyResult --> h_backed{"Backed?"}
     h_backed -- yes --> h_persist["persist_table_components"]
+    h_backed -- no --> h_return(["return the ClassifierApplyResult"])
+    h_persist --> h_return
 ```
 
 ## The summary, on the main thread
