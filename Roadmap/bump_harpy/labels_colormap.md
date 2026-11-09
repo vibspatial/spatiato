@@ -386,6 +386,15 @@ calls `_get_typed_dict_mapping`, so it gives today's output.
   (categorical and continuous) still returns the expected texture. This catches
   a later change that sends styled layers back to the slow path while colors
   stay correct, without measuring time.
+- Typed-dict path: one existing test pins it.
+  `test_compact_categorical_label_colormap_high_bit_texture_mapping_uses_jitted_typed_dict`
+  calls `_data_to_texture` on int64 data and asserts that
+  `"_compact_int64_typed_dict"` is in `colormap._cache_other`. With the dense
+  table that dict is no longer built, so the test would fail.
+  - Keep its expected texture values, rename it, and assert that the dense
+    table is cached instead.
+  - Move the typed-dict assertion into the fallback tests, where
+    `_get_typed_dict_mapping` is still used.
 - 252 bins: two existing tests pin the 256-bin layout and need new numbers.
   - `test_compact_continuous_labels_mapping_matches_current_rgba_for_representative_values`:
     255 rows (was 259), missing code 254 (was 258);
