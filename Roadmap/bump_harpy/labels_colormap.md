@@ -1,6 +1,6 @@
 # Labels Colormap: Fast Per-Slice Texture Recoding
 
-Status: investigated on 2026-11-09, not implemented. Tracks
+Status: implemented on 2026-11-09 on `feature/lazy_feature_matrix`. Tracks
 https://github.com/vibspatial/spatiato/issues/130. The fix below was checked
 against the current code with a scratch prototype (results under "Prototype
 Results"). Decisions are listed at the end.
@@ -243,8 +243,10 @@ class NeutralLabelColormap(DirectLabelColormap):
 ```
 
 - Do not rely silently on napari numbering the default 0 and the background 1:
-  check both codes in `_label_mapping_and_color_dict[0]` when the colormap is
-  built.
+  check both codes (and that there are only two) in
+  `_label_mapping_and_color_dict[0]` before using the comparison, and use
+  napari's path otherwise. The mapping is cached by napari, so the check is
+  cheap, and it also covers a colormap rebuilt from `model_dump()`.
 - The output dtype is right: `_num_unique_colors + 2` is 4, so vispy expects
   uint8.
 - Keep napari's constructor (no custom `__init__`).
@@ -391,15 +393,18 @@ calls `_get_typed_dict_mapping`, so it gives today's output.
   calls `_data_to_texture` on int64 data and asserts that
   `"_compact_int64_typed_dict"` is in `colormap._cache_other`. With the dense
   table that dict is no longer built, so the test would fail.
-  - Keep its expected texture values, rename it, and assert that the dense
-    table is cached instead.
+  - Keep its expected texture values, rename it (now
+    `test_compact_categorical_label_colormap_high_bit_texture_mapping_uses_dense_table`),
+    and assert that the dense table is cached instead.
   - Move the typed-dict assertion into the fallback tests, where
     `_get_typed_dict_mapping` is still used.
-- 252 bins: two existing tests pin the 256-bin layout and need new numbers.
+- 252 bins: three existing tests pin the 256-bin layout and need new numbers.
   - `test_compact_continuous_labels_mapping_matches_current_rgba_for_representative_values`:
     255 rows (was 259), missing code 254 (was 258);
   - `test_compact_continuous_labels_mapping_uses_explicit_range_and_clamps_values`:
-    0.5 gets code 128 (was 130), 1.0 and 2.0 get 253 (was 257).
+    0.5 gets code 128 (was 130), 1.0 and 2.0 get 253 (was 257);
+  - `test_compact_continuous_labels_mapping_accepts_large_label_ids`: the top
+    bin gets code 253 (was 257).
 
   The tests that compare with `continuous_rgba_for_values` use the values 0,
   0.5 and 1, which give the same color with 252 bins, so they pass unchanged.
