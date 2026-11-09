@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from html import unescape
 from types import SimpleNamespace
 
@@ -42,6 +43,7 @@ from spatiato.widgets.shared_styles import (
     CompactComboBox,
     _ElidedLabel,
 )
+from spatiato.widgets.viewer._table_color_sources import LinkedTableColorSources
 from spatiato.widgets.viewer.disclosure import _CollapsibleSectionWidget, _ElidedToolButton
 from spatiato.widgets.viewer.image_widget import _ImageCardWidget
 from spatiato.widgets.viewer.points_controller import PointsController, PointsLoadRequest
@@ -136,10 +138,40 @@ def _combo_texts(combo: QComboBox) -> list[str]:
     return [combo.itemText(index) for index in range(combo.count())]
 
 
+def _color_source_kinds(card: object) -> list[str | None]:
+    """Return the source kind of each "Color source" entry; `None` for "No color source"."""
+    combo = card.color_source_kind_combo
+    source_kinds: list[str | None] = []
+    for index in range(combo.count()):
+        kind_entry = combo.itemData(index)
+        source_kinds.append(None if kind_entry is None else kind_entry.source_kind)
+    return source_kinds
+
+
 def _select_color_source_kind(card: object, source_kind: str) -> None:
-    index = card.color_source_kind_combo.findData(source_kind)
-    assert index >= 0
-    card.color_source_kind_combo.setCurrentIndex(index)
+    """Select the first "Color source" entry of `source_kind`."""
+    source_kinds = _color_source_kinds(card)
+    assert source_kind in source_kinds
+    card.color_source_kind_combo.setCurrentIndex(source_kinds.index(source_kind))
+
+
+def _patch_linked_tables(
+    monkeypatch,
+    sources_for_table: Callable[[str], list[TableColorSourceSpec]] | None = None,
+    var_layers_by_table: dict[str, tuple[str | None, ...]] | None = None,
+) -> None:
+    """Give each linked table of a fake SpatialData its color sources; its vars read only `X`, unless given."""
+
+    def from_table(sdata: object, table_name: str) -> LinkedTableColorSources:
+        sources = [] if sources_for_table is None else sources_for_table(table_name)
+        return LinkedTableColorSources(
+            table_name=table_name,
+            obs_sources=tuple(source for source in sources if source.source_kind == "obs_column"),
+            var_names=tuple(source.value_key for source in sources if source.source_kind == "var"),
+            var_layers=(var_layers_by_table or {}).get(table_name, (None,)),
+        )
+
+    monkeypatch.setattr(LinkedTableColorSources, "from_table", staticmethod(from_table))
 
 
 def _patch_viewer_widget_labels_tables(
@@ -149,6 +181,7 @@ def _patch_viewer_widget_labels_tables(
     table_names_by_label: dict[str, list[str]],
     color_sources_by_table: dict[str, list[TableColorSourceSpec]] | None = None,
 ) -> None:
+    _patch_linked_tables(monkeypatch, lambda table_name: list((color_sources_by_table or {}).get(table_name, [])))
     monkeypatch.setattr(viewer_widget_module, "_get_images_in_coordinate_system", lambda sdata, coordinate_system: [])
     monkeypatch.setattr(viewer_widget_module, "_get_shapes_in_coordinate_system", lambda sdata, coordinate_system: [])
     monkeypatch.setattr(viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: [])
@@ -161,11 +194,6 @@ def _patch_viewer_widget_labels_tables(
         viewer_widget_module,
         "get_annotating_table_names",
         lambda sdata, labels_name: list(table_names_by_label.get(labels_name, [])),
-    )
-    monkeypatch.setattr(
-        viewer_widget_module,
-        "get_table_color_source_options",
-        lambda sdata, table_name: list((color_sources_by_table or {}).get(table_name, [])),
     )
 
 
@@ -1092,7 +1120,7 @@ def test_viewer_widget_labels_cards_expose_table_driven_coloring_controls(qtbot,
     assert [first_card.color_source_kind_combo.itemText(index) for index in range(3)] == [
         "No color source",
         "Observations",
-        "Vars",
+        "Vars (X)",
     ]
     assert first_card.color_source_kind_combo.isEnabled()
     assert first_card.color_source_value_input.completer() is not None
@@ -1109,7 +1137,7 @@ def test_viewer_widget_labels_cards_expose_table_driven_coloring_controls(qtbot,
     assert first_card.selected_color_source is None
     assert first_card.action_hint_label.text() == "Action: select an observation column for a colored overlay"
 
-    _select_color_source_kind(first_card, "x_var")
+    _select_color_source_kind(first_card, "var")
     assert first_card.color_source_value_input.isEnabled()
     assert first_card.color_source_value_input.text() == ""
     assert first_card.color_source_value_input.placeholderText() == "Select var"
@@ -1126,14 +1154,88 @@ def test_viewer_widget_labels_cards_expose_table_driven_coloring_controls(qtbot,
     assert first_card.action_hint_label.text() == "Action: select a var for a colored overlay"
 
     first_card.color_source_value_input.setText("channel_1_sum")
-    assert first_card.action_hint_label.text() == 'Action: add/update colored overlay for X[:, "channel_1_sum"]'
+    assert first_card.action_hint_label.text() == 'Action: add/update colored overlay "vars (X): channel_1_sum"'
 
     assert _combo_texts(second_card.color_source_kind_combo) == ["No color source"]
     assert not second_card.color_source_kind_combo.isEnabled()
-    assert second_card.color_source_kind_combo.findData("x_var") == -1
+    assert "var" not in _color_source_kinds(second_card)
     assert second_card.selected_source_kind is None
     assert second_card.selected_color_source is None
     assert second_card.action_hint_label.text() == "Action: add/update primary labels layer"
+
+
+def test_viewer_widget_labels_card_offers_the_vars_of_every_matrix(qtbot, sdata_blobs) -> None:
+    table = sdata_blobs["table"]
+    table.layers["raw"] = table.X.copy()
+    table.layers["counts"] = table.X.copy()
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    assert _combo_texts(card.color_source_kind_combo) == [
+        "No color source",
+        "Observations",
+        "Vars (X)",
+        "Vars (counts)",
+        "Vars (raw)",
+    ]
+
+    card.color_source_kind_combo.setCurrentIndex(3)
+    assert card.selected_source_kind == "var"
+    assert card.selected_kind_entry.var_layer == "counts"
+    # Every matrix has the same vars.
+    assert card.color_source_value_input.completer().model().stringList() == [
+        "channel_0_sum",
+        "channel_1_sum",
+        "channel_2_sum",
+    ]
+    card.color_source_value_input.setText("channel_1_sum")
+    assert card.selected_color_source == TableColorSourceSpec(
+        table_name="table",
+        source_kind="var",
+        value_key="channel_1_sum",
+        value_kind="continuous",
+        var_layer="counts",
+    )
+    assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (counts): channel_1_sum"'
+
+    # Choosing another matrix keeps the selected var.
+    card.color_source_kind_combo.setCurrentIndex(2)
+    assert card.selected_kind_entry.label == "Vars (X)"
+    assert card.selected_kind_entry.var_layer is None
+    assert card.color_source_value_input.text() == "channel_1_sum"
+    assert card.selected_color_source.var_layer is None
+    assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (X): channel_1_sum"'
+
+    # A refresh of the linked tables keeps the matrix and the var.
+    card.color_source_kind_combo.setCurrentIndex(4)
+    widget._refresh_labels_card_linked_tables()
+    assert card.selected_kind_entry.var_layer == "raw"
+    assert card.color_source_value_input.text() == "channel_1_sum"
+    assert card.selected_color_source.var_layer == "raw"
+
+
+def test_viewer_widget_labels_card_offers_only_the_layers_of_a_table_without_x(qtbot, sdata_blobs) -> None:
+    table = sdata_blobs["table"]
+    table.layers["counts"] = table.X.copy()
+    table.X = None
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Observations", "Vars (counts)"]
+
+    _select_color_source_kind(card, "var")
+    card.color_source_value_input.setText("channel_0_sum")
+    assert card.selected_color_source.var_layer == "counts"
 
 
 def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_changes(qtbot, monkeypatch) -> None:
@@ -1151,10 +1253,9 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
     monkeypatch.setattr(
         viewer_widget_module, "get_annotating_table_names", lambda sdata, labels_name: ["table_a", "table_b"]
     )
-    monkeypatch.setattr(
-        viewer_widget_module,
-        "get_table_color_source_options",
-        lambda sdata, table_name: (
+    _patch_linked_tables(
+        monkeypatch,
+        lambda table_name: (
             [
                 TableColorSourceSpec(
                     table_name=table_name, source_kind="obs_column", value_key="cell_type", value_kind="categorical"
@@ -1163,7 +1264,7 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
             if table_name == "table_a"
             else [
                 TableColorSourceSpec(
-                    table_name=table_name, source_kind="x_var", value_key="GeneA", value_kind="continuous"
+                    table_name=table_name, source_kind="var", value_key="GeneA", value_kind="continuous"
                 )
             ]
         ),
@@ -1175,7 +1276,7 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
     card = widget.labels_cards[0]
 
     assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Observations"]
-    assert card.color_source_kind_combo.findData("x_var") == -1
+    assert "var" not in _color_source_kinds(card)
 
     _select_color_source_kind(card, "obs_column")
     assert card.color_source_value_input.isEnabled()
@@ -1186,13 +1287,13 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
     assert card.action_hint_label.text() == "Action: select an observation column for a colored overlay"
 
     card.linked_table_combo.setCurrentIndex(1)
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Vars"]
-    assert card.color_source_kind_combo.findData("obs_column") == -1
+    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Vars (X)"]
+    assert "obs_column" not in _color_source_kinds(card)
     assert card.selected_source_kind is None
     assert not card.color_source_value_input.isEnabled()
     assert card.action_hint_label.text() == "Action: add/update primary labels layer"
 
-    _select_color_source_kind(card, "x_var")
+    _select_color_source_kind(card, "var")
     assert card.color_source_value_input.isEnabled()
     assert card.color_source_value_input.completer().model().stringList() == ["GeneA"]
     assert card.color_source_value_input.text() == ""
@@ -1201,7 +1302,7 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
     assert card.action_hint_label.text() == "Action: select a var for a colored overlay"
 
     card.color_source_value_input.setText("GeneA")
-    assert card.action_hint_label.text() == 'Action: add/update colored overlay for X[:, "GeneA"]'
+    assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (X): GeneA"'
 
 
 def test_viewer_widget_ignores_non_feature_matrix_write_events(qtbot, monkeypatch) -> None:
@@ -1414,7 +1515,7 @@ def test_viewer_widget_preserves_labels_card_color_source_selection_after_event(
     assert card.selected_table_name == "table"
     assert card.selected_source_kind == "obs_column"
     assert card.selected_color_source == color_sources_by_table["table"][0]
-    assert card.action_hint_label.text() == 'Action: add/update colored overlay for obs["cell_type"]'
+    assert card.action_hint_label.text() == 'Action: add/update colored overlay "obs: cell_type"'
 
 
 def test_viewer_widget_refreshes_table_color_sources_when_user_class_is_created(qtbot, monkeypatch) -> None:
@@ -1603,7 +1704,7 @@ def test_viewer_widget_refreshes_only_shapes_section_from_shapes_element_event(
     )
     monkeypatch.setattr(viewer_widget_module, "get_image_channel_names_from_sdata", lambda sdata, image_name: ["c0"])
     monkeypatch.setattr(viewer_widget_module, "get_annotating_table_names", lambda sdata, element_name: [])
-    monkeypatch.setattr(viewer_widget_module, "get_table_color_source_options", lambda sdata, table_name: [])
+    _patch_linked_tables(monkeypatch)
     monkeypatch.setattr(viewer_widget_module, "get_shape_column_color_source_options", lambda sdata, shapes_name: [])
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
@@ -1662,7 +1763,7 @@ def test_viewer_widget_ignores_shapes_element_events_for_other_sdata_or_coordina
     )
     monkeypatch.setattr(viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: [])
     monkeypatch.setattr(viewer_widget_module, "get_annotating_table_names", lambda sdata, element_name: [])
-    monkeypatch.setattr(viewer_widget_module, "get_table_color_source_options", lambda sdata, table_name: [])
+    _patch_linked_tables(monkeypatch)
     monkeypatch.setattr(viewer_widget_module, "get_shape_column_color_source_options", lambda sdata, shapes_name: [])
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
@@ -1882,11 +1983,7 @@ def test_viewer_widget_filters_cards_by_selected_coordinate_system(qtbot, monkey
         "get_annotating_table_names",
         lambda sdata, labels_name: ["table_global"] if labels_name == "labels_global" else ["table_local"],
     )
-    monkeypatch.setattr(
-        viewer_widget_module,
-        "get_table_color_source_options",
-        lambda sdata, table_name: [],
-    )
+    _patch_linked_tables(monkeypatch)
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
         widget.app_state.set_sdata(fake_sdata)
@@ -1941,7 +2038,7 @@ def test_viewer_widget_refreshes_from_shared_coordinate_system_changes(qtbot, mo
         "get_annotating_table_names",
         lambda sdata, labels_name: ["table_global"] if labels_name == "labels_global" else ["table_local"],
     )
-    monkeypatch.setattr(viewer_widget_module, "get_table_color_source_options", lambda sdata, table_name: [])
+    _patch_linked_tables(monkeypatch)
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
         widget.app_state.set_sdata(fake_sdata)
@@ -2191,7 +2288,7 @@ def test_viewer_widget_add_update_labels_dispatches_to_styled_overlay_path(qtbot
     monkeypatch.setattr(widget, "_add_or_update_styled_labels_layer", lambda request: recorded_requests.append(request))
 
     first_card = widget.labels_cards[0]
-    _select_color_source_kind(first_card, "x_var")
+    _select_color_source_kind(first_card, "var")
     first_card.color_source_value_input.setText("channel_1_sum")
     first_card.add_update_button.click()
 
@@ -2199,7 +2296,7 @@ def test_viewer_widget_add_update_labels_dispatches_to_styled_overlay_path(qtbot
     request = recorded_requests[0]
     assert request.labels_name == "blobs_labels"
     assert request.table_name == "table"
-    assert request.selected_source_kind == "x_var"
+    assert request.selected_source_kind == "var"
     assert request.selected_color_source is not None
     assert request.selected_color_source.value_key == "channel_1_sum"
 
@@ -2229,7 +2326,7 @@ def test_viewer_widget_add_update_labels_creates_and_updates_styled_overlay(qtbo
     assert binding is not None
     assert binding.labels_role == "styled"
     _assert_action_feedback_card(widget, title="Colored Overlay Created", kind="success")
-    assert 'Created colored overlay for obs["cell_type"]' in widget.global_action_feedback_label.text()
+    assert 'Created colored overlay "obs: cell_type"' in widget.global_action_feedback_label.text()
     assert "stored categorical palette" in widget.global_action_feedback_label.text()
 
     first_card.add_update_button.click()
@@ -2237,7 +2334,7 @@ def test_viewer_widget_add_update_labels_creates_and_updates_styled_overlay(qtbo
     assert len(viewer.layers) == 1
     assert viewer.layers[0] is layer
     _assert_action_feedback_card(widget, title="Colored Overlay Updated", kind="success")
-    assert 'Updated colored overlay for obs["cell_type"]' in widget.global_action_feedback_label.text()
+    assert 'Updated colored overlay "obs: cell_type"' in widget.global_action_feedback_label.text()
 
 
 def test_viewer_widget_styled_overlay_missing_palette_uses_info_card(qtbot, sdata_blobs) -> None:
@@ -2278,7 +2375,7 @@ def test_viewer_widget_styled_overlay_instance_key_uses_success_card(qtbot, sdat
     first_card.add_update_button.click()
 
     _assert_action_feedback_card(widget, title="Colored Overlay Created", kind="success")
-    assert 'Created colored overlay for obs["instance_id"]' in widget.global_action_feedback_label.text()
+    assert 'Created colored overlay "obs: instance_id"' in widget.global_action_feedback_label.text()
     assert "Used instance colors." in widget.global_action_feedback_label.text()
     binding = widget.app_state.viewer_adapter.layer_bindings.get_binding(viewer.layers[0])
     assert binding is not None
@@ -3241,8 +3338,8 @@ def test_viewer_widget_shapes_card_exposes_shape_column_controls(qtbot) -> None:
         "Shapes column",
     ]
     assert card.color_source_kind_combo.isEnabled()
-    assert card.color_source_kind_combo.findData("obs_column") == -1
-    assert card.color_source_kind_combo.findData("x_var") == -1
+    assert "obs_column" not in _color_source_kinds(card)
+    assert "var" not in _color_source_kinds(card)
     assert _combo_texts(card.linked_table_combo) == ["No linked tables"]
     assert not card.linked_table_combo.isEnabled()
     assert card.color_source_value_label.text() == "Value source"
@@ -3269,7 +3366,7 @@ def test_viewer_widget_shapes_card_exposes_shape_column_controls(qtbot) -> None:
 
     card.color_source_value_input.setText("cell_type")
     assert card.fill_toggle.isEnabled()
-    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer for column "cell_type"'
+    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer "column: cell_type"'
 
     card.fill_toggle.setChecked(True)
     _select_color_source_kind(card, "shape_column")
@@ -3333,11 +3430,7 @@ def test_viewer_widget_shapes_card_omits_shape_column_when_only_table_sources(qt
         "get_annotating_table_names",
         lambda sdata, element_name: ["table"] if element_name == "cells" else [],
     )
-    monkeypatch.setattr(
-        viewer_widget_module,
-        "get_table_color_source_options",
-        lambda sdata, table_name: [table_source],
-    )
+    _patch_linked_tables(monkeypatch, lambda table_name: [table_source])
     qtbot.addWidget(widget)
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
@@ -3346,7 +3439,7 @@ def test_viewer_widget_shapes_card_omits_shape_column_when_only_table_sources(qt
     card = widget.shape_cards[0]
 
     assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Observations"]
-    assert card.color_source_kind_combo.findData("shape_column") == -1
+    assert "shape_column" not in _color_source_kinds(card)
     assert card.color_source_kind_combo.isEnabled()
 
     _select_color_source_kind(card, "obs_column")
@@ -3389,7 +3482,7 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
         "table_b": [
             TableColorSourceSpec(
                 table_name="table_b",
-                source_kind="x_var",
+                source_kind="var",
                 value_key="GeneA",
                 value_kind="continuous",
             )
@@ -3401,11 +3494,7 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
         "get_annotating_table_names",
         lambda sdata, element_name: ["table_a", "table_b"] if element_name == "cells" else [],
     )
-    monkeypatch.setattr(
-        viewer_widget_module,
-        "get_table_color_source_options",
-        lambda sdata, table_name: list(color_sources_by_table[table_name]),
-    )
+    _patch_linked_tables(monkeypatch, lambda table_name: list(color_sources_by_table[table_name]))
     qtbot.addWidget(widget)
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
@@ -3416,7 +3505,7 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
     assert _combo_texts(card.linked_table_combo) == ["table_a", "table_b"]
     assert card.selected_table_name == "table_a"
     assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Shapes column", "Observations"]
-    assert card.color_source_kind_combo.findData("x_var") == -1
+    assert "var" not in _color_source_kinds(card)
 
     _select_color_source_kind(card, "obs_column")
     assert card.color_source_value_label.text() == "Observation"
@@ -3431,16 +3520,16 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
 
     card.color_source_value_input.setText("cell_type")
     assert card.selected_color_source == color_sources_by_table["table_a"][0]
-    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer for obs["cell_type"]'
+    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer "obs: cell_type"'
 
     card.linked_table_combo.setCurrentIndex(1)
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Shapes column", "Vars"]
-    assert card.color_source_kind_combo.findData("obs_column") == -1
+    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Shapes column", "Vars (X)"]
+    assert "obs_column" not in _color_source_kinds(card)
     assert card.selected_source_kind is None
     assert not card.color_source_value_input.isEnabled()
     assert card.action_hint_label.text() == "Action: add/update primary shapes layer"
 
-    _select_color_source_kind(card, "x_var")
+    _select_color_source_kind(card, "var")
     assert card.color_source_value_label.text() == "Var"
     assert card.color_source_value_input.isEnabled()
     assert card.color_source_value_input.text() == ""
@@ -3455,7 +3544,39 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
     card.color_source_value_input.completer().popup().hide()
     card.color_source_value_input.setText("GeneA")
     assert card.selected_color_source == color_sources_by_table["table_b"][0]
-    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer for X[:, "GeneA"]'
+    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer "vars (X): GeneA"'
+
+
+def test_viewer_widget_shapes_card_reads_the_selected_var_from_the_selected_layer(qtbot, monkeypatch) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    sdata = _make_colorable_shapes_sdata(cell_type_colors=["red", "blue"])
+    var_source = TableColorSourceSpec(table_name="table", source_kind="var", value_key="GeneA", value_kind="continuous")
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "get_annotating_table_names",
+        lambda sdata, element_name: ["table"] if element_name == "cells" else [],
+    )
+    _patch_linked_tables(monkeypatch, lambda table_name: [var_source], {"table": (None, "counts")})
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata)
+
+    card = widget.shape_cards[0]
+    assert _combo_texts(card.color_source_kind_combo) == [
+        "No color source",
+        "Shapes column",
+        "Vars (X)",
+        "Vars (counts)",
+    ]
+
+    card.color_source_kind_combo.setCurrentIndex(3)
+    card.color_source_value_input.setText("GeneA")
+
+    assert card.selected_kind_entry.var_layer == "counts"
+    assert card.selected_color_source == replace(var_source, var_layer="counts")
+    assert card.action_hint_label.text() == 'Action: add/update styled shapes layer "vars (counts): GeneA"'
 
 
 def test_viewer_widget_add_update_shapes_with_table_source_dispatches_to_styled_path(qtbot, monkeypatch) -> None:
@@ -3476,11 +3597,7 @@ def test_viewer_widget_add_update_shapes_with_table_source_dispatches_to_styled_
         "get_annotating_table_names",
         lambda sdata, element_name: ["table"] if element_name == "cells" else [],
     )
-    monkeypatch.setattr(
-        viewer_widget_module,
-        "get_table_color_source_options",
-        lambda sdata, table_name: [table_source],
-    )
+    _patch_linked_tables(monkeypatch, lambda table_name: [table_source])
 
     def ensure_styled_shapes_loaded(
         sdata_arg: object,
@@ -3518,7 +3635,7 @@ def test_viewer_widget_add_update_shapes_with_table_source_dispatches_to_styled_
     assert recorded_calls == [(sdata, "cells", "global", table_source, True)]
     assert viewer.layers.selection.active is result_layer
     _assert_action_feedback_card(widget, title="Styled Shapes Created", kind="info")
-    assert 'Created styled shapes layer for obs["cell_type"]' in widget.global_action_feedback_label.text()
+    assert 'Created styled shapes layer "obs: cell_type"' in widget.global_action_feedback_label.text()
     assert (
         "Rendered point-radius shapes as napari points for faster display."
         in widget.global_action_feedback_label.text()
@@ -3577,7 +3694,7 @@ def test_viewer_widget_add_update_styled_shapes_creates_and_updates_layer(qtbot)
 
     assert len(viewer.layers) == 1
     layer = viewer.layers[0]
-    assert layer.name == "cells[shapes_column:cell_type]"
+    assert layer.name == "cells[column: cell_type]"
     binding = widget.app_state.viewer_adapter.layer_bindings.get_binding(layer)
     assert binding is not None
     assert binding.element_type == "shapes"
@@ -3589,7 +3706,7 @@ def test_viewer_widget_add_update_styled_shapes_creates_and_updates_layer(qtbot)
     )
     np.testing.assert_allclose(layer.face_color[:, 3], np.zeros(len(layer.data)))
     _assert_action_feedback_card(widget, title="Styled Shapes Created", kind="success")
-    assert 'Created styled shapes layer for column "cell_type"' in widget.global_action_feedback_label.text()
+    assert 'Created styled shapes layer "column: cell_type"' in widget.global_action_feedback_label.text()
     assert "Used the stored categorical palette." in widget.global_action_feedback_label.text()
 
     card.fill_toggle.setChecked(True)
@@ -3599,7 +3716,7 @@ def test_viewer_widget_add_update_styled_shapes_creates_and_updates_layer(qtbot)
     assert viewer.layers[0] is layer
     np.testing.assert_allclose(layer.face_color[:, 3], np.full(len(layer.data), SHAPES_FACE_ALPHA))
     _assert_action_feedback_card(widget, title="Styled Shapes Updated", kind="success")
-    assert 'Updated styled shapes layer for column "cell_type"' in widget.global_action_feedback_label.text()
+    assert 'Updated styled shapes layer "column: cell_type"' in widget.global_action_feedback_label.text()
 
 
 def test_viewer_widget_styled_shapes_feedback_reports_missing_palette(qtbot) -> None:
@@ -3845,7 +3962,7 @@ def test_viewer_widget_add_update_shapes_uses_selected_coordinate_system(qtbot, 
     )
     monkeypatch.setattr(viewer_widget_module, "get_shape_column_color_source_options", lambda sdata, shapes_name: [])
     monkeypatch.setattr(viewer_widget_module, "get_annotating_table_names", lambda sdata, element_name: [])
-    monkeypatch.setattr(viewer_widget_module, "get_table_color_source_options", lambda sdata, table_name: [])
+    _patch_linked_tables(monkeypatch)
     monkeypatch.setattr(
         widget.app_state.viewer_adapter,
         "ensure_shapes_loaded",
@@ -3896,7 +4013,7 @@ def test_viewer_widget_add_update_shapes_reports_skipped_geometry_warning(qtbot,
     )
     monkeypatch.setattr(viewer_widget_module, "get_shape_column_color_source_options", lambda sdata, shapes_name: [])
     monkeypatch.setattr(viewer_widget_module, "get_annotating_table_names", lambda sdata, element_name: [])
-    monkeypatch.setattr(viewer_widget_module, "get_table_color_source_options", lambda sdata, table_name: [])
+    _patch_linked_tables(monkeypatch)
     monkeypatch.setattr(
         widget.app_state.viewer_adapter,
         "ensure_shapes_loaded",
