@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import anndata as ad
+import harpy as hp
 import pandas as pd
 import zarr
 from spatialdata.models import TableModel
 
-from spatiato.core.spatialdata import get_table, normalize_table_metadata
+from spatiato.core.spatialdata import get_table, get_table_metadata, normalize_table_metadata
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -22,7 +23,17 @@ _MISSING = object()
 
 @dataclass(frozen=True, order=True)
 class TableComponentPath:
-    """Identify one logical, independently tracked AnnData table component."""
+    """Identify one part of an AnnData table that is tracked, written and reloaded on its own.
+
+    Only three components are supported:
+
+    - `obs`: one column, for example `TableComponentPath("obs", ("pred_class",))`.
+    - `obsm`: one entry, for example `TableComponentPath("obsm", ("features",))`.
+    - `uns`: one entry at any depth, for example
+      `TableComponentPath("uns", ("classifier_config", "pred_class"))`.
+
+    Other components, such as `X`, `layers`, `var` or `obsp`, raise `ValueError`.
+    """
 
     component: TableComponent
     keys: tuple[str, ...]
@@ -39,7 +50,7 @@ class TableComponentPath:
 
 
 @dataclass(frozen=True)
-class TableComponentWriteResult:
+class TableComponentPersistResult:
     """Report the table store and logical paths persisted by one write."""
 
     table_path: str
@@ -54,50 +65,72 @@ class TableComponentReloadResult:
     reloaded_paths: frozenset[TableComponentPath]
 
 
-def write_table_components(
+def persist_table_components(
     sdata: SpatialData,
     *,
     table_name: str,
     paths: frozenset[TableComponentPath],
-) -> TableComponentWriteResult:
-    """Persist selected logical table components through AnnData zarr encodings."""
-    table, table_path, table_group = _resolve_backed_table_group(sdata, table_name, mode="r+")
+) -> TableComponentPersistResult:
+    """Write the given `obs`, `obsm` and `uns` paths of a backed table to its zarr store.
+
+    Only these three components are written, since `TableComponentPath`
+    supports no others; the rest of the table in the store is left as it is.
+    The store is made to follow memory, in one update through harpy:
+
+    - `obs`: any `obs` path writes the whole `obs` dataframe, because harpy
+      writes `obs` only whole. A column dropped in memory is gone from the store.
+    - `obsm` and `uns`: a path with a value in memory is written; a path
+      without one is deleted from the store.
+
+    The attached table stays the same AnnData object in `sdata.tables`, but
+    harpy's `add_table_components(...)` replaces what it wrote with what it
+    reads back from the store: `obs` becomes a new dataframe, `uns` a new dict,
+    and, when an `obsm` entry is written, `obsm` a new mapping whose written
+    entries are lazy views of the store. Values come back as stored, so a list
+    in `uns` becomes a numpy array, as after a reload. Code that kept a
+    reference to the old `table.obs` or `table.uns` keeps the old object.
+
+    If the write fails, both the store and the attached table are restored.
+
+    Raises `ValueError` when `paths` is empty, when the table is not backed,
+    or when it is stored anywhere other than `tables/<table_name>`.
+    """
+    table, table_path = _require_backed_table(sdata, table_name)
     normalized_paths = _remove_redundant_uns_descendants(frozenset(paths))
     if not normalized_paths:
         raise ValueError("At least one table component path is required for persistence.")
 
-    uns_paths = tuple(sorted(path for path in normalized_paths if path.component == "uns"))
-    for path in uns_paths:
-        _read_mapping_path(table.uns, path.keys)
-        _validate_disk_parent_chain(table_group["uns"], path.keys[:-1], table_name=table_name)
-
+    components: dict[tuple[str, ...], object] = {}
+    deletions: list[tuple[str, ...]] = []
     if any(path.component == "obs" for path in normalized_paths):
-        ad.io.write_elem(table_group, "obs", table.obs)
-
-    for path in sorted(path for path in normalized_paths if path.component == "obsm"):
-        key = path.keys[0]
-        if key in table.obsm:
-            ad.io.write_elem(table_group["obsm"], key, table.obsm[key])
-        elif key in table_group["obsm"]:
-            # A controller can remove an obsm entry and record its path as
-            # dirty. The later dirty snapshot still selects that path for
-            # writing, so synchronize its in-memory absence by deleting the
-            # persisted entry from the zarr store.
-            del table_group["obsm"][key]
-
-    for path in uns_paths:
-        exists, value = _read_mapping_path(table.uns, path.keys)
-        key = path.keys[-1]
+        components[("obs",)] = table.obs
+    for path in sorted(path for path in normalized_paths if path.component != "obs"):
+        if path.component == "obsm":
+            exists = path.keys[0] in table.obsm
+            value = table.obsm[path.keys[0]] if exists else _MISSING
+        else:
+            exists, value = _read_mapping_path(table.uns, path.keys)
         if exists:
-            parent = _resolve_disk_parent_for_write(table_group["uns"], path.keys[:-1])
-            ad.io.write_elem(parent, key, value)
-            continue
-        parent = _resolve_existing_disk_parent(table_group["uns"], path.keys[:-1])
-        if parent is not None and key in parent:
-            del parent[key]
+            components[(path.component, *path.keys)] = value
+        else:
+            deletions.append((path.component, *path.keys))
 
-    zarr.consolidate_metadata(sdata.path)
-    return TableComponentWriteResult(table_path=table_path, persisted_paths=normalized_paths)
+    if components:
+        obs_identity = None
+        if any(component_path[0] == "obsm" for component_path in components):
+            metadata = get_table_metadata(sdata, table_name)
+            obs_identity = table.obs[[metadata.region_key, metadata.instance_key]]
+        hp.tb.io.add_table_components(
+            sdata,
+            table_name=table_name,
+            components=components,
+            delete=tuple(deletions),
+            obs_identity=obs_identity,
+            overwrite=True,
+        )
+    else:
+        hp.tb.io.remove_table_components(sdata, table_name=table_name, components=tuple(deletions))
+    return TableComponentPersistResult(table_path=table_path, persisted_paths=normalized_paths)
 
 
 def build_full_table_reload_paths(
@@ -211,23 +244,6 @@ def reload_table_components(
     )
 
 
-def write_table_prediction_state(
-    sdata: SpatialData,
-    *,
-    table_name: str,
-    uns_keys: Sequence[str] = (),
-) -> str:
-    """Compatibility wrapper for writing table obs and selected live uns entries."""
-    table = get_table(sdata, table_name)
-    paths = {TableComponentPath("obs", (str(column),)) for column in table.obs.columns}
-    paths.update(TableComponentPath("uns", (key,)) for key in uns_keys if key in table.uns)
-    return write_table_components(
-        sdata,
-        table_name=table_name,
-        paths=frozenset(paths),
-    ).table_path
-
-
 def resolve_table_path(sdata: SpatialData, table: AnnData, table_name: str) -> str:
     """Return the unique zarr path for `table` inside a backed SpatialData object."""
     table_paths = sdata.locate_element(table)
@@ -242,16 +258,31 @@ def resolve_table_path(sdata: SpatialData, table: AnnData, table_name: str) -> s
     return table_paths[0]
 
 
+def _require_backed_table(sdata: SpatialData, table_name: str) -> tuple[AnnData, str]:
+    """Return the attached table and its path in the store.
+
+    harpy reads and writes a table at `tables/<table_name>`, so a table stored
+    anywhere else is refused here, before harpy is called.
+    """
+    if not sdata.is_backed() or sdata.path is None:
+        raise ValueError("SpatialData must be backed by a zarr store for table persistence.")
+    table = get_table(sdata, table_name)
+    table_path = resolve_table_path(sdata, table, table_name)
+    if table_path != f"tables/{table_name}":
+        raise ValueError(
+            f"Table `{table_name}` is stored at `{table_path}`, but tables are written and reloaded "
+            f"at `tables/{table_name}`."
+        )
+    return table, table_path
+
+
 def _resolve_backed_table_group(
     sdata: SpatialData,
     table_name: str,
     *,
     mode: Literal["r", "r+"],
 ) -> tuple[AnnData, str, Any]:
-    if not sdata.is_backed() or sdata.path is None:
-        raise ValueError("SpatialData must be backed by a zarr store for table persistence.")
-    table = get_table(sdata, table_name)
-    table_path = resolve_table_path(sdata, table, table_name)
+    table, table_path = _require_backed_table(sdata, table_name)
     root = zarr.open_group(sdata.path, mode=mode, use_consolidated=False)
     return table, table_path, root[table_path]
 
@@ -266,34 +297,6 @@ def _read_mapping_path(mapping: Mapping[str, object], keys: tuple[str, ...]) -> 
             return False, _MISSING
         current = current[key]
     return True, current
-
-
-def _validate_disk_parent_chain(group: Any, keys: tuple[str, ...], *, table_name: str) -> None:
-    current = group
-    for key in keys:
-        if key not in current:
-            return
-        current = current[key]
-        if not hasattr(current, "keys"):
-            raise ValueError(f"Table `{table_name}` has a non-mapping encoded uns parent at `{key}`.")
-
-
-def _resolve_disk_parent_for_write(group: Any, keys: tuple[str, ...]) -> Any:
-    current = group
-    for key in keys:
-        if key not in current:
-            ad.io.write_elem(current, key, {})
-        current = current[key]
-    return current
-
-
-def _resolve_existing_disk_parent(group: Any, keys: tuple[str, ...]) -> Any | None:
-    current = group
-    for key in keys:
-        if key not in current:
-            return None
-        current = current[key]
-    return current
 
 
 def _read_disk_path(group: Any, keys: tuple[str, ...]) -> tuple[bool, object]:
