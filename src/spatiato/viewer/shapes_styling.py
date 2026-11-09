@@ -16,6 +16,7 @@ from spatiato.core._color_source import (
     ShapeColorValueKind,
     ShapeColumnColorSourceSpec,
     TableColorSourceSpec,
+    format_var_matrix,
     validate_shape_color_value_kind,
 )
 from spatiato.core.class_palette import (
@@ -23,7 +24,7 @@ from spatiato.core.class_palette import (
     resolve_table_categorical_palette,
     validate_categorical_palette_source,
 )
-from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata
+from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata, get_table_var_matrix
 from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
     build_string_categorical_values,
@@ -279,7 +280,7 @@ def apply_table_color_source_to_shapes_layer(
             aligned_values=aligned_values,
             column_name=style_spec.value_key,
         )
-    elif style_spec.source_kind == "x_var":
+    elif style_spec.source_kind == "var":
         style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(
             aligned_values.rendered_row_values
         )
@@ -322,11 +323,7 @@ def build_styled_shapes_layer_name(
     style_spec: ShapeColumnColorSourceSpec | TableColorSourceSpec,
 ) -> str:
     """Return the user-facing layer name for one styled shapes variant."""
-    if style_spec.source_kind == "obs_column":
-        return f"{shapes_name}[obs:{style_spec.value_key}]"
-    if style_spec.source_kind == "x_var":
-        return f"{shapes_name}[X:{style_spec.value_key}]"
-    return f"{shapes_name}[shapes_column:{style_spec.value_key}]"
+    return f"{shapes_name}[{style_spec.source_label}]"
 
 
 def _validate_source_row_id_by_rendered_row(
@@ -556,7 +553,7 @@ def _get_table_color_values_by_instance(
         if style_spec.value_key not in table.obs:
             raise ValueError(f"Observation column `{style_spec.value_key}` is not available in the selected table.")
         values = region_rows[style_spec.value_key]
-    elif style_spec.source_kind == "x_var":
+    elif style_spec.source_kind == "var":
         var_name = style_spec.value_key
         if var_name not in table.var_names:
             raise ValueError(f"Var `{var_name}` is not available in the selected table.")
@@ -565,12 +562,16 @@ def _get_table_color_values_by_instance(
         if not isinstance(var_index, (int, np.integer)):
             raise ValueError(f"Var `{var_name}` does not resolve to one unique column in `table.var_names`.")
 
+        matrix = get_table_var_matrix(table, style_spec.var_layer)
         obs_positions = table.obs.index.get_indexer(region_rows.index)
         if np.any(obs_positions < 0):
-            raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
+            raise ValueError(
+                f"Could not align linked table rows back to `{format_var_matrix(style_spec.var_layer)}[:, {var_name!r}]` "
+                "for viewer coloring."
+            )
 
-        x_values = read_matrix_column(table.X, int(var_index), rows=obs_positions)
-        values = pd.Series(x_values, index=region_rows.index, name=var_name)
+        var_values = read_matrix_column(matrix, int(var_index), rows=obs_positions)
+        values = pd.Series(var_values, index=region_rows.index, name=var_name)
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
 

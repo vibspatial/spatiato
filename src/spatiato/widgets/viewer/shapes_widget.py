@@ -30,6 +30,7 @@ from spatiato.widgets.shared_styles import (
     build_input_control_stylesheet,
     create_form_label,
 )
+from spatiato.widgets.viewer._table_color_sources import ColorSourceKindEntry, LinkedTableColorSources
 from spatiato.widgets.viewer.styles import (
     CARD_TITLE_STYLESHEET,
     DETAIL_PANEL_STYLESHEET,
@@ -41,14 +42,7 @@ _SHAPE_COLUMN_PLACEHOLDER = "Select column"
 _OBS_SOURCE_PLACEHOLDER = "Select obs column"
 _VAR_SOURCE_PLACEHOLDER = "Select var"
 _NO_COLOR_SOURCE_LABEL = "No color source"
-_SHAPE_SOURCE_KIND_ITEMS: tuple[
-    tuple[str, ShapeColorSourceKind | TableColorSourceKind],
-    ...,
-] = (
-    ("Shapes column", "shape_column"),
-    ("Observations", "obs_column"),
-    ("Vars", "x_var"),
-)
+_SHAPE_COLUMN_KIND_ENTRY = ColorSourceKindEntry(label="Shapes column", source_kind="shape_column")
 
 
 @dataclass(frozen=True)
@@ -70,12 +64,12 @@ class _ShapesCardWidget(QFrame):
         *,
         shapes_name: str,
         shape_column_color_sources: list[ShapeColumnColorSourceSpec],
-        table_color_sources_by_table: dict[str, list[TableColorSourceSpec]],
+        linked_tables: dict[str, LinkedTableColorSources],
     ) -> None:
         super().__init__()
         self.shapes_name = shapes_name
         self._shape_column_color_sources = shape_column_color_sources
-        self._table_color_sources_by_table = table_color_sources_by_table
+        self._linked_tables = linked_tables
         self._filtered_color_sources: list[ShapeColumnColorSourceSpec | TableColorSourceSpec] = []
         self._active_source_kind: ShapeColorSourceKind | TableColorSourceKind | None = None
         self.setObjectName(f"viewer_widget_shapes_card_{shapes_name}")
@@ -100,7 +94,7 @@ class _ShapesCardWidget(QFrame):
         self.linked_table_combo = CompactComboBox(minimum_contents_length=8)
         self.linked_table_combo.setObjectName(f"viewer_widget_shapes_linked_table_combo_{shapes_name}")
         self.linked_table_combo.setStyleSheet(INPUT_CONTROL_STYLESHEET)
-        table_names = list(table_color_sources_by_table)
+        table_names = list(linked_tables)
         if table_names:
             self.linked_table_combo.addItems(table_names)
         else:
@@ -170,12 +164,18 @@ class _ShapesCardWidget(QFrame):
             return None
 
         table_name = self.linked_table_combo.currentText()
-        return table_name if table_name in self._table_color_sources_by_table else None
+        return table_name if table_name in self._linked_tables else None
+
+    @property
+    def selected_kind_entry(self) -> ColorSourceKindEntry | None:
+        """Return the selected "Color source" entry, or `None` for "No color source"."""
+        entry = self.color_source_kind_combo.currentData()
+        return entry if isinstance(entry, ColorSourceKindEntry) else None
 
     @property
     def selected_source_kind(self) -> ShapeColorSourceKind | TableColorSourceKind | None:
-        value = self.color_source_kind_combo.currentData()
-        return value if value in self._available_source_kinds() else None
+        entry = self.selected_kind_entry
+        return None if entry is None else entry.source_kind
 
     @property
     def selected_color_source(self) -> ShapeColumnColorSourceSpec | TableColorSourceSpec | None:
@@ -189,18 +189,15 @@ class _ShapesCardWidget(QFrame):
     def fill_shapes(self) -> bool:
         return self.fill_toggle.isChecked()
 
-    def set_linked_tables(
-        self,
-        table_color_sources_by_table: dict[str, list[TableColorSourceSpec]],
-    ) -> None:
+    def set_linked_tables(self, linked_tables: dict[str, LinkedTableColorSources]) -> None:
         previous_table_name = self.selected_table_name
-        previous_source_kind = self.selected_source_kind
+        previous_kind_entry = self.selected_kind_entry
         previous_source_identity = (
             self.selected_color_source.identity if self.selected_color_source is not None else None
         )
 
-        self._table_color_sources_by_table = table_color_sources_by_table
-        table_names = list(table_color_sources_by_table)
+        self._linked_tables = linked_tables
+        table_names = list(linked_tables)
         with QSignalBlocker(self.linked_table_combo):
             self.linked_table_combo.clear()
             if table_names:
@@ -214,7 +211,7 @@ class _ShapesCardWidget(QFrame):
                 self.linked_table_combo.setCurrentIndex(0)
 
         self._refresh_color_source_controls(
-            preferred_source_kind=previous_source_kind,
+            preferred_kind_entry=previous_kind_entry,
             preferred_source_identity=previous_source_identity,
         )
 
@@ -222,10 +219,11 @@ class _ShapesCardWidget(QFrame):
         self,
         _index: int | None = None,
         *,
-        preferred_source_kind: ShapeColorSourceKind | TableColorSourceKind | None = None,
+        preferred_kind_entry: ColorSourceKindEntry | None = None,
         preferred_source_identity: tuple[object, ...] | None = None,
     ) -> None:
-        current_source_kind = preferred_source_kind or self.selected_source_kind
+        current_kind_entry = preferred_kind_entry if preferred_kind_entry is not None else self.selected_kind_entry
+        current_source_kind = None if current_kind_entry is None else current_kind_entry.source_kind
         if preferred_source_identity is not None:
             selected_source_identity = preferred_source_identity
         elif self._active_source_kind == current_source_kind:
@@ -235,36 +233,32 @@ class _ShapesCardWidget(QFrame):
         else:
             selected_source_identity = None
 
-        self._rebuild_color_source_kind_combo(preferred_source_kind=current_source_kind)
+        self._rebuild_color_source_kind_combo(preferred_kind_entry=current_kind_entry)
+        kind_entry = self.selected_kind_entry
         source_kind = self.selected_source_kind
-        table_name = self.selected_table_name
+        linked_table = self._selected_linked_table()
 
         if source_kind == "shape_column":
             self.color_source_value_label.setText("Shapes column")
-            available_sources: list[ShapeColumnColorSourceSpec | TableColorSourceSpec] = list(
-                self._shape_column_color_sources
-            )
             placeholder_text = _SHAPE_COLUMN_PLACEHOLDER
         elif source_kind == "obs_column":
             self.color_source_value_label.setText("Observation")
-            available_sources = (
-                list(self._table_color_sources_by_table.get(table_name, ())) if table_name is not None else []
-            )
             placeholder_text = _OBS_SOURCE_PLACEHOLDER
-        elif source_kind == "x_var":
+        elif source_kind == "var":
             self.color_source_value_label.setText("Var")
-            available_sources = (
-                list(self._table_color_sources_by_table.get(table_name, ())) if table_name is not None else []
-            )
             placeholder_text = _VAR_SOURCE_PLACEHOLDER
         else:
             self.color_source_value_label.setText("Value source")
-            available_sources = []
             placeholder_text = "Select a color source kind first"
 
-        self._filtered_color_sources = (
-            [] if source_kind is None else [source for source in available_sources if source.source_kind == source_kind]
-        )
+        if kind_entry is None:
+            self._filtered_color_sources = []
+        elif kind_entry.source_kind == "shape_column":
+            self._filtered_color_sources = list(self._shape_column_color_sources)
+        elif linked_table is None:
+            self._filtered_color_sources = []
+        else:
+            self._filtered_color_sources = list(linked_table.sources_for(kind_entry))
 
         with QSignalBlocker(self.color_source_value_input):
             if source_kind is None:
@@ -299,35 +293,38 @@ class _ShapesCardWidget(QFrame):
         self._active_source_kind = source_kind
         self._update_action_status()
 
-    def _available_source_kinds(self) -> tuple[ShapeColorSourceKind | TableColorSourceKind, ...]:
-        source_kinds: set[ShapeColorSourceKind | TableColorSourceKind] = set()
-        if self._shape_column_color_sources:
-            source_kinds.add("shape_column")
-
+    def _selected_linked_table(self) -> LinkedTableColorSources | None:
         table_name = self.selected_table_name
-        if table_name is not None:
-            source_kinds.update(source.source_kind for source in self._table_color_sources_by_table.get(table_name, ()))
+        return None if table_name is None else self._linked_tables[table_name]
 
-        return tuple(source_kind for _, source_kind in _SHAPE_SOURCE_KIND_ITEMS if source_kind in source_kinds)
+    def _kind_entries(self) -> list[ColorSourceKindEntry]:
+        kind_entries: list[ColorSourceKindEntry] = []
+        if self._shape_column_color_sources:
+            kind_entries.append(_SHAPE_COLUMN_KIND_ENTRY)
+
+        linked_table = self._selected_linked_table()
+        if linked_table is not None:
+            kind_entries.extend(linked_table.kind_entries())
+        return kind_entries
 
     def _rebuild_color_source_kind_combo(
         self,
         *,
-        preferred_source_kind: ShapeColorSourceKind | TableColorSourceKind | None = None,
+        preferred_kind_entry: ColorSourceKindEntry | None = None,
     ) -> None:
-        available_source_kinds = self._available_source_kinds()
-        selected_source_kind = preferred_source_kind if preferred_source_kind in available_source_kinds else None
+        kind_entries = self._kind_entries()
 
         with QSignalBlocker(self.color_source_kind_combo):
             self.color_source_kind_combo.clear()
             self.color_source_kind_combo.addItem(_NO_COLOR_SOURCE_LABEL, None)
-            for label, source_kind in _SHAPE_SOURCE_KIND_ITEMS:
-                if source_kind in available_source_kinds:
-                    self.color_source_kind_combo.addItem(label, source_kind)
+            next_index = 0
+            for kind_entry in kind_entries:
+                if kind_entry == preferred_kind_entry:
+                    next_index = self.color_source_kind_combo.count()
+                self.color_source_kind_combo.addItem(kind_entry.label, kind_entry)
 
-            next_index = self.color_source_kind_combo.findData(selected_source_kind)
-            self.color_source_kind_combo.setCurrentIndex(next_index if next_index >= 0 else 0)
-            self.color_source_kind_combo.setEnabled(bool(available_source_kinds))
+            self.color_source_kind_combo.setCurrentIndex(next_index)
+            self.color_source_kind_combo.setEnabled(bool(kind_entries))
 
     def _sync_current_source_selection(self) -> None:
         if not self.color_source_value_input.isEnabled():
@@ -350,7 +347,7 @@ class _ShapesCardWidget(QFrame):
             self.action_hint_label.setText("Action: add/update primary shapes layer")
             return
 
-        if source_kind in {"obs_column", "x_var"} and table_name is None:
+        if source_kind in {"obs_column", "var"} and table_name is None:
             self.action_hint_label.setText("Action: table-backed shapes coloring requires a linked table")
             return
 
@@ -369,18 +366,7 @@ class _ShapesCardWidget(QFrame):
                 self.action_hint_label.setText("Action: no vars available for a styled shapes layer")
             return
 
-        if selected_source.source_kind == "shape_column":
-            self.action_hint_label.setText(
-                f'Action: add/update styled shapes layer for column "{selected_source.value_key}"'
-            )
-        elif selected_source.source_kind == "obs_column":
-            self.action_hint_label.setText(
-                f'Action: add/update styled shapes layer for obs["{selected_source.value_key}"]'
-            )
-        else:
-            self.action_hint_label.setText(
-                f'Action: add/update styled shapes layer for X[:, "{selected_source.value_key}"]'
-            )
+        self.action_hint_label.setText(f'Action: add/update styled shapes layer "{selected_source.source_label}"')
 
     def _update_fill_toggle_enabled(self, enabled: bool) -> None:
         self.fill_toggle.setEnabled(enabled)

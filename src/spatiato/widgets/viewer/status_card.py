@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 from spatiato.widgets.shared_styles import StatusCardKind, format_feedback_identifier, validate_status_card_kind
 
 if TYPE_CHECKING:
-    from spatiato.core._color_source import TableColorSourceSpec
     from spatiato.viewer.image_styling import ImageLoadResult
     from spatiato.viewer.labels_styling import LabelsLoadResult
     from spatiato.viewer.points_styling import PointsLoadResult
@@ -128,12 +127,12 @@ def build_styled_labels_card_spec(
         raise ValueError("Styled labels status requires a selected color source.")
 
     action = _created_updated_action(result.created)
-    source_text = _format_table_color_source(selected_color_source)
+    source_text = selected_color_source.source_label
     labels_name = request.labels_name
     display_name, was_shortened = format_feedback_identifier(labels_name)
-    lines = [(f'{action} colored overlay for {source_text} on labels element "{display_name}".')]
+    lines = [(f'{action} colored overlay "{source_text}" on labels element "{display_name}".')]
     tooltip_message = (
-        f'{action} colored overlay for {source_text} on labels element "{labels_name}".' if was_shortened else None
+        f'{action} colored overlay "{source_text}" on labels element "{labels_name}".' if was_shortened else None
     )
     title = f"Colored Overlay {action}"
     kind = _append_palette_status_lines(
@@ -183,16 +182,14 @@ def build_styled_shapes_card_spec(
         raise ValueError("Styled shapes status requires a selected color source.")
 
     action = _created_updated_action(result.created)
-    source_text = _format_shapes_color_source(selected_color_source)
+    source_text = selected_color_source.source_label
     shapes_name = request.shapes_name
     display_name, was_shortened = format_feedback_identifier(shapes_name)
-    lines = [(f'{action} styled shapes layer for {source_text} on shapes element "{display_name}".')]
+    lines = [(f'{action} styled shapes layer "{source_text}" on shapes element "{display_name}".')]
     if result.shapes_rendering_mode == "points":
         lines.append("Rendered point-radius shapes as napari points for faster display.")
     tooltip_message = (
-        f'{action} styled shapes layer for {source_text} on shapes element "{shapes_name}".'
-        if was_shortened
-        else None
+        f'{action} styled shapes layer "{source_text}" on shapes element "{shapes_name}".' if was_shortened else None
     )
     title = f"Styled Shapes {action}"
     kind = _append_palette_status_lines(
@@ -253,19 +250,6 @@ def _format_image_overlay_channels(result: ImageLoadResult) -> str:
     label = "channel" if len(channel_values) == 1 else "channels"
     formatted_channels = ", ".join(f'"{channel}"' for channel in channel_values)
     return f"{label} {formatted_channels}"
-
-
-def _format_table_color_source(color_source: TableColorSourceSpec) -> str:
-    if color_source.source_kind == "obs_column":
-        return f'obs["{color_source.value_key}"]'
-    return f'X[:, "{color_source.value_key}"]'
-
-
-def _format_shapes_color_source(color_source: object) -> str:
-    source_kind = getattr(color_source, "source_kind", None)
-    if source_kind in {"obs_column", "x_var"}:
-        return _format_table_color_source(color_source)
-    return f'column "{color_source.value_key}"'
 
 
 def _created_updated_action(created: bool) -> str:
