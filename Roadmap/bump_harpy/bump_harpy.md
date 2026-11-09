@@ -1030,12 +1030,15 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    query to annotation, so the switch cannot be split further without
    temporary adapters.
 4. **Swap the table I/O** (P5 writes, P4 reload):
-   - writes through harpy's store-only `hp.tb.io.write_table_components(...)`
-     and `delete_table_components(...)`. Spatiato's dirty tracking already
-     knows which paths changed, which maps onto explicit components and
-     deletes. The store-only functions leave the in-memory values alone; the
-     SpatialData adapters (`add_table_components(...)` and the like) would
-     replace them with lazy views of the store on every save;
+   - writes through harpy's SpatialData adapter
+     `hp.tb.io.add_table_components(...)`, or `remove_table_components(...)`
+     for deletions only. Spatiato's dirty tracking already knows which paths
+     changed, which maps onto explicit components and deletes. The adapter
+     writes the store, then reopens every written component into the attached
+     table, lazily for matrices. Revised on 2026-11-08 (step-4 design point
+     2): the store-only `write_table_components(...)` was the first choice, to
+     leave the in-memory values alone, but under D1 a written `obsm` key
+     should become a lazy view of the store anyway;
    - not `write_table_updates(...)`: it compares the whole table with the store
      and never deletes, so it does not fit explicit dirty paths (non-goal);
    - reload through `hp.tb.io.read_table_components(...)`, lazily (D1);
@@ -1045,6 +1048,77 @@ Spatiato's own table I/O code, is the core of this bump. Order:
      metadata consolidation. Kept: `TableComponentPath`, dirty tracking in
      `SpatiatoAppState`, the reload checks (`_validate_reload_binding(...)`),
      and restoring the in-memory state when a reload fails.
+
+   Readiness check for step 4 (2026-11-08, against harpy 0.5.3), settled the
+   same day. Sub-steps, each committed separately:
+
+   | Sub-step | Content | Status |
+   |---|---|---|
+   | 4a | Writes through harpy (P5, step-4 design points 1-4 below): `write_table_components(...)` keeps its signature and result, and maps the paths onto `hp.tb.io.add_table_components(...)`, or onto `remove_table_components(...)` when every path is absent; harpy reopens what it writes into the attached table, lazily for `obsm`; `write_table_prediction_state(...)` is deleted and headless calls `write_table_components(...)`; Write reports every error. Tests: a write and a delete in one call; a failed write leaves the store and the attached table unchanged and acknowledges nothing (the existing test patches the harpy call instead of `ad.io.write_elem`); a written `obsm` key is attached lazily afterwards and reads the written values; headless persistence as before | implemented on 2026-11-08: `write_table_components(...)` builds the components and deletions and calls `hp.tb.io.add_table_components(...)` (or `remove_table_components(...)`); a new `_require_backed_table(...)` refuses a table stored anywhere but `tables/<table_name>`; the disk-parent helpers, the consolidation and `write_table_prediction_state(...)` are gone; headless lists one `obs` path and the `uns` keys in memory; the controls catch `Exception` around Write, so their `TableBusyError` import goes; `docs/development/table_state.md` describes the write. Tests: the failed-write test injects a failure while harpy installs the published paths, and checks that the store and the attached table are unchanged and nothing is acknowledged; new: a write and a delete in one call, with the written `obsm` reopened as a Dask view holding the written values; Write reports an `OSError` as feedback. No existing test changed because of a dtype round trip. Renamed the same day: `write_table_components(...)` is now `persist_table_components(...)`, and its result `TableComponentPersistResult`, since it takes paths and makes the store follow memory, unlike either harpy function; it pairs with `reload_table_components(...)` |
+   | 4b | Reload through harpy (P4, step-4 design point 5 below): `build_full_table_reload_paths(...)` and `reload_table_components(...)` read with `hp.tb.io.read_table_components(..., mode="lazy", missing="omit")`; `_resolve_backed_table_group(...)`, `_read_disk_path(...)` and the `zarr` and `ad.io` imports go. Tests: a reload keeps `obsm` lazy; a key missing on disk leaves memory; the reload binding check and the rollback as before | ready (decided on 2026-11-08), after 4a |
+
+   1. **Path mapping (4a).** Any `("obs", col)` becomes `("obs",)`, the
+      whole dataframe, as today. A path present in memory is a replacement;
+      an absent one goes to `delete=`, and harpy skips a target absent from
+      both memory and store (logged at INFO), as Spatiato does today. The
+      call passes `overwrite=True`, and `obs_identity=table.obs[[region_key,
+      instance_key]]` only when an `obsm` entry is written. A request with
+      only deletions goes to `remove_table_components(...)`, since
+      `components` must not be empty. harpy creates missing nested `uns`
+      parents as encoded mappings, consolidates the store's metadata, and
+      refuses overlapping paths, so `_remove_redundant_uns_descendants(...)`
+      stays. It also checks that the attached table's axes match the stored
+      ones, and that the `obs` index and the region and instance linkage are
+      unchanged, which Spatiato's flows never change. What goes: the three
+      disk-parent helpers and the consolidation.
+   2. **harpy reopens what it writes (4a).** harpy stages a write before
+      replacing the stored key, so writing an `obsm` value that is a lazy
+      view of that same key is safe. But the store-only writer does not
+      update existing references ("reopen affected data after writing"): if
+      the new chunk layout differs, a stale in-memory view could silently read
+      the wrong chunks. `add_table_components(...)` reopens every written
+      component from the store and installs it in the attached table, inside
+      its rollback window, so Spatiato needs no re-attach code of its own;
+      this is consistent with D1. A failure also restores the previous
+      in-memory objects, not only the store. The first version of this
+      decision used the store-only writer and re-attached written `obsm` keys
+      in Spatiato; revised the same day. Rare today: on backed data, Feature
+      Extraction and Spatial Query write `obsm` through harpy and record a
+      persisted change, so `obsm` is dirty only for data changed in memory
+      before it was backed. 4b makes lazy views of the store common.
+   3. **Write reports every error (4a).** harpy can also raise `TypeError`,
+      `KeyError`, `FileNotFoundError`, `OSError`, and `RuntimeError` when its
+      own rollback fails. The persistence controls catch `Exception` around
+      Write, as they already do around Reload, instead of only `ValueError`
+      and `TableBusyError`.
+   4. **Headless (4a).** `write_table_prediction_state(...)` is deleted;
+      headless calls `write_table_components(...)` with the `obs` path and
+      the `uns` keys present in memory.
+   5. **Reload reads lazily (4b).** With `read_table_components(...,
+      mode="lazy", missing="omit")`, `("obs",)` and `uns` are decoded into
+      memory, and `obsm` entries come back as Dask views of the store. For a
+      full reload, the disk's keys come from reading the `("obsm",)` root
+      lazily (no values computed) and `("uns",)` eagerly. The request always
+      includes `("obs",)` and `("uns", "spatialdata_attrs")` for the binding
+      check, without overlapping a requested path. The reload binding check,
+      `TableModel.validate` and the in-memory rollback stay.
+
+   Accepted: the adapter reopens every written component, not only `obsm`.
+   After each Write, the attached `obs`, which Spatiato always writes whole,
+   and each written `uns` entry are copies read back from the store (harpy
+   always decodes dataframes and `uns` into memory). That costs a read of
+   `obs` per Write; the objects are new, though their values are those just
+   written (Spatiato has no identity-based caches on them); and what the
+   encoding normalizes, such as a dtype, shows in memory right after the
+   Write instead of after the next Reload, so memory matches the store.
+   harpy stages a write in a temporary directory next to the store
+   root, so the store's parent directory must be writable and have room for
+   the staged copy (Spatiato wrote in place). Until step 5, a reloaded
+   `obsm` is lazy while a freshly opened store still gives in-memory arrays;
+   consumers handle both since step 3. harpy assumes the table lives at
+   `tables/<table_name>`; `resolve_table_path(...)` stays, as a guard and for
+   the path Write returns. `docs/development/table_state.md` gets a short
+   note that Write and Reload go through harpy, with rollback.
 5. **Switch the reader** to `hp.io.read_zarr` (lazy, D1), last: it changes
    every table at once. Both places that open a store call
    `spatialdata.read_zarr` today and both switch, so they give the same
@@ -1337,6 +1411,8 @@ Direction: cover them with the P2 helper and add tests per consumer.
 
 ### P4. Reload drops laziness
 
+Status: decided on 2026-11-08, as step 4b (see "Migration Plan", step 4).
+
 `reload_table_components(...)` uses `ad.io.read_elem`, so "Reload Table State"
 replaces a lazy feature matrix with an in-memory copy.
 
@@ -1345,6 +1421,8 @@ Direction: read with `hp.tb.io.read_table_components(...)`, lazily (D1; see
 `TableModel.validate`, and in-memory rollback around it.
 
 ### P5. Replace Spatiato's on-disk writes with harpy's component API
+
+Status: decided on 2026-11-08, as step 4a (see "Migration Plan", step 4).
 
 Spatiato writes in place without staging or rollback. Once `obsm` entries are
 lazy views of the store, an in-place `write_elem` over such a key could write to
@@ -1358,9 +1436,11 @@ Direction:
   write snapshots/acknowledgement, and reload validation;
 - replace only the store I/O in `core/persistence.py`
   (`write_table_components`, `write_table_prediction_state`,
-  `reload_table_components`) with `hp.tb.io` calls, using harpy's store-only
-  functions rather than the SpatialData adapters (see "Migration Plan",
-  step 4);
+  `reload_table_components`) with `hp.tb.io` calls: writes through the
+  SpatialData adapter `add_table_components(...)`, which reopens what it
+  writes, and reloads through `read_table_components(...)` (see "Migration
+  Plan", step 4; the store-only writer was the first choice, revised on
+  2026-11-08);
 - map paths: `("obs", col)` -> `("obs",)` (whole dataframe, as today),
   `("obsm", key)` -> `("obsm", key)`, `("uns", *keys)` -> `("uns", *keys)`;
 - pass `obs_identity` for obs-aligned writes; keep including `_colors` palette
@@ -2219,6 +2299,22 @@ Settled on 2026-11-05:
   participant may block the reload, without side effects; only then do they
   invalidate their work.
 
+Settled on 2026-11-08:
+
+- Step 4 readiness check (see "Migration Plan", step 4): split into 4a,
+  writes through harpy (P5), and 4b, reload through harpy (P4).
+  `write_table_components(...)` keeps its signature and maps Spatiato's paths
+  onto harpy's replacements and deletions, through the adapter
+  `add_table_components(...)`, which reopens what it writes into the attached
+  table (lazily for `obsm`) and restores memory on failure; this replaced,
+  the same day, the store-only writer with re-attach code in Spatiato. Write
+  reports every error, as Reload does; `write_table_prediction_state(...)` is deleted, and
+  headless calls `write_table_components(...)`. Reload reads lazily with
+  `read_table_components(..., missing="omit")`. Accepted: after a Write, the
+  attached `obs` and written `uns` entries are copies read back from the
+  store; staging needs a writable parent directory of the store; until step
+  5, reloaded `obsm` is lazy while a freshly opened store is not.
+
 Settled on 2026-11-07:
 
 - Step 3d design point 5, revised: `uns["classifier_config"]` keeps only the
@@ -2284,3 +2380,6 @@ Settled on 2026-10-27 (see "Migration Plan"):
   eager tables) switches to `hp.io.read_zarr`, as the last migration step.
 - P5 uses harpy's store-only functions (Spatiato installs results in memory
   itself), not the SpatialData adapters, which would reattach lazily.
+  Revised on 2026-11-08: P5 writes through the adapter
+  `add_table_components(...)`, because under D1 a written `obsm` key should
+  be reattached lazily anyway (see "Migration Plan", step 4).
