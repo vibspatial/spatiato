@@ -1605,7 +1605,7 @@ def test_widget_refreshes_feature_matrix_selector_when_first_key_is_written(qtbo
     assert widget.feature_matrix_combo.count() == 1
     assert widget.selected_feature_key == "features_new"
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
-    assert mark_dirty_reasons == []
+    assert mark_dirty_reasons == ["the feature matrix changed"]
 
 
 def test_widget_invalidates_classifier_when_selected_feature_matrix_is_overwritten(
@@ -2091,7 +2091,43 @@ def test_widget_auto_selects_new_feature_matrix_table_when_no_table_was_availabl
     assert widget.selected_table_name == "new_table"
     assert widget.selected_feature_key == "features_new"
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
-    assert mark_dirty_reasons == []
+    assert mark_dirty_reasons == ["the annotation table changed"]
+
+
+def test_widget_does_not_report_a_model_for_a_table_created_by_feature_extraction(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    """A table that Feature Extraction creates has no model yet, so the classifier is stale, not up to date."""
+    layer = make_blobs_labels_layer(sdata_blobs)
+    viewer = DummyViewer(layers=[layer])
+    app_state = get_or_create_app_state(viewer)
+    widget = ObjectClassificationWidget(viewer)
+    qtbot.addWidget(widget)
+    widget.segmentation_combo.setCurrentIndex(1)
+
+    assert widget.selected_segmentation_name == "blobs_multiscale_labels"
+    assert widget.selected_table_name is None
+
+    _add_feature_table_for_labels(
+        sdata_blobs,
+        table_name="new_table",
+        labels_name="blobs_multiscale_labels",
+        feature_key="features_new",
+    )
+    app_state.record_table_mutation(
+        _feature_table_event(
+            sdata_blobs,
+            table_name="new_table",
+            feature_key="features_new",
+        )
+    )
+
+    assert widget.selected_table_name == "new_table"
+    assert widget._classifier_controller.is_dirty is True
+    assert widget._classifier_controller.status_message == (
+        "Classifier: model is stale because the annotation table changed"
+    )
 
 
 def test_widget_updates_color_by_mode_when_selection_changes(qtbot, sdata_blobs: SpatialData) -> None:
@@ -3684,3 +3720,48 @@ def test_widget_exports_classifier_with_mocked_save_dialog(
     assert loaded.n_features == int(table.obsm["features_1"].shape[1])
     assert "Classifier Exported" in widget.classifier_feedback.text()
     assert str(export_path) in widget.classifier_feedback.text()
+
+
+@pytest.mark.parametrize("error_type", [ValueError, OSError])
+def test_widget_reports_a_failed_classifier_export(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+    sdata_blobs: SpatialData,
+    error_type: type[Exception],
+) -> None:
+    """Every export failure is shown in the widget, also a failed file write."""
+    table = sdata_blobs["table"]
+    instance_ids = table.obs["instance_id"].to_numpy(dtype=np.int64)
+    table.obs[USER_CLASS_COLUMN] = pd.Categorical(
+        [
+            1 if int(instance_id) in {1, 2} else 2 if int(instance_id) in {24, 25} else pd.NA
+            for instance_id in instance_ids
+        ],
+        categories=[1, 2],
+    )
+    _set_feature_metadata(sdata_blobs)
+
+    layer = make_blobs_labels_layer(sdata_blobs)
+    viewer = DummyViewer(layers=[layer])
+    widget = ObjectClassificationWidget(viewer)
+    qtbot.addWidget(widget)
+    select_segmentation(widget)
+    widget.retrain_button.click()
+    qtbot.waitUntil(lambda: widget.export_classifier_button.isEnabled(), timeout=5000)
+
+    def fail_to_write(path: object, bundle: object) -> None:
+        del path, bundle
+        raise error_type("the disk is full")
+
+    monkeypatch.setattr(classifier_module, "write_classifier_export_bundle", fail_to_write)
+    monkeypatch.setattr(
+        widget_module.QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(tmp_path / "widget-export"), ""),
+    )
+
+    widget.export_classifier_button.click()
+
+    assert "Classifier Export Error" in widget.classifier_feedback.text()
+    assert "the disk is full" in widget.classifier_feedback.text()

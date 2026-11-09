@@ -1691,6 +1691,75 @@ def test_classifier_controller_reset_after_reload_accepts_multi_region_predictio
     )
 
 
+@pytest.mark.parametrize(
+    ("training_scope", "n_features", "expected_mismatch"),
+    [
+        (
+            "selected_segmentation_only",
+            4,
+            'loaded predictions use training scope "all" but "selected_segmentation_only" is selected',
+        ),
+        ("all", 2, 'loaded predictions were made from 2 feature column(s) but feature matrix "features_1" has 4'),
+    ],
+)
+def test_classifier_controller_reset_after_reload_marks_stale_when_the_model_does_not_match(
+    sdata_blobs: SpatialData,
+    training_scope: str,
+    n_features: int,
+    expected_mismatch: str,
+) -> None:
+    table = sdata_blobs["table"]
+    assert table.obsm["features_1"].shape[1] == 4
+    # The stored model was trained on training scope "all".
+    table.uns[CLASSIFIER_CONFIG_KEY] = _trained_config(
+        prediction_scope="selected_segmentation_only",
+        prediction_regions=["blobs_labels"],
+        training_regions=["blobs_labels"],
+        n_features=n_features,
+    )
+
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs, "blobs_labels", "table", "features_1", training_scope=training_scope)
+    controller.reset_after_reload()
+
+    assert controller.is_dirty is True
+    assert controller.status_message == f"Classifier: model is stale because {expected_mismatch}."
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_status"),
+    [
+        (
+            "Need at least two labeled classes before training the classifier.",
+            "Classifier: Need at least two labeled classes before training the classifier.",
+        ),
+        (None, "Classifier: model is stale. Click Train Classifier to refresh predictions."),
+    ],
+)
+def test_classifier_controller_reset_after_reload_keeps_an_entry_without_a_model_stale(
+    sdata_blobs: SpatialData,
+    reason: str | None,
+    expected_status: str,
+) -> None:
+    """A widget entry without `model_provenance` records that nothing was trained, so it is stale, as before the reload."""
+    table = sdata_blobs["table"]
+    config = _trained_config(
+        prediction_scope="selected_segmentation_only",
+        prediction_regions=["blobs_labels"],
+        training_regions=["blobs_labels"],
+        n_features=4,
+    )
+    config[PRED_CLASS_COLUMN] = {**config[PRED_CLASS_COLUMN], "reason": reason, "model_provenance": None}
+    table.uns[CLASSIFIER_CONFIG_KEY] = config
+
+    controller = ClassifierController(debounce_interval_ms=0)
+    controller.bind(sdata_blobs, "blobs_labels", "table", "features_1")
+    controller.reset_after_reload()
+
+    assert controller.is_dirty is True
+    assert controller.status_message == expected_status
+
+
 @pytest.mark.parametrize("config", ["never_trained", "headless_wrote_pred_class"])
 def test_classifier_controller_reset_after_reload_asks_to_train_without_a_widget_entry(
     qtbot, sdata_blobs: SpatialData, config: str

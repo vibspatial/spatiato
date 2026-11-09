@@ -5,9 +5,6 @@ This document describes how Spatiato calculates a feature matrix with
 exists. It covers who decides what, what is rejected, and how memory and store
 relate. It is an internal developer contract, not user documentation.
 
-> The decisions behind this flow, and their reasons, are recorded in P7 of
-> [`Roadmap/bump_harpy/bump_harpy.md`](../../Roadmap/bump_harpy/bump_harpy.md).
-
 ## Terminology
 
 - **Feature matrix entry:** `table.obsm[feature_key]` together with its metadata
@@ -287,5 +284,3 @@ use it, and these parts can go.
 - Controller: `calculate`, `_run_feature_extraction_job`, `_on_worker_returned`
   and `_on_worker_errored` in
   [`src/spatiato/widgets/feature_extraction/controller.py`](../../src/spatiato/widgets/feature_extraction/controller.py).
-- Decisions and their reasons: P7 in
-  [`Roadmap/bump_harpy/bump_harpy.md`](../../Roadmap/bump_harpy/bump_harpy.md).

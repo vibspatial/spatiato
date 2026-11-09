@@ -577,11 +577,11 @@ class ObjectClassificationWidget(QWidget):
         next_table_binding_error = self._validate_selected_table_binding()
         next_effective_table_name = None if next_table_binding_error is not None else self.selected_table_name
 
-        if (
-            next_effective_table_name != previous_effective_table_name
-            or self.selected_feature_key != previous_feature_key
-        ):
-            self._bind_current_selection()
+        if next_effective_table_name != previous_effective_table_name:
+            self._bind_current_selection(classifier_dirty_reason="the annotation table changed")
+            return
+        if self.selected_feature_key != previous_feature_key:
+            self._bind_current_selection(classifier_dirty_reason="the feature matrix changed")
             return
 
         if (
@@ -1626,7 +1626,7 @@ class ObjectClassificationWidget(QWidget):
         path = self._normalize_classifier_export_path(Path(selected_path))
         try:
             bundle = self._classifier_controller.export_classifier(path)
-        except ValueError as error:
+        except Exception as error:  # noqa: BLE001 - this UI boundary must report every export failure, also a failed file write.
             self._set_classifier_export_feedback(str(error), error=True)
             self._update_classifier_controls()
             return

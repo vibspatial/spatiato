@@ -6,9 +6,11 @@ announced, what Write and Reload do, and how running jobs interact with them.
 It is an internal developer contract, not user documentation.
 
 Not covered here: Shapes elements (their own written and reloaded events),
-coordinate-system changes (their own participant protocol), and how Feature
+coordinate-system changes (their own participant protocol), how Feature
 Extraction decides what to calculate
-([`feature_extraction.md`](feature_extraction.md)).
+([`feature_extraction.md`](feature_extraction.md)), and how Object
+Classification trains, predicts and exports a classifier
+([`classifier.md`](classifier.md)).
 
 ## Terms
 
