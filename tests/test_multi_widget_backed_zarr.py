@@ -29,6 +29,7 @@ from spatiato.core.spatial_query.canonical_centers import (
     compute_canonical_centers,
     read_canonical_centers_region,
 )
+from spatiato.core.table_matrix import read_matrix
 from spatiato.viewer._styling import MISSING_CATEGORICAL_COLOR
 from spatiato.widgets.annotation.models import AnnotationContext, ShapesAnnotationTarget
 from spatiato.widgets.feature_extraction.controller import FeatureExtractionResult
@@ -181,8 +182,11 @@ def _assert_color(layer: Labels, value: int, expected: str) -> None:
 
 
 def _dense_array(value: object) -> np.ndarray:
-    toarray = getattr(value, "toarray", None)
-    return np.asarray(toarray() if callable(toarray) else value)
+    # `read_matrix(...)` loads any table matrix, lazy, backed or in memory, as
+    # NumPy or SciPy; a sparse result is then made dense.
+    matrix = read_matrix(value)
+    toarray = getattr(matrix, "toarray", None)
+    return np.asarray(toarray() if callable(toarray) else matrix)
 
 
 def test_mixed_table_mutations_share_dirty_controls_and_round_trip_declared_components(
