@@ -21,7 +21,7 @@ from spatiato.core.object_classification.annotation import (
     USER_CLASS_COLORS_KEY,
     USER_CLASS_COLUMN,
 )
-from spatiato.core.persistence import TableComponentPath, write_table_components
+from spatiato.core.persistence import TableComponentPath, persist_table_components
 from spatiato.core.spatial_query import CanonicalCenterQueryResult
 from spatiato.core.spatial_query.canonical_centers import (
     CANONICAL_CENTERS_PATHS,
@@ -320,7 +320,7 @@ def test_feature_acknowledgement_preserves_other_and_newer_dirty_components(
     }
     app_state.record_table_mutation(feature_event)
     captured = app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table")
-    write_table_components(
+    persist_table_components(
         backed_sdata_blobs,
         table_name="table",
         paths=feature_paths,
@@ -335,7 +335,7 @@ def test_feature_acknowledgement_preserves_other_and_newer_dirty_components(
     stale_snapshot = app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table")
     table.obsm["features_1"] = np.full_like(np.asarray(table.obsm["features_1"]), 7.0)
     app_state.record_table_mutation(feature_event)
-    write_table_components(
+    persist_table_components(
         backed_sdata_blobs,
         table_name="table",
         paths=feature_paths,
@@ -612,7 +612,7 @@ def test_spatialdata_replacement_ignores_late_query_classifier_and_feature_callb
     app_state.table_state_changed.connect(table_events.append)
 
     old_table.obsm["late_features"] = np.ones((old_table.n_obs, 1), dtype=np.float64)
-    write_table_components(
+    persist_table_components(
         backed_sdata_blobs,
         table_name="table",
         paths=frozenset({TableComponentPath("obsm", ("late_features",))}),

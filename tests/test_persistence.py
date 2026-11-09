@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import anndata as ad
+import dask.array as da
+import harpy.table.io._components as harpy_components_module
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,7 +11,6 @@ from harpy.utils._keys import _FEATURE_MATRICES_KEY
 from spatialdata import SpatialData, read_zarr
 from spatialdata.models import TableModel
 
-import spatiato.core.persistence as persistence_module
 import spatiato.widgets.persistence.controller as persistence_controller_module
 from spatiato._app_state import SpatiatoAppState, TableStateChangedEvent
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND, register_feature_matrix_metadata
@@ -67,48 +68,86 @@ def test_persistence_controller_write_of_a_clean_table_writes_nothing(
     def fail_if_called(*args, **kwargs):
         raise AssertionError("A table without unsaved changes must not be written.")
 
-    monkeypatch.setattr(persistence_controller_module, "write_table_components", fail_if_called)
+    monkeypatch.setattr(persistence_controller_module, "persist_table_components", fail_if_called)
 
     assert controller.write_table_state() == "tables/table"
     assert app_state.is_table_dirty(backed_sdata_blobs, "table") is False
 
 
-def test_failed_write_acknowledges_none_of_its_paths(
+def test_failed_write_changes_nothing_and_acknowledges_none_of_its_paths(
     backed_sdata_blobs: SpatialData,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A Write that fails after harpy published it is rolled back, in the store and in memory."""
     app_state = SpatiatoAppState()
     controller = PersistenceController(app_state)
     controller.bind(backed_sdata_blobs, "table", "blobs_labels")
     table = backed_sdata_blobs["table"]
+    stored_features = np.asarray(read_zarr(backed_sdata_blobs.path)["table"].obsm["features_1"]).copy()
     obsm_path = TableComponentPath("obsm", ("features_1",))
     uns_path = TableComponentPath("uns", ("extension_metadata", "result"))
     table.obsm["features_1"] = np.zeros_like(np.asarray(table.obsm["features_1"]))
     table.uns["extension_metadata"] = {"result": {"version": 1}}
     _record_mutation(app_state, backed_sdata_blobs, obsm_path, uns_path)
-    real_write_elem = persistence_module.ad.io.write_elem
+    attached_features = table.obsm["features_1"]
 
-    def fail_uns_write(group, key, value, *args, **kwargs):
-        if key == "result":
-            raise RuntimeError("injected uns write failure")
-        return real_write_elem(group, key, value, *args, **kwargs)
+    def fail_installation(table, updates):
+        del table, updates
+        raise RuntimeError("injected installation failure")
 
-    # The obsm entry is written first; the uns entry then fails.
-    monkeypatch.setattr(persistence_module.ad.io, "write_elem", fail_uns_write)
-    with pytest.raises(RuntimeError, match="injected uns write failure"):
+    # harpy has published both paths when it installs them in memory; this fails.
+    monkeypatch.setattr(harpy_components_module, "_install_memory_updates", fail_installation)
+    with pytest.raises(RuntimeError, match="injected installation failure"):
         controller.write_table_state()
 
-    # Neither path is acknowledged, also the obsm entry that was written.
+    # The store and the attached table are as before the Write, and nothing is acknowledged.
+    reread = read_zarr(backed_sdata_blobs.path)["table"]
+    np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), stored_features)
+    assert "extension_metadata" not in reread.uns
+    assert table.obsm["features_1"] is attached_features
     assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == {obsm_path, uns_path}
 
     # So Write can be retried.
-    monkeypatch.setattr(persistence_module.ad.io, "write_elem", real_write_elem)
+    monkeypatch.undo()
     controller.write_table_state()
 
     reread = read_zarr(backed_sdata_blobs.path)["table"]
     assert controller.has_unsynced_table_changes is False
     np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), 0)
     assert reread.uns["extension_metadata"]["result"]["version"] == 1
+
+
+def test_write_replaces_and_deletes_in_one_call_and_attaches_written_obsm_lazily(
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """A Write follows memory: present paths are written, absent ones deleted, and written `obsm` reopened lazily."""
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
+    table = backed_sdata_blobs["table"]
+    written_features = np.full_like(np.asarray(table.obsm["features_1"], dtype=np.float64), 0.5)
+    table.obsm["features_1"] = written_features
+    del table.obsm["features_2"]
+    table.uns["extension_metadata"] = {"result": {"version": 2}}
+    _record_mutation(
+        app_state,
+        backed_sdata_blobs,
+        TableComponentPath("obsm", ("features_1",)),
+        TableComponentPath("obsm", ("features_2",)),
+        TableComponentPath("uns", ("extension_metadata", "result")),
+    )
+
+    controller.write_table_state()
+
+    reread = read_zarr(backed_sdata_blobs.path)["table"]
+    assert sorted(reread.obsm.keys()) == ["features_1"]
+    np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), written_features)
+    assert reread.uns["extension_metadata"]["result"]["version"] == 2
+    # The written entry is now a lazy view of the store, with the written values.
+    assert isinstance(table.obsm["features_1"], da.Array)
+    np.testing.assert_array_equal(table.obsm["features_1"].compute(), written_features)
+    assert "features_2" not in table.obsm
+    assert controller.has_unsynced_table_changes is False
 
 
 def test_persistence_controller_tracks_dirty_state_per_selected_table(

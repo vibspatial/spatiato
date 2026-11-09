@@ -196,6 +196,24 @@ def test_write_of_a_busy_table_is_refused_with_the_reason(qtbot, backed_sdata_bl
     assert app_state.is_table_dirty(backed_sdata_blobs, "table") is True
 
 
+def test_write_reports_a_failure_of_any_kind(qtbot, monkeypatch, backed_sdata_blobs: SpatialData) -> None:
+    """harpy can raise more than `ValueError`, for example `OSError`; Write reports it as feedback."""
+    app_state = SpatiatoAppState()
+    controls = TablePersistenceControls(app_state)
+    qtbot.addWidget(controls)
+    controls.bind(backed_sdata_blobs, "table", "blobs_labels")
+    _dirty_user_class(app_state, backed_sdata_blobs)
+
+    def fail_write() -> str:
+        raise OSError("injected disk failure")
+
+    monkeypatch.setattr(controls._controller, "write_table_state", fail_write)
+
+    assert controls.write_table_state() is False
+    assert "injected disk failure" in controls.feedback_label.text()
+    assert app_state.is_table_dirty(backed_sdata_blobs, "table") is True
+
+
 def test_reload_is_refused_when_the_table_becomes_busy_while_its_dialog_is_open(
     qtbot,
     monkeypatch,
