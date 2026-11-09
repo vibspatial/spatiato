@@ -139,6 +139,10 @@ class SpatialQueryController:
     never continues with a query. One centers job runs at a time, attached or detached
     (`has_job_in_flight`).
 
+    This job contract mirrors Feature Extraction's controller: one job at a
+    time, the busy mark, and publishing the change of a detached job. Sharing
+    it in one helper: https://github.com/vibspatial/spatiato/issues/135
+
     `is_running` means a Run the widget is attached to. Both phases of a Run
     share one operation ID, and every late signal must match the attached
     operation ID and phase before it can affect that Run.

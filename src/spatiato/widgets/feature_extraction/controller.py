@@ -296,6 +296,9 @@ class FeatureExtractionController:
         # opening a new one gives a second controller. That controller does not
         # start a job on the busy table, but may start one on another table of
         # the same store. Accepted: rare.
+        # Spatial Query's controller mirrors this job contract for its centers
+        # job. Sharing it in one helper:
+        # https://github.com/vibspatial/spatiato/issues/135
         self._job: FeatureExtractionJob | None = None
         self._worker: Any | None = None
         self._busy_mark: TableBusyMark | None = None

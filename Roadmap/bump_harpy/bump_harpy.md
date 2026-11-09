@@ -1,8 +1,9 @@
 # Bump Harpy to 0.5.3: Lazy Matrices and Table Component I/O
 
-Status: investigation done. Problems are listed below and will be tackled one by
-one, in the order of "Migration Plan"; each section's direction is a proposal to
-settle when we pick it up. Target moved from harpy 0.5.0 to 0.5.2 on
+Status: implemented on 2026-11-09: steps 1-5 of "Migration Plan" and every
+problem below (P0-P11) are implemented, covered or kept, as each one's status
+says. What stays open is listed under "Open Questions". Target moved from
+harpy 0.5.0 to 0.5.2 on
 2026-10-25, and to 0.5.3 on 2026-11-05 (canonical-center refactor and
 reserved `.obsm` keys, see "Harpy 0.5.3: What Changed").
 
@@ -1228,6 +1229,13 @@ P6 (cosmetic) can be picked up along the way.
 
 ### P0. Run the suite on harpy 0.5.2
 
+Status: done on 2026-10-25. The recheck of the anndata 0.12.16 observations
+was superseded by step 3 (2026-11-09): `normalize_feature_matrix(...)` was
+deleted, `_get_finite_feature_row_mask(...)` now checks only rows already read
+into memory by `read_matrix_rows(...)`, and `X`-var coloring goes through
+`read_matrix_column(...)`. The shared helpers in `core/table_matrix.py` are
+tested on anndata 0.13.4 for every matrix type in those observations.
+
 - Maintainer installs harpy into `.venv` (the environment is managed manually,
   per `CLAUDE.md`): 0.5.0 first, then 0.5.2 with anndata 0.13.4 and
   spatialdata 0.8.0 on 2026-10-25.
@@ -1237,7 +1245,7 @@ P6 (cosmetic) can be picked up along the way.
   tests to observe a lazy `obsm[feature_key]`. Done on 0.5.0 and on 0.5.2
   (below).
 - Recheck the anndata 0.12.16 observations under "Matrix consumption" and in
-  P2 on anndata 0.13.4. Still to do; the suite does not cover them.
+  P2 on anndata 0.13.4. Superseded by step 3 (see the status above).
 - Verify the unbacked `add_feature_matrix` result type at runtime (the adapter
   docstring describes a lazy merge). Done (below).
 
@@ -1338,6 +1346,12 @@ Remaining P0 items, checked on 2026-10-23:
 
 ### P1. Dense Dask feature matrices are fully materialized on every use
 
+Status: resolved. Upstream, harpy 0.5.2 (#275) computes an unbacked regional
+merge when both matrices are in memory; Spatiato raises before an unbacked
+regional update of a matrix that is not in memory (3c.3, 2026-11-06); and
+Object Classification no longer reads the matrix on refresh: a job reads only
+its rows, in the worker (3d.1 and 3d.2, 2026-11-06 and 2026-11-07).
+
 After P0, feature extraction on backed SpatialData leaves `obsm[feature_key]` as
 a Dask array (0.5.0 and 0.5.2). It works, but `normalize_feature_matrix(...)` reads the whole matrix from the store
 on every call, including on every Object Classification refresh. On large tables
@@ -1427,6 +1441,13 @@ Direction (settled with D1 on 2026-10-30, see "Migration Plan", step 3):
   `_prepare_classifier_job(...)` on the main thread.
 
 ### P2. Lazy sparse matrices break
+
+Status: fixed. `X`-var coloring on 2026-10-30, by 3a (the shared helpers) and
+3b. In Object Classification, 3d.1 and 3d.2 (2026-11-06 and 2026-11-07)
+deleted `normalize_feature_matrix(...)` and read rows through
+`read_matrix_rows(...)`; `_get_finite_feature_row_mask(...)` stays, but checks
+only those rows, already in memory as NumPy or SciPy, inside
+`_read_rows_with_finite_features(...)`.
 
 Dask arrays of CSR blocks (e.g. `X` from `hp.io.read_zarr`, or sparse `obsm`)
 fail in `normalize_feature_matrix(...)`, `_get_finite_feature_row_mask(...)`,
@@ -1533,7 +1554,8 @@ Direction: read with `hp.tb.io.read_table_components(...)`, lazily (D1; see
 
 ### P5. Replace Spatiato's on-disk writes with harpy's component API
 
-Status: decided on 2026-11-08, as step 4a (see "Migration Plan", step 4).
+Status: decided on 2026-11-08, as step 4a (see "Migration Plan", step 4), and
+implemented the same day.
 
 Spatiato writes in place without staging or rollback. Once `obsm` entries are
 lazy views of the store, an in-place `write_elem` over such a key could write to
