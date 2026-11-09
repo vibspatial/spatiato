@@ -1211,6 +1211,17 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    later optimization. After the switch, a freshly opened store and a
    reloaded table no longer differ in representation.
 
+   Implemented on 2026-11-09, as agreed: `_reader.py` and
+   `widgets/viewer/widget.py` import `from harpy.io import read_zarr`, with a
+   comment at each call; Open catches `Exception`; the three backed fixtures
+   in `tests/conftest.py` open stores with harpy's reader, and
+   `_dense_array(...)` computes a lazy matrix first; the README examples open
+   stores with `hp.io.read_zarr(...)` and say that `spatialdata.read_zarr`
+   also works and loads table matrices into memory. Tests: new, the napari
+   reader and the Viewer's Open on a real store give Dask `X` and `obsm`; the
+   Open error test also covers a `RuntimeError`. The 14 modules that use the
+   backed fixtures pass (705 tests), as do the reader and Viewer tests.
+
 P6 (cosmetic) can be picked up along the way.
 
 ## Problems
