@@ -234,8 +234,10 @@ Publishing an event never makes a path clean by itself.
    When the table is dirty, the controls ask Write / Discard / Cancel. Write
    writes before reloading, Discard reloads over the unsaved changes, and
    Cancel stops.
-2. The persistence controller captures a `TableReloadRequest`: the table, and
-   every component path in memory or in the store, plus the dirty paths.
+2. The persistence controller captures a `TableReloadRequest`: the table, its
+   `obs` columns, every `obsm` and `uns` key in memory or in the store, and
+   the dirty paths. Any `obs` path reloads the whole `obs`, so the columns in
+   memory suffice.
 3. `app_state.prepare_for_table_reload(request)` runs two passes:
    1. if the table became busy meanwhile, for example because a job started
       while the dialog was open, it raises `TableBusyError` with every reason
@@ -245,9 +247,12 @@ Publishing an event never makes a path clean by itself.
       is clean;
    2. otherwise every participant's `prepare_for_table_reload(request)`
       invalidates its work that depends on the old table.
-4. The components are read from the store and replaced in memory. A failure
-   while reading changes nothing; a failure while validating the replaced
-   components restores the previous ones.
+4. `reload_table_components(...)` reads the components through harpy's
+   `hp.tb.io.read_table_components(...)`, `obs` and `uns` into memory and
+   `obsm` entries as lazy views of the store, and replaces them in memory.
+   Memory follows the store: an entry absent from the store is removed from
+   memory. A failure while reading changes nothing; a failure while
+   validating the replaced components restores the previous ones.
 5. `record_table_reload(event)` makes every reloaded path clean and publishes
    the event with change kind `reloaded`. Each workflow adopts it: it refreshes
    its choices from the reloaded table, binds them again, and invalidates its

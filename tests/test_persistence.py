@@ -395,7 +395,7 @@ def test_persistence_controller_reloads_registered_custom_feature_matrix_metadat
     metadata = table.uns[_FEATURE_MATRICES_KEY][feature_key]
 
     assert result.table_path == "tables/table"
-    assert np.array_equal(table.obsm[feature_key], disk_features)
+    np.testing.assert_array_equal(np.asarray(table.obsm[feature_key]), disk_features)
     assert metadata["source_kind"] == CUSTOM_OBSM_SOURCE_KIND
     assert list(metadata["feature_columns"]) == feature_columns
     assert len(emitted_events) == 1
@@ -598,7 +598,127 @@ def test_persistence_controller_reloads_obsm_key_written_directly_to_disk_group(
 
     assert table_path == "tables/table"
     assert sorted(table.obsm.keys()) == ["features_1", "features_2", "features_3"]
-    assert np.array_equal(table.obsm["features_3"], features_3)
+    # Reload reads every `obsm` entry lazily, as views of the store.
+    for key in table.obsm:
+        assert isinstance(table.obsm[key], da.Array)
+    np.testing.assert_array_equal(table.obsm["features_3"].compute(), features_3)
+
+
+def test_full_reload_removes_what_exists_only_in_memory(backed_sdata_blobs: SpatialData) -> None:
+    """A full reload makes memory follow the store: entries absent from the store leave memory.
+
+    That covers an `obsm` key deleted from the store; an `obsm` key, `obs`
+    column and `uns` key added in memory and recorded as dirty, whose dirty
+    state the reload clears; and an `uns` key added outside Spatiato's
+    tracking, as in the napari console.
+    """
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table")
+    table = backed_sdata_blobs["table"]
+    obsm = dict(table.obsm)
+    del obsm["features_2"]
+    _write_disk_snapshot_state(backed_sdata_blobs, obs=table.obs.copy(), obsm=obsm, uns=dict(table.uns))
+    table.obsm["memory_features"] = np.zeros((table.n_obs, 2))
+    table.obs["memory_column"] = 1.0
+    table.uns["memory_flag"] = {"source": "memory"}
+    _record_mutation(
+        app_state,
+        backed_sdata_blobs,
+        TableComponentPath("obsm", ("memory_features",)),
+        TableComponentPath("obs", ("memory_column",)),
+        TableComponentPath("uns", ("memory_flag",)),
+    )
+    table.uns["untracked_flag"] = {"source": "console"}
+
+    controller.reload_table_state()
+
+    assert sorted(table.obsm.keys()) == ["features_1"]
+    assert "memory_column" not in table.obs
+    assert sorted(table.uns.keys()) == [TableModel.ATTRS_KEY]
+    assert controller.has_unsynced_table_changes is False
+
+
+def test_reload_takes_a_path_under_spatialdata_attrs_from_the_attrs_it_reads(
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """A requested path under `spatialdata_attrs` comes from the attrs read for the binding check.
+
+    harpy refuses overlapping paths in one request, so the reload reads
+    `spatialdata_attrs` once and takes the nested `region` path from it.
+    """
+    controller = PersistenceController()
+    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
+    table = backed_sdata_blobs["table"]
+    uns = dict(table.uns)
+    uns[TableModel.ATTRS_KEY] = {
+        **uns[TableModel.ATTRS_KEY],
+        TableModel.REGION_KEY: np.array(["blobs_labels"]),
+    }
+    _write_disk_snapshot_state(backed_sdata_blobs, obs=table.obs.copy(), obsm=dict(table.obsm), uns=uns)
+    region_path = TableComponentPath("uns", (TableModel.ATTRS_KEY, TableModel.REGION_KEY))
+    # Test setup: memory holds the region as a string, the store as an array.
+    assert table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] == "blobs_labels"
+
+    result = controller.reload_table_components(frozenset({region_path}))
+
+    assert result.reloaded_paths == frozenset({region_path})
+    # The stored array is normalized back to a list of region names.
+    assert table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] == ["blobs_labels"]
+
+
+def test_reload_of_a_nested_uns_path_without_a_parent_adds_no_parent(
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """A nested `uns` path whose parent exists neither in memory nor in the store leaves `uns` as it is.
+
+    The path is absent from the store, so there is nothing to install and
+    nothing to remove; the reload must not create its parent as an empty
+    mapping.
+    """
+    controller = PersistenceController()
+    controller.bind(backed_sdata_blobs, "table")
+    table = backed_sdata_blobs["table"]
+    nested_path = TableComponentPath("uns", ("parent", "child"))
+    uns_keys_before = sorted(table.uns.keys())
+
+    result = controller.reload_table_components(frozenset({nested_path}))
+
+    assert result.reloaded_paths == frozenset({nested_path})
+    assert sorted(table.uns.keys()) == uns_keys_before
+
+
+def test_failed_reload_restores_the_previous_table_components(
+    monkeypatch: pytest.MonkeyPatch,
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """When validation fails after the install, the previous `obs`, `obsm` and `uns` come back.
+
+    Nothing from the store stays in memory, and the dirty state is unchanged.
+    """
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table")
+    table = backed_sdata_blobs["table"]
+    _write_disk_snapshot_payload(backed_sdata_blobs)
+    _record_mutation(app_state, backed_sdata_blobs, TableComponentPath("obs", (USER_CLASS_COLUMN,)))
+    obs_before = table.obs.copy()
+    features_before = table.obsm["features_1"]
+    uns_keys_before = sorted(table.uns.keys())
+
+    def fail_validation(_table: object) -> None:
+        raise ValueError("validation failed after the install")
+
+    monkeypatch.setattr(TableModel, "validate", fail_validation)
+
+    with pytest.raises(ValueError, match="validation failed after the install"):
+        controller.reload_table_state()
+
+    pd.testing.assert_frame_equal(table.obs, obs_before)
+    assert "disk_features" not in table.obsm
+    assert table.obsm["features_1"] is features_before
+    assert sorted(table.uns.keys()) == uns_keys_before
+    assert controller.has_unsynced_table_changes is True
 
 
 def test_persistence_controller_normalizes_numpy_array_region_attrs_when_reloading(

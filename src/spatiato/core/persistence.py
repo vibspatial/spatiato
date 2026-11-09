@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
-import anndata as ad
 import harpy as hp
 import pandas as pd
-import zarr
 from spatialdata.models import TableModel
 
 from spatiato.core.spatialdata import get_table, get_table_metadata, normalize_table_metadata
@@ -139,16 +137,40 @@ def build_full_table_reload_paths(
     table_name: str,
     extra_paths: frozenset[TableComponentPath] = frozenset(),
 ) -> frozenset[TableComponentPath]:
-    """Expand a full supported table reload into explicit logical paths."""
-    table, _table_path, table_group = _resolve_backed_table_group(sdata, table_name, mode="r")
-    disk_obs = ad.io.read_elem(table_group["obs"])
-    if not isinstance(disk_obs, pd.DataFrame):
-        raise ValueError(f"Reloaded obs for table `{table_name}` must be a DataFrame.")
+    """List every path that a full reload of a backed table covers.
+
+    `reload_table_components(...)` installs only the paths it is given, so
+    the `obsm` and top-level `uns` keys are listed from memory and from the
+    store: a key only in the store is added to memory, and a key only in
+    memory is removed from it. harpy cannot list keys without reading, so
+    `obsm` is read lazily, which reads only metadata, and `uns` into memory.
+
+    `obs` is not read: any `obs` path reloads the whole `obs`, and the reload
+    reports the columns of memory and store together, so the columns in
+    memory suffice.
+
+    `extra_paths` are the table's dirty paths. They matter only for a dirty
+    path whose key exists neither in memory nor in the store, which
+    Spatiato's own flows do not produce; listing it lets the reload still
+    make it clean.
+    """
+    table, _table_path = _require_backed_table(sdata, table_name)
+    disk = hp.tb.io.read_table_components(
+        sdata.path,
+        table_name=table_name,
+        components=[("obsm",), ("uns",)],
+        mode="lazy",
+        missing="omit",
+    )
+    disk_obsm = disk.get(("obsm",))
+    disk_uns = disk.get(("uns",))
+    disk_obsm_keys = disk_obsm.keys() if isinstance(disk_obsm, Mapping) else ()
+    disk_uns_keys = disk_uns.keys() if isinstance(disk_uns, Mapping) else ()
 
     paths = set(extra_paths)
-    paths.update(TableComponentPath("obs", (str(column),)) for column in {*table.obs.columns, *disk_obs.columns})
-    paths.update(TableComponentPath("obsm", (str(key),)) for key in {*table.obsm.keys(), *table_group["obsm"].keys()})
-    paths.update(TableComponentPath("uns", (str(key),)) for key in {*table.uns.keys(), *table_group["uns"].keys()})
+    paths.update(TableComponentPath("obs", (str(column),)) for column in table.obs.columns)
+    paths.update(TableComponentPath("obsm", (str(key),)) for key in {*table.obsm.keys(), *disk_obsm_keys})
+    paths.update(TableComponentPath("uns", (str(key),)) for key in {*table.uns.keys(), *disk_uns_keys})
     if not paths:
         raise ValueError(f"Table `{table_name}` has no supported components to reload.")
     return _remove_redundant_uns_descendants(frozenset(paths))
@@ -161,21 +183,55 @@ def reload_table_components(
     paths: frozenset[TableComponentPath],
     region_name: str | None = None,
 ) -> TableComponentReloadResult:
-    """Reload selected table components in place from a backed zarr store.
+    """Reload the given `obs`, `obsm` and `uns` paths of a backed table from its zarr store.
 
-    Named ``obsm`` keys and ``uns`` paths are reloaded individually, preserving
-    unrelated entries. Requesting any ``obs`` path reloads the complete ``obs``
-    dataframe so its columns and shared row index are restored consistently.
+    The paths are read through harpy's `read_table_components(...)` and
+    installed in the attached table, which stays the same AnnData object.
+    Memory follows the store:
+
+    - `obs`: any `obs` path reloads the whole `obs` dataframe, so its columns
+      and row index stay consistent.
+    - `obsm` and `uns`: each path is reloaded on its own, and other entries
+      are left as they are. A path in the store replaces the value in memory;
+      a path absent from the store is removed from memory.
+
+    `obs` and `uns` are read into memory, and `obsm` entries as lazy views of
+    the store. Nothing is installed unless the stored `obs` has the same
+    rows, with the same region and instance values, as memory, and, when
+    `region_name` is given, the stored table still annotates it. If
+    installing or validating the table fails, the previous `obs`, `obsm` and
+    `uns` are restored.
+
+    harpy installs read components in an attached table only after its own
+    writes, and checks the stored rows against memory only before them.
+    Replace the install, its rollback, `_replace_mapping_path(...)` and
+    `_validate_reload_binding(...)` with harpy's public function once
+    https://github.com/saeyslab/harpy/issues/285 is released, with its check
+    of the stored rows made fast (https://github.com/saeyslab/harpy/issues/284);
+    the reported paths stay.
     """
-    table, table_path, table_group = _resolve_backed_table_group(sdata, table_name, mode="r")
+    table, table_path = _require_backed_table(sdata, table_name)
     normalized_paths = _remove_redundant_uns_descendants(frozenset(paths))
     if not normalized_paths:
         raise ValueError("At least one table component path is required for reload.")
 
-    disk_obs = ad.io.read_elem(table_group["obs"])
-    disk_attrs_exists, disk_attrs = _read_disk_path(table_group["uns"], (TableModel.ATTRS_KEY,))
-    if not disk_attrs_exists:
-        disk_attrs = _MISSING
+    # `obs` and `spatialdata_attrs` are always read, for the binding check.
+    # harpy refuses overlapping paths in one request, so a requested path
+    # under `spatialdata_attrs` is taken from that value below.
+    attrs_path = ("uns", TableModel.ATTRS_KEY)
+    components: list[tuple[str, ...]] = [("obs",), attrs_path]
+    for path in sorted(normalized_paths):
+        if path.component == "obsm" or (path.component == "uns" and path.keys[0] != TableModel.ATTRS_KEY):
+            components.append((path.component, *path.keys))
+    disk = hp.tb.io.read_table_components(
+        sdata.path,
+        table_name=table_name,
+        components=components,
+        mode="lazy",
+        missing="omit",
+    )
+    disk_obs = disk.get(("obs",), _MISSING)
+    disk_attrs = disk.get(attrs_path, _MISSING)
     _validate_reload_binding(
         table,
         table_name=table_name,
@@ -188,19 +244,21 @@ def reload_table_components(
     obsm_values: dict[str, object] = {}
     for path in sorted(path for path in normalized_paths if path.component == "obsm"):
         key = path.keys[0]
-        exists, value = _read_disk_path(table_group["obsm"], (key,))
-        if exists:
+        value = disk.get(("obsm", key), _MISSING)
+        if value is not _MISSING:
             shape = getattr(value, "shape", None)
             if shape is None or len(shape) == 0 or int(shape[0]) != table.n_obs:
                 raise ValueError(f"Reloaded obsm entry `{key}` for table `{table_name}` must have {table.n_obs} rows.")
-            obsm_values[key] = value
-        else:
-            obsm_values[key] = _MISSING
+        obsm_values[key] = value
 
     uns_values: dict[tuple[str, ...], object] = {}
     for path in sorted(path for path in normalized_paths if path.component == "uns"):
-        exists, value = _read_disk_path(table_group["uns"], path.keys)
-        uns_values[path.keys] = value if exists else _MISSING
+        if path.keys[0] == TableModel.ATTRS_KEY:
+            # `_validate_reload_binding(...)` has checked that it is a mapping.
+            _exists, value = _read_mapping_path({TableModel.ATTRS_KEY: disk_attrs}, path.keys)
+        else:
+            value = disk.get(("uns", *path.keys), _MISSING)
+        uns_values[path.keys] = value
 
     previous_obs = table.obs
     previous_obsm = dict(table.obsm)
@@ -276,17 +334,6 @@ def _require_backed_table(sdata: SpatialData, table_name: str) -> tuple[AnnData,
     return table, table_path
 
 
-def _resolve_backed_table_group(
-    sdata: SpatialData,
-    table_name: str,
-    *,
-    mode: Literal["r", "r+"],
-) -> tuple[AnnData, str, Any]:
-    table, table_path = _require_backed_table(sdata, table_name)
-    root = zarr.open_group(sdata.path, mode=mode, use_consolidated=False)
-    return table, table_path, root[table_path]
-
-
 def _read_mapping_path(mapping: Mapping[str, object], keys: tuple[str, ...]) -> tuple[bool, object]:
     current: object = mapping
     for index, key in enumerate(keys):
@@ -297,15 +344,6 @@ def _read_mapping_path(mapping: Mapping[str, object], keys: tuple[str, ...]) -> 
             return False, _MISSING
         current = current[key]
     return True, current
-
-
-def _read_disk_path(group: Any, keys: tuple[str, ...]) -> tuple[bool, object]:
-    current = group
-    for key in keys:
-        if not hasattr(current, "keys") or key not in current:
-            return False, _MISSING
-        current = current[key]
-    return True, ad.io.read_elem(current)
 
 
 def _replace_mapping_path(
@@ -324,6 +362,13 @@ def _replace_mapping_path(
 
     child = result.get(key)
     if child is None:
+        if value is _MISSING:
+            # Nothing to remove under a parent that does not exist. A full
+            # reload lists every top-level key and drops the nested paths below
+            # them, so only a nested path whose parent exists neither in memory
+            # nor in the store gets here, such as a dirty path left by an edit
+            # outside Spatiato.
+            return result
         child_mapping: dict[str, object] = {}
     elif isinstance(child, Mapping):
         child_mapping = dict(child)
