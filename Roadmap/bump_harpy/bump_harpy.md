@@ -1168,6 +1168,49 @@ Spatiato's own table I/O code, is the core of this bump. Order:
    representation: the napari reader (`_reader.py`) and the Viewer's "Open"
    action (`widgets/viewer/widget.py`).
 
+   Readiness check for step 5 (2026-11-09, against harpy 0.5.3): ready.
+   `hp.io.read_zarr(...)` reads images, labels, points and shapes through
+   `spatialdata.read_zarr(...)` and only the tables through
+   `hp.tb.io.read_table(..., mode="lazy")`. On the `blobs` and
+   `blobs_multi_region` stores both readers give the same elements, backing
+   path, `obs` dtypes, `spatialdata_attrs["region"]` (a string, or a list for
+   several regions) and Spatiato table metadata; only `X` (also sparse) and
+   `obsm` become Dask arrays. `X` is read only to color by a var, through
+   the step-3 helper; tables are written only through harpy; nothing changes
+   a table matrix in place. harpy's reader raises `FileNotFoundError` or
+   `ValueError`, which the Viewer's Open already reports. Agreed the same
+   day:
+
+   1. **Import.** Both modules import `from harpy.io import read_zarr` and
+      keep the call as it is (harpy's default `table_mode="lazy"`), with a
+      short comment. The tests that patch `read_zarr` by name in
+      `test_reader.py` and `test_viewer_widget.py` stay unchanged; passing
+      `table_mode` would break their one-argument fakes.
+   2. **Backed test fixtures.** `backed_sdata_blobs`,
+      `backed_sdata_blobs_multi_region` and
+      `backed_sdata_blobs_points_repartitioned` in `tests/conftest.py` open
+      their stores with `hp.io.read_zarr(...)`, so backed tests see what the
+      app opens; the in-memory fixtures stay, and keep NumPy and SciPy covered
+      for `Interactive` and headless use. A trial run with harpy's reader
+      patched into these fixtures (14 modules, 705 tests): 704 passed; the
+      helper `_dense_array(...)` in `test_multi_widget_backed_zarr.py` turned
+      a lazy sparse `X` into an object array and computes it first.
+   3. **New tests.** The napari reader and the Viewer's Open, on a real store,
+      give a table whose `X` and `obsm` are Dask arrays.
+   4. **Open reports every error.** The Viewer's Open catches `Exception`, as
+      Write and Reload do, instead of `OSError` and `ValueError`: anndata's
+      `IORegistryError`, for example for an `uns` entry it cannot decode, is a
+      plain `Exception` and escaped the handler.
+   5. **README.** The `Interactive` and headless examples open their store
+      with `hp.io.read_zarr(...)`, as the plugin does. `spatialdata.read_zarr`
+      still works there: both take the caller's SpatialData as it is.
+
+   Already accepted (D1): a store with an `obsm` encoding harpy cannot read
+   lazily fails to open, with harpy's error; lazy matrices depend on the
+   store; classifier jobs read their rows from the store; chunking is a
+   later optimization. After the switch, a freshly opened store and a
+   reloaded table no longer differ in representation.
+
 P6 (cosmetic) can be picked up along the way.
 
 ## Problems
@@ -2355,6 +2398,11 @@ Settled on 2026-11-09:
   the reload, was considered and not taken: it would change
   `TableReloadRequest` from exact paths to "full reload plus dirty paths". A
   test for the in-memory rollback of a reload is added, since none existed.
+- Step 5 readiness check (see "Migration Plan", step 5, points 1-5): both
+  modules import harpy's `read_zarr` under the same name; the backed test
+  fixtures open stores with `hp.io.read_zarr(...)`; the napari reader and
+  the Viewer's Open get tests on a real store; Open reports every error; the
+  README examples open stores with `hp.io.read_zarr(...)`.
 
 Settled on 2026-11-08:
 
