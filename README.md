@@ -31,7 +31,7 @@ and launch the Spatiato napari interface with `Interactive`.
 import tempfile
 from pathlib import Path
 
-from spatialdata import read_zarr
+import harpy as hp
 
 from spatiato import Interactive
 from spatiato.datasets import blobs_multi_region
@@ -41,12 +41,14 @@ zarr_path = Path(tempfile.mkdtemp()) / "blobs_multi_region.zarr"
 sdata = blobs_multi_region()
 sdata.write(zarr_path)
 
-sdata = read_zarr(zarr_path)
+sdata = hp.io.read_zarr(zarr_path)
 Interactive(sdata)
 ```
 
 This opens napari with the Spatiato widgets docked and the
 `blobs_multi_region` dataset available in the shared viewer state.
+`hp.io.read_zarr` opens table matrices lazily, as Spatiato's own reader does;
+`spatialdata.read_zarr` also works, and loads them into memory.
 Shapes triangulation uses the fast Bermuda backend by default. To use Numba
 instead, launch with `Interactive(sdata, triangulation_backend="numba")`.
 
@@ -102,11 +104,11 @@ the selected samples. When features need image intensities, the channel
 selection is read from the exported classifier's `source_channels` metadata.
 
 ```python
-from spatialdata import read_zarr
+import harpy as hp
 
 from spatiato import headless
 
-sdata = read_zarr("experiment.zarr")
+sdata = hp.io.read_zarr("experiment.zarr")
 
 result = headless.apply_classifier_with_feature_extraction_from_path(
     sdata,
@@ -117,6 +119,15 @@ result = headless.apply_classifier_with_feature_extraction_from_path(
     image_name=["sample_1_image", "sample_2_image"],
 )
 ```
+
+Predictions go to `pred_class` and `pred_class_confidence`. If you pass
+another `pred_class_column`, the confidences go to
+`<class column>_confidence`. How the predictions were made is recorded in
+`table.uns["classifier_config"][<class column>]`. If the Object
+Classification widget shows the same data, click Reload in the widget after
+the headless run to show the new predictions. If the run wrote `pred_class`,
+the widget shows those predictions, but has no model of its own for them:
+its status asks you to train, and Export is unavailable until you do.
 
 ## Local development
 

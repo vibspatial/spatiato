@@ -283,8 +283,14 @@ slice that takes about 75 ms with contour 1 and 100 ms with contour 2, against
 under 2 ms for the recoding. `install_fast_labels_contours` replaces
 `_calculate_contour` on each layer with a parallel numba kernel that gives the
 same output, including the border napari adds around partial slices: about
-5 ms and 24 ms. Contours off, 3D slices and input the kernel does not take
-still go through napari's method.
+1 ms and 6 ms. Two shortcuts keep it fast without changing the output:
+background pixels stay background without a neighbourhood check, and indices
+are mirrored only for pixels within `contour` of the slice edge.
+`_contours_2d_simple` keeps the straightforward version without them as the
+readable reference: a test checks that it gives the same output, but it takes
+about four times as long. Contours off,
+3D slices and input the kernel does not take still go through napari's
+method.
 
 The contour step belongs to the `Labels` layer, not to the colormap, so it
 applies to every Spatiato labels layer whatever its colormap.
@@ -367,8 +373,9 @@ click.
   contour kernel replaces `Labels._calculate_contour`, and a test fails if
   napari's scipy contours run again on a Spatiato layer.
 - **Contours.** The contour kernel still runs on the main thread, and thick
-  contours cost more: about 24 ms for contour 2 on a 5.2 Mpx slice, against
-  5 ms for contour 1
+  contours cost more: inside objects it checks every pixel within `contour`,
+  so on a 5.2 Mpx slice it takes about 1 ms for contour 1, 6 ms for contour 2
+  and 10 ms for contour 5
   ([#136](https://github.com/vibspatial/spatiato/issues/136)).
 - **napari's layer controls.** The color mode "auto" and the shuffle button in
   napari's Labels controls replace a styled layer's colormap with a random one
@@ -388,8 +395,9 @@ click.
 - Styling: `apply_table_color_source_to_labels_layer` and
   `apply_neutral_labels_style` in
   [`src/spatiato/viewer/labels_styling.py`](../../src/spatiato/viewer/labels_styling.py).
-- Contours: `labels_contours`, `install_fast_labels_contours` and
-  `_calculate_labels_contour` in
+- Contours: `labels_contours`, `install_fast_labels_contours`,
+  `_calculate_labels_contour`, and the kernels `_contours_2d` and
+  `_contours_2d_simple` in
   [`src/spatiato/viewer/labels_contours.py`](../../src/spatiato/viewer/labels_contours.py).
 - Adapter: `ensure_styled_labels_loaded` and `_build_labels_layer` in
   [`src/spatiato/viewer/adapter.py`](../../src/spatiato/viewer/adapter.py).
