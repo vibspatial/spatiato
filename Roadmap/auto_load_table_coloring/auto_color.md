@@ -185,11 +185,13 @@ def set_loaded_labels_bindings(
 
 It follows `set_loaded_image_bindings(...)`: validate the whole snapshot first, keep rows whose binding is unchanged, build rows for new bindings, dispose rows for absent ones, never mutate napari layers. Row intents use `partial(..., expected_binding)` and are checked against the current row before they are forwarded.
 
+The loaded list (count label, "Remove all", scroll area capped at 10 rows, empty state, and the reconcile of styled rows) is built as a widget of its own, so the shapes card reuses it. The two cards already duplicate their color-source control logic; the loaded list should not be duplicated as well.
+
 The card no longer emits `LabelsLoadRequest`. The status-card builders in `src/spatiato/widgets/viewer/status_card.py` (`build_primary_labels_loaded_card_spec(...)`, `build_styled_labels_card_spec(...)`) still take one; either build it in `ViewerWidget` from the intent, or change the builders to take the labels name and spec directly.
 
 ### Shapes card (`src/spatiato/widgets/viewer/shapes_widget.py`)
 
-Same structure as the labels card. The differences are:
+Same structure as the labels card, and it reuses the labels card's loaded-list widget. The differences are:
 
 - sources can also be `ShapeColumnColorSourceSpec`;
 - each styled row has a **Fill** checkbox (see below).
@@ -270,11 +272,23 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
 
 ## Implementation Phases
 
-1. **Adapter**: the `labels_layers_changed` / `shapes_layers_changed` signals, `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`, and the styled-source matching key.
-2. **Shared row**: add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it.
-3. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh.
+Labels go before shapes:
+
+- labels have one source type (`TableColorSourceSpec`), no Fill and no shapes-column sources;
+- the primary labels layer has a simpler lifecycle. The Annotation widget also removes and re-adds the primary shapes layer (`normalize_native_shapes_layer_for_annotation(...)`), swaps it (`replace_primary_shapes_layer(...)`) and replaces its binding object without a signal (`sync_primary_shapes_layer_binding(...)`). Those reconcile edge cases are easier to handle once the pattern works for labels;
+- styled labels layers load cheaply, so the flow is quick to try by hand; polygon shapes can take seconds per layer;
+- the main table-refresh case, Object Classification annotating `user_class`, is a labels case;
+- labels have fewer existing Add / Update tests to rewrite (about 10, against about 16 for shapes).
+
+Phases 1 and 2 still cover the parts shapes need, so the shared design is tested before the labels card depends on it.
+
+1. **Adapter, for labels and shapes together**: the `labels_layers_changed` / `shapes_layers_changed` signals, `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`, and the styled-source matching key for both `TableColorSourceSpec` and `ShapeColumnColorSourceSpec`. Both element types are handled in the same adapter functions (`_handle_registered_binding(...)`, `_on_viewer_layer_removed(...)`, `_on_viewer_layers_reordered(...)`, `_remove_layer_from_viewer_and_registry(...)`), so splitting the work would edit them twice.
+2. **Shared row**: add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it. Build and test the extra-control slot here, with a placeholder widget, although only shapes rows use it, so the row API does not change in phase 5.
+3. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh. Build the loaded list as a reusable widget so the shapes card can use it in phase 5.
 4. **Table refresh**: scoped restyle on `table_state_changed`, and stale-source warnings.
-5. **Shapes card**: same as labels, plus shapes-column sources and per-row Fill.
+5. **Shapes card**: reuse the loaded list from phase 3, and add shapes-column sources and per-row Fill.
+
+Release phases 3 to 5 together. Between them, the labels card loads immediately while the shapes card still uses **Add / Update in viewer**. That is fine on the feature branch, but confusing in a release.
 
 ## Tests
 
@@ -287,7 +301,7 @@ Adapter (`tests/test_viewer_adapter.py`):
 
 Layer rows:
 
-- new `tests/test_layer_row.py` for `_LayerRow`: intents are emitted without mutating the layer, visibility follows native events, `dispose()` is idempotent, the warning state renders, and rows can be built for `Labels`, `Shapes` and `Points` layers;
+- new `tests/test_layer_row.py` for `_LayerRow`: intents are emitted without mutating the layer, visibility follows native events, `dispose()` is idempotent, the warning state renders, an extra control can be added and its signals reach the owner, and rows can be built for `Labels`, `Shapes` and `Points` layers;
 - the existing `tests/test_image_layer_row.py` keeps passing unchanged.
 
 Viewer widget (`tests/test_viewer_widget.py`):
