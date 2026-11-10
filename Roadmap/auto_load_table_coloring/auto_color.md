@@ -103,6 +103,8 @@ Mirror the image card's Stack pattern:
 - no primary layer loaded: show a **Load in viewer** button;
 - primary layer loaded: show a row with eye toggle, the layer name and a remove button.
 
+The row is the first form row of the card, labelled "Primary layer", above "Linked table". It is kept out of the loaded list of styled layers (see "Decisions"), and the card reconciles it from a separate `primary_binding`.
+
 Loading keeps today's semantics: `ensure_labels_loaded(...)` / `ensure_shapes_loaded(...)` return an existing primary layer unchanged.
 
 ### Adapter changes (`src/spatiato/viewer/adapter.py`)
@@ -258,10 +260,13 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
 - **Missing source**: when the table or column of a loaded layer disappears, the layer stays in the viewer as it is and its row shows a warning. The Viewer never removes it automatically.
 - **Row labels with several linked tables**: when an element has more than one linked table, table-backed rows are prefixed with the table name. Rows stay in one flat list in napari layer order; they are not grouped under table headings.
 - **Shared row**: the generic part of `_ImageLayerRow` moves to `_LayerRow` in a new neutral module, `src/spatiato/widgets/layer_row.py`. `_ImageLayerRow` stays in `image_layer_row.py` as a subclass that adds the color button and colormap sync, together with the image channel and colormap helpers. It is not generalized in place, because labels and shapes rows would then sit in an image-named class with a color option that has to be off for them. It is not moved and renamed as a whole either, because the neutral module would then hold image colormap and channel code. See "Shared layer row".
-
-## Open Questions
-
-1. **Primary row placement**: above the color-source controls (proposed), or as the first row of the loaded list?
+- **Primary row placement**: the primary layer has its own row at the top of the card, above "Linked table" and the other color-source controls. It is not part of the loaded list, because:
+  - the list follows napari layer order, so the primary layer could not be pinned first without an exception;
+  - "Remove all" and the "N colored layers" count cover only styled layers;
+  - while the primary layer is absent, its row shows a **Load in viewer** button, and the list shows only live layers;
+  - the image card keeps its Stack row in a container separate from the overlay list in the same way;
+  - other widgets restyle (Object Classification, Spatial Query) or edit (Annotation) the primary layer, so it is a different kind of layer from the colored ones;
+  - the list's scroll area could scroll it out of view.
 
 ## Implementation Phases
 
