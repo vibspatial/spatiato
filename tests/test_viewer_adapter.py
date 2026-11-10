@@ -1915,29 +1915,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdat
     assert len(viewer.layers) == 1
 
 
-def test_viewer_adapter_ensure_styled_labels_loaded_force_syncs_after_recolor(
-    monkeypatch: pytest.MonkeyPatch,
-    sdata_blobs,
-) -> None:
-    viewer = DummyViewer()
-    adapter = ViewerAdapter(viewer)
-    sync_calls: list[Labels] = []
-    style_spec = TableColorSourceSpec(
-        table_name="table",
-        source_kind="var",
-        value_key="channel_0_sum",
-        value_kind="continuous",
-    )
-
-    monkeypatch.setattr(adapter, "sync_labels_display_after_colormap_change", sync_calls.append)
-
-    first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
-    second = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
-
-    assert first.layer is second.layer
-    assert sync_calls == [first.layer, first.layer]
-
-
 def test_viewer_adapter_ensure_styled_labels_loaded_updates_reused_variant_from_current_table(
     sdata_blobs,
 ) -> None:

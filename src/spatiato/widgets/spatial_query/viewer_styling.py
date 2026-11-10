@@ -32,7 +32,6 @@ def load_and_style_unannotated_spatial_annotation_labels(
         coordinate_system,
     )
     apply_neutral_labels_style(load_result.layer)
-    viewer_adapter.sync_labels_display_after_colormap_change(load_result.layer)
     viewer_adapter.activate_layer(load_result.layer)
 
     return LabelsLoadResult(
@@ -65,8 +64,7 @@ def load_and_style_spatial_annotation_labels(
     Parameters
     ----------
     viewer_adapter
-        Viewer boundary used to load, synchronize, and activate the primary
-        labels layer.
+        Viewer boundary used to load and activate the primary labels layer.
     sdata
         SpatialData object containing the labels element and annotation table.
     coordinate_system
@@ -104,7 +102,6 @@ def load_and_style_spatial_annotation_labels(
             value_kind="categorical",
         ),
     )
-    viewer_adapter.sync_labels_display_after_colormap_change(load_result.layer)
     viewer_adapter.activate_layer(load_result.layer)
 
     return LabelsLoadResult(

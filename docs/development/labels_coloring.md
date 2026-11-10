@@ -280,10 +280,7 @@ compact colormap deliberately does not provide.
 flowchart TD
     change(["Colors change"]) --> how{"How?"}
     how -- "a new colormap:<br/>styling, Color by,<br/>full refresh" --> assign["layer.colormap = new colormap"]
-    assign --> sync["sync_labels_display_after_colormap_change"]
-    sync --> loaded{"layer.loaded?"}
-    loaded -- yes --> now["set_view_slice<br/>→ events.colormap<br/>→ events.set_data"]
-    loaded -- "no: a slice<br/>is in flight" --> defer["wait until the layer is loaded,<br/>then run the same steps once"]
+    assign --> setter["napari: events.colormap<br/>→ refresh(extent=False)"]
     how -- "one annotation,<br/>Color by user_class" --> edit["set_label_value / set_label_missing<br/>on the current colormap"]
     edit --> rows{"New color row,<br/>or low-bit labels?"}
     rows -- yes --> event["events.colormap<br/>rebuilds the color lookup texture"]
@@ -291,17 +288,18 @@ flowchart TD
     event --> refresh["refresh(extent=False)<br/>recodes the slice"]
 ```
 
-**Assigning a new colormap.** Every place that assigns a table-driven or
-neutral colormap then calls `ViewerAdapter.sync_labels_display_after_colormap_change`.
-With async slicing, napari can rebuild the color lookup texture for the new
-colormap before the slice has been recoded with it, which shows stale or
-swapped colors ([napari#9188](https://github.com/napari/napari/issues/9188)).
-The sync recomputes the slice, then emits the colormap event, then uploads the
-data. If a slice is still in flight, it waits until the layer is loaded,
-because recomputing the slice at that moment can crash inside dask's cache.
+**Assigning a new colormap.** napari's colormap setter handles this on its
+own: it emits the colormap event, which rebuilds the color lookup texture, and
+refreshes the layer, which recodes the slice with the new colormap. Before
+napari 0.9.0, async slicing could build the lookup texture for napari's
+placeholder slice and keep it after the real slice arrived, which showed stale
+or swapped colors ([napari#9188](https://github.com/napari/napari/issues/9188)).
+napari now rebuilds it when the slice's dtype changes. With async slicing, the
+previous slice can still be drawn with the new lookup texture for a moment,
+until the recoded slice arrives.
 
 **One annotation** (Object Classification, Color by `user_class`). Building
-and syncing a new colormap on every click would be too slow, so the widget
+and assigning a new colormap on every click would be too slow, so the widget
 changes the layer's colormap in place: `set_label_value` or
 `set_label_missing` gives the clicked object its class's texture code. Because
 the colormap object stays the same, napari does not emit a colormap event by
@@ -368,10 +366,7 @@ click.
 - Styling: `apply_table_color_source_to_labels_layer` and
   `apply_neutral_labels_style` in
   [`src/spatiato/viewer/labels_styling.py`](../../src/spatiato/viewer/labels_styling.py).
-- Display sync: `sync_labels_display_after_colormap_change` in
-  [`src/spatiato/viewer/labels_async.py`](../../src/spatiato/viewer/labels_async.py);
-  `ViewerAdapter.sync_labels_display_after_colormap_change`,
-  `ensure_styled_labels_loaded` and `_build_labels_layer` in
+- Adapter: `ensure_styled_labels_loaded` and `_build_labels_layer` in
   [`src/spatiato/viewer/adapter.py`](../../src/spatiato/viewer/adapter.py).
 - Object Classification: `ViewerStylingController` (`refresh_layer_colors`,
   `refresh_user_class_colormap_and_feature`,
@@ -383,9 +378,10 @@ click.
 - Spatial Query: `load_and_style_spatial_annotation_labels` and
   `load_and_style_unannotated_spatial_annotation_labels` in
   [`src/spatiato/widgets/spatial_query/viewer_styling.py`](../../src/spatiato/widgets/spatial_query/viewer_styling.py).
-- napari: `Labels._raw_to_displayed` (contours and recoding) and
-  `VispyLabelsLayer._on_colormap_change` (the color lookup texture).
+- napari: `Labels._raw_to_displayed` (contours and recoding),
+  `Labels._set_colormap` (the colormap event and refresh),
+  `VispyLabelsLayer._on_colormap_change` (the color lookup texture) and
+  `VispyLabelsLayer._on_data_change` (its rebuild when the slice dtype changes).
 - Tests: [`tests/test_labels_colormap.py`](../../tests/test_labels_colormap.py),
-  [`tests/test_labels_styling.py`](../../tests/test_labels_styling.py),
-  [`tests/test_labels_async.py`](../../tests/test_labels_async.py) and
+  [`tests/test_labels_styling.py`](../../tests/test_labels_styling.py) and
   [`tests/test_viewer_styling.py`](../../tests/test_viewer_styling.py).

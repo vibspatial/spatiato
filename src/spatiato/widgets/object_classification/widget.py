@@ -1664,7 +1664,6 @@ class ObjectClassificationWidget(QWidget):
                 # table-backed colors with the shared neutral style because
                 # the rejected table cannot provide trustworthy class values.
                 apply_neutral_labels_style(layer)
-                self._app_state.viewer_adapter.sync_labels_display_after_colormap_change(layer)
             self._layer_styling_error = None
             self._update_warning_status_card()
             return
