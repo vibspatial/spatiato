@@ -5,7 +5,7 @@ pixels of every new 2D slice before recoding it: `Labels._calculate_contour`
 calls napari's `get_contours`, a single-threaded scipy grey dilation and
 erosion on the Qt main thread. That takes about 74 ms for a 5.2 Mpx slice with
 contour 1 and 100 ms with contour 2. The parallel numba kernel here gives the
-same output in about 4 ms and 23 ms. Spatiato installs it on every Labels layer
+same output in about 1 ms and 6 ms. Spatiato installs it on every Labels layer
 it builds.
 
 The override can go once napari ships fast contours itself:
@@ -33,34 +33,92 @@ def _reflect(index, size):
     return index
 
 
+# napari keeps a pixel when the maximum over its cross neighbourhood differs
+# from the minimum over the diamond of radius `thickness`. The diamond contains
+# the cross and the pixel itself, so a pixel is on an outline when one of its 4
+# neighbours differs from it, or, for thicker contours, when any pixel in the
+# diamond is smaller than it. The two functions below test that rule, with
+# plain and with reflected indices.
+
+
+@njit(inline="always")
+def _is_boundary(labels, y, x, thickness, value):
+    """Whether pixel (y, x) is on an outline; its whole diamond lies inside `labels`."""
+    if labels[y - 1, x] != value or labels[y + 1, x] != value or labels[y, x - 1] != value or labels[y, x + 1] != value:
+        return True
+    if thickness > 1:
+        for dy in range(-thickness, thickness + 1):
+            radius = thickness - abs(dy)
+            row = y + dy
+            for dx in range(-radius, radius + 1):
+                if labels[row, x + dx] < value:
+                    return True
+    return False
+
+
+@njit(inline="always")
+def _is_boundary_reflect(labels, y, x, thickness, value, height, width):
+    """Whether pixel (y, x) is on an outline, mirroring indices outside `labels`."""
+    if (
+        labels[_reflect(y - 1, height), x] != value
+        or labels[_reflect(y + 1, height), x] != value
+        or labels[y, _reflect(x - 1, width)] != value
+        or labels[y, _reflect(x + 1, width)] != value
+    ):
+        return True
+    if thickness > 1:
+        for dy in range(-thickness, thickness + 1):
+            radius = thickness - abs(dy)
+            row = _reflect(y + dy, height)
+            for dx in range(-radius, radius + 1):
+                if labels[row, _reflect(x + dx, width)] < value:
+                    return True
+    return False
+
+
 @njit(parallel=True, cache=True)
-def _contours_2d(labels, thickness, background, out):
-    """Write the contours of `labels` into `out`; see `labels_contours`."""
-    # napari keeps a pixel when the maximum over its cross neighbourhood differs
-    # from the minimum over the diamond of radius `thickness`. The diamond
-    # contains the cross and the pixel itself, so a pixel is kept when one of
-    # its 4 neighbours differs from it, or, for thicker contours, when any
-    # pixel in the diamond is smaller than it.
+def _contours_2d_simple(labels, thickness, background, out):
+    """The straightforward version of `_contours_2d`: the same output, more slowly.
+
+    It tests every pixel with mirrored indices. `_contours_2d` adds two
+    shortcuts that keep the output identical: background pixels stay
+    background without a check, and pixels at least `thickness` from the slice
+    edge use plain indices. On a 5.2 Mpx slice (Apple M2 Max), this version
+    takes about 4, 23 and 34 ms for contour 1, 2 and 3; `_contours_2d` takes
+    about 1, 6 and 7 ms. Not used for drawing; kept as the readable reference
+    and tested against `_contours_2d`.
+    """
     height, width = labels.shape
     for y in prange(height):
         for x in range(width):
             value = labels[y, x]
-            boundary = (
-                labels[_reflect(y - 1, height), x] != value
-                or labels[_reflect(y + 1, height), x] != value
-                or labels[y, _reflect(x - 1, width)] != value
-                or labels[y, _reflect(x + 1, width)] != value
-            )
-            if not boundary and thickness > 1:
-                for dy in range(-thickness, thickness + 1):
-                    radius = thickness - abs(dy)
-                    yy = _reflect(y + dy, height)
-                    for dx in range(-radius, radius + 1):
-                        if labels[yy, _reflect(x + dx, width)] < value:
-                            boundary = True
-                            break
-                    if boundary:
-                        break
+            boundary = _is_boundary_reflect(labels, y, x, thickness, value, height, width)
+            out[y, x] = value if boundary else background
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _contours_2d(labels, thickness, background, out):
+    """Write the contours of `labels` into `out`; see `labels_contours`.
+
+    Gives the same output as `_contours_2d_simple`, with two shortcuts that
+    make it about four times faster.
+    """
+    height, width = labels.shape
+    for y in prange(height):
+        interior_row = thickness <= y < height - thickness
+        for x in range(width):
+            value = labels[y, x]
+            if value == background:
+                # A background pixel stays background, on an outline or not.
+                out[y, x] = background
+                continue
+            # Only pixels within `thickness` of the slice edge reach outside
+            # it; the index reflection is too slow to pay for every pixel.
+            if interior_row and thickness <= x < width - thickness:
+                boundary = _is_boundary(labels, y, x, thickness, value)
+            else:
+                boundary = _is_boundary_reflect(labels, y, x, thickness, value, height, width)
             out[y, x] = value if boundary else background
     return out
 
