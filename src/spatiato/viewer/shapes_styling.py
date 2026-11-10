@@ -33,6 +33,7 @@ from spatiato.viewer._styling import (
     default_categorical_palette_for_categories,
     is_string_like_series,
     normalize_category_value,
+    zeros_mean_not_detected,
 )
 
 if TYPE_CHECKING:
@@ -265,6 +266,7 @@ def apply_table_color_source_to_shapes_layer(
         source_row_id_by_rendered_row=source_row_id_by_rendered_row,
     )
 
+    not_detected_rows = None
     if style_spec.value_kind == "instance" or (
         style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key
     ):
@@ -284,6 +286,8 @@ def apply_table_color_source_to_shapes_layer(
         style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(
             aligned_values.rendered_row_values
         )
+        if zeros_mean_not_detected(feature_values):
+            not_detected_rows = (feature_values == 0.0).to_numpy(dtype=bool)
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
 
@@ -299,6 +303,7 @@ def apply_table_color_source_to_shapes_layer(
             layer,
             rendered_row_colors,
             rendered_row_has_table_row=aligned_values.rendered_row_has_table_row,
+            not_detected_rows=not_detected_rows,
             fill=fill,
         )
     elif isinstance(layer, Points):
@@ -306,6 +311,7 @@ def apply_table_color_source_to_shapes_layer(
             layer,
             rendered_row_colors,
             rendered_row_has_table_row=aligned_values.rendered_row_has_table_row,
+            not_detected_rows=not_detected_rows,
         )
     else:  # pragma: no cover - defensive for future layer subclasses.
         raise TypeError(f"Unsupported styled shapes layer type: {type(layer)!r}.")
@@ -1015,8 +1021,14 @@ def _apply_table_rendered_row_colors_to_shapes_layer(
     rendered_row_colors: np.ndarray,
     *,
     rendered_row_has_table_row: np.ndarray,
+    not_detected_rows: np.ndarray | None = None,
     fill: bool = False,
 ) -> None:
+    """Apply table-backed row colors to a Shapes layer.
+
+    Shapes without a table row, and rows in `not_detected_rows` (exact zeros
+    of a non-negative `var` column), are drawn fully transparent.
+    """
     if len(rendered_row_has_table_row) != len(layer.data):
         raise ValueError("Rendered-row table coverage must contain one value for each rendered napari shape row.")
 
@@ -1036,9 +1048,11 @@ def _apply_table_rendered_row_colors_to_shapes_layer(
     # appear as missing in `rendered_row_values`, so color builders map both to
     # gray. Use the table-row coverage mask to keep missing table values gray
     # while making shapes with no table row fully transparent.
-    unannotated_rows = ~rendered_row_has_table_row
-    face_color[unannotated_rows, 3] = 0.0
-    edge_color[unannotated_rows, 3] = 0.0
+    hidden_rows = ~rendered_row_has_table_row
+    if not_detected_rows is not None:
+        hidden_rows = hidden_rows | not_detected_rows
+    face_color[hidden_rows, 3] = 0.0
+    edge_color[hidden_rows, 3] = 0.0
     layer.face_color = face_color
     layer.edge_color = edge_color
     refresh = getattr(layer, "refresh", None)
@@ -1051,7 +1065,13 @@ def _apply_table_rendered_row_colors_to_points_layer(
     rendered_row_colors: np.ndarray,
     *,
     rendered_row_has_table_row: np.ndarray,
+    not_detected_rows: np.ndarray | None = None,
 ) -> None:
+    """Apply table-backed row colors to a Points layer of point-radius shapes.
+
+    Points without a table row, and rows in `not_detected_rows` (exact zeros
+    of a non-negative `var` column), are drawn fully transparent.
+    """
     if len(rendered_row_has_table_row) != len(layer.data):
         raise ValueError("Rendered-row table coverage must contain one value for each rendered napari point row.")
 
@@ -1064,7 +1084,10 @@ def _apply_table_rendered_row_colors_to_points_layer(
     # Keep the same distinction as table-backed Shapes layers: annotated rows
     # with missing selected values stay gray, while points with no table row are
     # transparent.
-    colors[~rendered_row_has_table_row, 3] = 0.0
+    hidden_rows = ~rendered_row_has_table_row
+    if not_detected_rows is not None:
+        hidden_rows = hidden_rows | not_detected_rows
+    colors[hidden_rows, 3] = 0.0
     layer.face_color = colors
     layer.border_color = colors
     layer.border_width = 0

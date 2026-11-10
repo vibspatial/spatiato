@@ -28,6 +28,7 @@ from spatiato.viewer._styling import (
     default_categorical_palette_for_categories,
     is_string_like_series,
     normalize_category_value,
+    zeros_mean_not_detected,
 )
 from spatiato.viewer.labels_colormap import (
     CompactLabelColormap,
@@ -269,7 +270,11 @@ def _build_var_colormap(
         index=region_rows.index,
         name=var_name,
     )
-    colormap = compact_continuous_label_colormap_from_values(numeric_region_series)
+    colormap = compact_continuous_label_colormap_from_values(
+        numeric_region_series,
+        # "none" is matplotlib's fully transparent color.
+        zero_color="none" if zeros_mean_not_detected(numeric_region_series) else None,
+    )
     style_result = LabelsStyleResult(
         value_kind="continuous",
         palette_source=None,

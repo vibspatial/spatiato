@@ -25,9 +25,10 @@ from spatiato.viewer._styling import (
 _TRANSPARENT_RGBA = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 # A continuous mapping has `bins + 3` texture rows: default, background, the
-# bins and missing. Napari stores texture codes as uint8 only up to 255 colors
-# (`minimum_dtype_for_labels`), so 252 bins is the largest count that keeps the
-# per-slice labels texture uint8 instead of uint16.
+# bins and missing, plus a zero row when zeros get their own color. Napari
+# stores texture codes as uint8 only up to 255 colors
+# (`minimum_dtype_for_labels`), so 252 bins, or 251 with a zero row, is the
+# largest count that keeps the per-slice labels texture uint8 instead of uint16.
 _CONTINUOUS_LABEL_BINS = 252
 
 # Upper bound for one colormap's dense table (the `label_id -> texture_code`
@@ -867,12 +868,13 @@ def compact_categorical_label_colormap_from_values(
 def compact_continuous_labels_mapping_from_values(
     values: pd.Series,
     *,
-    bins: int = _CONTINUOUS_LABEL_BINS,
+    bins: int | None = None,
     colormap_name: str = OVERLAY_CONTINUOUS_COLORMAP,
     missing_color: Any = MISSING_CONTINUOUS_COLOR,
     default_color: Any = _TRANSPARENT_RGBA,
     background_value: int = 0,
     value_range: tuple[float, float] | None = None,
+    zero_color: Any | None = None,
 ) -> CompactLabelsMapping:
     """Return compact labels coloring state for continuous table values.
 
@@ -886,9 +888,9 @@ def compact_continuous_labels_mapping_from_values(
     bins
         Number of color bins sampled from `colormap_name`. Finite source values
         map to these bins, while missing/non-finite values map to
-        `missing_color`. The default of 252 keeps the texture codes, and so
-        the per-slice labels texture, in uint8; more bins still work with
-        uint16 textures.
+        `missing_color`. The default, 252 or 251 with `zero_color`, keeps the
+        texture codes, and so the per-slice labels texture, in uint8; more bins
+        still work with uint16 textures.
     colormap_name
         Matplotlib colormap used for finite values.
     missing_color
@@ -901,6 +903,11 @@ def compact_continuous_labels_mapping_from_values(
         Optional `(min, max)` range used for normalization. If omitted, the
         range is derived from finite values. Values outside the range are
         clamped before binning.
+    zero_color
+        Optional color for values that are exactly 0, in their own texture
+        row. `None` colors them like any other value. Zeros still count for the
+        value range either way, so the other colors do not shift. Var styling
+        passes transparent when zeros mean "not detected".
 
     Source values such as `0.0` are table values attached to positive label
     ids. `background_value=0` is reserved for the labels image background.
@@ -909,6 +916,8 @@ def compact_continuous_labels_mapping_from_values(
     """
     if not isinstance(background_value, int) or isinstance(background_value, bool):
         raise ValueError("Compact labels mapping background value must be an integer label id.")
+    if bins is None:
+        bins = _CONTINUOUS_LABEL_BINS if zero_color is None else _CONTINUOUS_LABEL_BINS - 1
     if not isinstance(bins, int) or isinstance(bins, bool) or bins < 2:
         raise ValueError("Compact continuous labels mapping `bins` must be an integer >= 2.")
     if value_range is not None:
@@ -932,8 +941,10 @@ def compact_continuous_labels_mapping_from_values(
         colormap_name=colormap_name,
         default_rgba=_rgba_cache_key(default_color),
         missing_rgba=_rgba_cache_key(missing_color),
+        zero_rgba=None if zero_color is None else _rgba_cache_key(zero_color),
     )
     missing_texture_code = bins + 2
+    zero_texture_code = bins + 3
     texture_codes = np.full(len(value_array), missing_texture_code, dtype=np.int64)
 
     if np.any(finite_values):
@@ -955,6 +966,8 @@ def compact_continuous_labels_mapping_from_values(
         color_bins = np.floor(normalized_values * bins).astype(np.int64)
         color_bins = np.clip(color_bins, 0, bins - 1)
         texture_codes[finite_values] = color_bins + 2
+        if zero_color is not None:
+            texture_codes[finite_values & (value_array == 0.0)] = zero_texture_code
 
     if not label_ids_sorted:
         order = np.argsort(label_ids)
@@ -974,12 +987,13 @@ def compact_continuous_labels_mapping_from_values(
 def compact_continuous_label_colormap_from_values(
     values: pd.Series,
     *,
-    bins: int = _CONTINUOUS_LABEL_BINS,
+    bins: int | None = None,
     colormap_name: str = OVERLAY_CONTINUOUS_COLORMAP,
     missing_color: Any = MISSING_CONTINUOUS_COLOR,
     default_color: Any = _TRANSPARENT_RGBA,
     background_value: int = 0,
     value_range: tuple[float, float] | None = None,
+    zero_color: Any | None = None,
 ) -> CompactLabelColormap:
     """Return a compact direct labels colormap for continuous values."""
     mapping = compact_continuous_labels_mapping_from_values(
@@ -990,6 +1004,7 @@ def compact_continuous_label_colormap_from_values(
         default_color=default_color,
         background_value=background_value,
         value_range=value_range,
+        zero_color=zero_color,
     )
     return CompactLabelColormap(mapping)
 
@@ -1117,16 +1132,18 @@ def _continuous_texture_rgba(
     colormap_name: str,
     default_rgba: tuple[float, float, float, float],
     missing_rgba: tuple[float, float, float, float],
+    zero_rgba: tuple[float, float, float, float] | None = None,
 ) -> np.ndarray:
     finite_colors = colormaps[colormap_name](np.linspace(0.0, 1.0, bins))
-    texture_rgba = np.vstack(
-        [
-            np.asarray(default_rgba, dtype=np.float32).reshape(1, 4),
-            _TRANSPARENT_RGBA.reshape(1, 4),
-            np.asarray(finite_colors, dtype=np.float32),
-            np.asarray(missing_rgba, dtype=np.float32).reshape(1, 4),
-        ]
-    )
+    rows = [
+        np.asarray(default_rgba, dtype=np.float32).reshape(1, 4),
+        _TRANSPARENT_RGBA.reshape(1, 4),
+        np.asarray(finite_colors, dtype=np.float32),
+        np.asarray(missing_rgba, dtype=np.float32).reshape(1, 4),
+    ]
+    if zero_rgba is not None:
+        rows.append(np.asarray(zero_rgba, dtype=np.float32).reshape(1, 4))
+    texture_rgba = np.vstack(rows)
     texture_rgba.setflags(write=False)
     return texture_rgba
 
