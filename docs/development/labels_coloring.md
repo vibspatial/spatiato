@@ -134,7 +134,7 @@ can be large with contours on
 ```mermaid
 flowchart TD
     slice(["New 2D slice of label ids"]) --> contour{"contour > 0?"}
-    contour -- yes --> outlines["napari: get_contours<br/>keeps only object outlines"]
+    contour -- yes --> outlines["keep only object outlines<br/>Spatiato: parallel numba kernel"]
     contour -- no --> dtype{"Labels dtype?"}
     outlines --> dtype
     dtype -- "high-bit" --> recode["colormap._data_to_texture<br/>label id → texture code<br/>Spatiato: dense table + parallel gather"]
@@ -274,6 +274,26 @@ colormap implements only that backend's hooks; napari's numpy backend would
 need a per-label `label id -> texture code` array (`_array_map`), which the
 compact colormap deliberately does not provide.
 
+### Contours: a numba kernel on each layer
+
+With `contour > 0`, napari keeps only the outline pixels of every new 2D slice
+before recoding it: `Labels._calculate_contour` calls napari's `get_contours`,
+a single-threaded scipy dilation and erosion on the main thread. On a 5.2 Mpx
+slice that takes about 75 ms with contour 1 and 100 ms with contour 2, against
+under 2 ms for the recoding. `install_fast_labels_contours` replaces
+`_calculate_contour` on each layer with a parallel numba kernel that gives the
+same output, including the border napari adds around partial slices: about
+5 ms and 24 ms. Contours off, 3D slices and input the kernel does not take
+still go through napari's method.
+
+The contour step belongs to the `Labels` layer, not to the colormap, so it
+applies to every Spatiato labels layer whatever its colormap.
+`_build_labels_layer` builds all of them and installs the kernel. It is set on
+each layer instance rather than patched into napari, so other plugins' layers
+keep napari's behavior. napari's Duplicate layer builds a plain `Labels`, so a
+duplicate uses napari's contours again. The upstream fix is tracked in
+[#136](https://github.com/vibspatial/spatiato/issues/136).
+
 ## Getting a color change onto the screen
 
 ```mermaid
@@ -343,10 +363,12 @@ click.
   `_map_without_cache`, `_clear_cache`) and use napari's private caches. The
   tests render through a real napari `Labels` layer with napari's per-pixel
   path disabled, and compare the overrides with napari's own paths, so a
-  napari release that renames or changes these hooks fails there first.
-- **Contours.** With `contour > 0`, napari computes the outlines of every new
-  2D slice on the main thread before recoding it, for any colormap. This step
-  is far slower than the recoding and is not sped up yet
+  napari release that renames or changes these hooks fails there first. The
+  contour kernel replaces `Labels._calculate_contour`, and a test fails if
+  napari's scipy contours run again on a Spatiato layer.
+- **Contours.** The contour kernel still runs on the main thread, and thick
+  contours cost more: about 24 ms for contour 2 on a 5.2 Mpx slice, against
+  5 ms for contour 1
   ([#136](https://github.com/vibspatial/spatiato/issues/136)).
 - **napari's layer controls.** The color mode "auto" and the shuffle button in
   napari's Labels controls replace a styled layer's colormap with a random one
@@ -366,6 +388,9 @@ click.
 - Styling: `apply_table_color_source_to_labels_layer` and
   `apply_neutral_labels_style` in
   [`src/spatiato/viewer/labels_styling.py`](../../src/spatiato/viewer/labels_styling.py).
+- Contours: `labels_contours`, `install_fast_labels_contours` and
+  `_calculate_labels_contour` in
+  [`src/spatiato/viewer/labels_contours.py`](../../src/spatiato/viewer/labels_contours.py).
 - Adapter: `ensure_styled_labels_loaded` and `_build_labels_layer` in
   [`src/spatiato/viewer/adapter.py`](../../src/spatiato/viewer/adapter.py).
 - Object Classification: `ViewerStylingController` (`refresh_layer_colors`,
@@ -379,9 +404,11 @@ click.
   `load_and_style_unannotated_spatial_annotation_labels` in
   [`src/spatiato/widgets/spatial_query/viewer_styling.py`](../../src/spatiato/widgets/spatial_query/viewer_styling.py).
 - napari: `Labels._raw_to_displayed` (contours and recoding),
+  `Labels._calculate_contour` and `get_contours` (napari's contours),
   `Labels._set_colormap` (the colormap event and refresh),
   `VispyLabelsLayer._on_colormap_change` (the color lookup texture) and
   `VispyLabelsLayer._on_data_change` (its rebuild when the slice dtype changes).
 - Tests: [`tests/test_labels_colormap.py`](../../tests/test_labels_colormap.py),
+  [`tests/test_labels_contours.py`](../../tests/test_labels_contours.py),
   [`tests/test_labels_styling.py`](../../tests/test_labels_styling.py) and
   [`tests/test_viewer_styling.py`](../../tests/test_viewer_styling.py).

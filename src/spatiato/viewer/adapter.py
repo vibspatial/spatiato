@@ -27,6 +27,7 @@ from spatiato.core._color_source import (
 )
 from spatiato.core.shapes_geometry import shapely_polygon_to_napari_polygon_vertices
 from spatiato.viewer.image_styling import DEFAULT_OVERLAY_COLORS, ImageDisplayMode, ImageLoadResult
+from spatiato.viewer.labels_contours import install_fast_labels_contours
 from spatiato.viewer.labels_styling import (
     LabelsLoadResult,
     apply_table_color_source_to_labels_layer,
@@ -2804,11 +2805,13 @@ def _build_labels_layer(
         )
 
     labels_data = _flatten_multiscale_element(label_element) if isinstance(label_element, DataTree) else label_element
-    return Labels(
+    layer = Labels(
         labels_data,
         name=name,
         affine=_get_affine_transform(label_element, coordinate_system),
     )
+    install_fast_labels_contours(layer)
+    return layer
 
 
 def _get_affine_transform(element: DataArray | DataTree, coordinate_system: str) -> np.ndarray | None:
