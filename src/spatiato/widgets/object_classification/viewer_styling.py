@@ -38,6 +38,7 @@ from spatiato.widgets.object_classification.controller import (
 
 if TYPE_CHECKING:
     from anndata import AnnData
+    from napari.layers import Labels
     from spatialdata import SpatialData
 
     from spatiato.widgets.object_classification.annotation_controller import UserClassAnnotationChange
@@ -178,7 +179,6 @@ class ViewerStylingController:
                 missing_color=DEFAULT_NEUTRAL_COLOR,
                 background_value=0,
             )
-        self._viewer_adapter.sync_labels_display_after_colormap_change(self._labels_layer)
 
     def refresh_layer_features(self, *, feature_rows: pd.DataFrame | None = None) -> None:
         """Expose current label and prediction values as napari layer features."""
@@ -244,13 +244,16 @@ class ViewerStylingController:
             result = colormap.set_label_value(instance_id, class_id, value_color=class_color)
 
         self._labels_layer.features = feature_rows
-        if result.texture_table_changed:
-            # Only brand-new classes append a new texture-code -> RGBA row.
-            # Notify vispy to upload the expanded lookup texture. Existing-
-            # class edits reuse an already uploaded texture row, so they only
-            # need the layer refresh below.
+        if result.texture_table_changed or _colors_labels_by_label_id_on_gpu(self._labels_layer):
+            # Vispy rebuilds and uploads its color lookup texture only on a
+            # colormap event:
+            # - a brand-new class appends a texture-code -> RGBA row;
+            # - for 8/16-bit labels the texture maps label ids to RGBA directly,
+            #   so every edit changes it.
+            # For larger dtypes, existing-class edits only change the texture
+            # codes of the edited label, which the refresh below recodes.
             self._labels_layer.events.colormap()
-        # The compact mapping was mutated in place; repaint the layer without
+        # The colormap object was updated in place; repaint the layer without
         # asking napari to recompute the layer extent.
         refresh(extent=False)
         return True
@@ -259,7 +262,7 @@ class ViewerStylingController:
         """Refresh one user-class feature value without repainting label colors.
 
         This is the direct-annotation fast path for prediction color modes:
-        annotation changes `user_class`, while `pred_class`/`pred_confidence`
+        annotation changes `user_class`, while `pred_class`/`pred_class_confidence`
         colors are refreshed only when the classifier writes predictions.
         """
         if self._labels_layer is None:
@@ -332,7 +335,7 @@ class ViewerStylingController:
         """Return normalized labels features for the selected segmentation region.
 
         The returned rows are indexed by label/instance id and include
-        `user_class`, `pred_class`, and `pred_confidence`. This is scoped to the
+        `user_class`, `pred_class`, and `pred_class_confidence`. This is scoped to the
         currently selected labels element, not necessarily the complete table.
         """
         region_rows = self._get_region_rows_by_instance()
@@ -424,10 +427,18 @@ class ViewerStylingController:
             column_name=category_column,
             categories=categories,
         )
-        return {
-            class_id: _rgba_array(color)
-            for class_id, color in zip(categories, colors, strict=True)
-        }
+        return {class_id: _rgba_array(color) for class_id, color in zip(categories, colors, strict=True)}
+
+
+def _colors_labels_by_label_id_on_gpu(layer: Labels) -> bool:
+    """Return whether napari colors this labels layer by label id on the GPU.
+
+    For 8- and 16-bit labels, napari uploads the label ids unchanged and vispy
+    looks up each label's RGBA in a texture built from the colormap, which is
+    rebuilt only on `layer.events.colormap`. Larger dtypes are recoded to
+    texture codes on the CPU for every refreshed slice.
+    """
+    return np.dtype(layer.data.dtype).itemsize <= 2
 
 
 def _read_class_categories(

@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 import pandas as pd
+from harpy.io import read_zarr
 from pandas.api.types import is_bool_dtype, is_numeric_dtype, is_object_dtype, is_string_dtype
 from qtpy.QtCore import QSignalBlocker, Qt
 from qtpy.QtWidgets import (
@@ -18,7 +19,6 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from spatialdata import read_zarr
 
 from spatiato._app_state import (
     CoordinateSystemChangedEvent,
@@ -28,16 +28,15 @@ from spatiato._app_state import (
     TableStateChangedEvent,
     get_or_create_app_state,
 )
+from spatiato.core.color_source_options import get_shape_column_color_source_options
 from spatiato.core.spatialdata import (
     get_annotating_table_names,
     get_coordinate_system_names_from_sdata,
     get_image_channel_names_from_sdata,
-    get_shape_column_color_source_options,
     get_spatialdata_image_options_for_coordinate_system_from_sdata,
     get_spatialdata_labels_options_for_coordinate_system_from_sdata,
     get_spatialdata_points_options_for_coordinate_system_from_sdata,
     get_spatialdata_shapes_options_for_coordinate_system_from_sdata,
-    get_table_color_source_options,
 )
 from spatiato.viewer.adapter import ImageLayerBinding
 from spatiato.viewer.points_styling import PointsLoadResult
@@ -58,6 +57,7 @@ from spatiato.widgets.shared_styles import (
     set_status_card,
 )
 from spatiato.widgets.spatialdata_replacement_dialog import confirm_spatialdata_replacement
+from spatiato.widgets.viewer._table_color_sources import LinkedTableColorSources
 from spatiato.widgets.viewer.disclosure import _CollapsibleSectionWidget, _DisclosureElementWidget
 from spatiato.widgets.viewer.image_widget import _ImageCardWidget
 from spatiato.widgets.viewer.labels_widget import LabelsLoadRequest, _LabelsCardWidget
@@ -437,8 +437,10 @@ class ViewerWidget(QWidget):
             return
 
         try:
+            # harpy's reader opens every table matrix lazily, as Dask arrays
+            # that read from the store; `obs`, `var` and `uns` are read into memory.
             sdata = read_zarr(selected_path)
-        except (OSError, ValueError) as error:
+        except Exception as error:  # noqa: BLE001 - this UI boundary must report every load failure.
             self._set_action_feedback(
                 title="SpatialData Load Error",
                 lines=[f"Could not load SpatialData store: {error}"],
@@ -633,12 +635,9 @@ class ViewerWidget(QWidget):
 
         for labels_name in labels_names:
             table_names = get_annotating_table_names(sdata, labels_name)
-            table_color_sources_by_table = {
-                table_name: get_table_color_source_options(sdata, table_name) for table_name in table_names
-            }
             card = _LabelsCardWidget(
                 labels_name=labels_name,
-                table_color_sources_by_table=table_color_sources_by_table,
+                linked_tables=_get_linked_tables(sdata, table_names),
             )
             card.add_update_requested.connect(self._add_or_update_labels_layer)
             row = _DisclosureElementWidget(
@@ -665,10 +664,7 @@ class ViewerWidget(QWidget):
 
         for card in self._labels_cards:
             table_names = get_annotating_table_names(sdata, card.labels_name)
-            table_color_sources_by_table = {
-                table_name: get_table_color_source_options(sdata, table_name) for table_name in table_names
-            }
-            card.set_linked_tables(table_color_sources_by_table)
+            card.set_linked_tables(_get_linked_tables(sdata, table_names))
 
     def _refresh_shapes_card_linked_tables(self) -> None:
         sdata = self._app_state.sdata
@@ -677,10 +673,7 @@ class ViewerWidget(QWidget):
 
         for card in self._shape_cards:
             table_names = get_annotating_table_names(sdata, card.shapes_name)
-            table_color_sources_by_table = {
-                table_name: get_table_color_source_options(sdata, table_name) for table_name in table_names
-            }
-            card.set_linked_tables(table_color_sources_by_table)
+            card.set_linked_tables(_get_linked_tables(sdata, table_names))
 
     def _rebuild_shapes_cards(self, sdata: SpatialData, shapes_names: list[str]) -> None:
         _clear_layout(self.shapes_section_layout)
@@ -690,13 +683,10 @@ class ViewerWidget(QWidget):
 
         for shapes_name in shapes_names:
             table_names = get_annotating_table_names(sdata, shapes_name)
-            table_color_sources_by_table = {
-                table_name: get_table_color_source_options(sdata, table_name) for table_name in table_names
-            }
             card = _ShapesCardWidget(
                 shapes_name=shapes_name,
                 shape_column_color_sources=get_shape_column_color_source_options(sdata, shapes_name),
-                table_color_sources_by_table=table_color_sources_by_table,
+                linked_tables=_get_linked_tables(sdata, table_names),
             )
             card.add_update_requested.connect(self._add_or_update_shapes_layer)
             row = _DisclosureElementWidget(
@@ -976,7 +966,7 @@ class ViewerWidget(QWidget):
             )
             return
 
-        if request.selected_source_kind in {"obs_column", "x_var"} and request.table_name is None:
+        if request.selected_source_kind in {"obs_column", "var"} and request.table_name is None:
             self._set_action_feedback(
                 title="Styled Shapes Error",
                 lines=[f'Shapes element "{request.shapes_name}" has no linked table for table-driven coloring.'],
@@ -990,7 +980,7 @@ class ViewerWidget(QWidget):
                     f"The selected observation column is not available in the linked table for "
                     f'"{request.shapes_name}". Pick another observation column.'
                 )
-            elif request.selected_source_kind == "x_var":
+            elif request.selected_source_kind == "var":
                 line = (
                     f'The selected var is not available in the linked table for "{request.shapes_name}". '
                     "Pick another var."
@@ -1688,6 +1678,11 @@ class ViewerWidget(QWidget):
 
             index = self.coordinate_system_combo.findData(coordinate_system)
             self.coordinate_system_combo.setCurrentIndex(index)
+
+
+def _get_linked_tables(sdata: SpatialData, table_names: list[str]) -> dict[str, LinkedTableColorSources]:
+    """Return the color sources of each linked table, by table name."""
+    return {table_name: LinkedTableColorSources.from_table(sdata, table_name) for table_name in table_names}
 
 
 def _clear_layout(layout: QLayout) -> None:

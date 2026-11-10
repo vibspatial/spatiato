@@ -1,26 +1,29 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
-from spatiato._app_state import TableReloadRequest
+from spatiato._app_state import TableBusyMark, TableBusyMarker, TableDirtySnapshot, format_table_busy_message
 from spatiato.core.feature_extraction import (
+    ExistingFeatureMatrix,
+    ExistingFeatureMatrixKind,
     FeatureExtractionChannel,
     FeatureExtractionTriplet,
+    FeatureMatrixRemovedError,
     _get_triplet_channel_selection_error,
     _has_empty_intensity_channel_selection,
     _normalize_channels,
     _normalize_triplets,
     _requires_image,
-    _resolve_harpy_channel_parameter,
-    _resolve_harpy_coordinate_system_parameter,
-    _resolve_harpy_image_name_parameter,
-    _resolve_harpy_labels_name_parameter,
+    calculate_feature_matrix,
+    check_existing_feature_matrix,
 )
+from spatiato.core.feature_matrix_metadata import validate_feature_key_not_reserved
+from spatiato.core.persistence import TableComponentPath
 from spatiato.core.spatialdata import get_table
 from spatiato.core.validation import normalize_spatialdata_name, validate_new_spatialdata_element_name
 
@@ -39,7 +42,10 @@ def _resolve_thread_worker() -> Any:
 
 
 FEATURE_EXTRACTION_IDLE_STATUS = "Feature extraction: choose a labels element, table, and output key."
-FeatureMatrixWriteChangeKind = Literal["created", "updated"]
+# harpy does not protect concurrent writers to one store, so a detached job that
+# is still writing holds back the next launch.
+_WAITING_FOR_DETACHED_JOB_STATUS = "Feature extraction: waiting for the previous calculation to finish writing."
+FeatureMatrixWriteChangeKind = Literal["created", "updated", "removed"]
 
 thread_worker = _resolve_thread_worker()
 
@@ -51,6 +57,10 @@ class FeatureExtractionRequest:
     `table_name` is always the spatiato target table name. `create_table`
     decides whether that name refers to an existing table or to a table Harpy
     should create while writing the feature matrix.
+
+    `confirmed_existing_entry` is the kind of existing feature matrix found
+    before launching, which the worker checks again; `None` acts on whatever is
+    found (see `calculate_feature_matrix(...)`).
     """
 
     triplets: tuple[FeatureExtractionTriplet, ...]
@@ -59,6 +69,7 @@ class FeatureExtractionRequest:
     feature_names: tuple[str, ...]
     feature_key: str
     overwrite_feature_key: bool = False
+    confirmed_existing_entry: ExistingFeatureMatrixKind | None = None
 
     def __post_init__(self) -> None:
         if not self.table_name.strip():
@@ -123,12 +134,21 @@ class FeatureExtractionBindingState:
 
 @dataclass(frozen=True)
 class FeatureExtractionJob:
-    """Immutable payload copied on the main thread and consumed by a worker."""
+    """Immutable payload copied on the main thread and consumed by a worker.
+
+    `dirty_snapshot` is the target table's dirty state captured at launch. The
+    controller does not interpret it: every result of the job carries it back,
+    and the widget records the result with it, so only paths that were dirty at
+    launch and that the job wrote can become clean. In practice there are none,
+    because launching is refused while the key's paths have unsaved changes.
+    `None` when the caller tracks no dirty state, for example for a new table:
+    the result is then only published.
+    """
 
     job_id: int
     sdata: SpatialData
     request: FeatureExtractionRequest
-    change_kind: FeatureMatrixWriteChangeKind = "created"
+    dirty_snapshot: TableDirtySnapshot | None = None
 
     @property
     def labels_names(self) -> tuple[str, ...]:
@@ -175,14 +195,23 @@ class FeatureExtractionJob:
 
 @dataclass(frozen=True)
 class FeatureExtractionResult:
-    """Summary produced by a completed feature-extraction worker."""
+    """Summary of a feature-matrix change made by a feature-extraction worker.
+
+    `regions` are the table regions whose rows changed, as table events report
+    them: the selected labels elements, or every region of the table after a
+    full replacement or a removal (`change_kind="removed"`, when extraction
+    failed after the previous matrix was removed). `dirty_snapshot` is the
+    job's launch snapshot (`FeatureExtractionJob.dirty_snapshot`).
+    """
 
     job_id: int
     # Tuple because a single feature-extraction request can cover a batch of labels elements.
     labels_names: tuple[str, ...]
     table_name: str
     feature_key: str
+    regions: tuple[str, ...]
     change_kind: FeatureMatrixWriteChangeKind = "created"
+    dirty_snapshot: TableDirtySnapshot | None = None
 
     @property
     def triplet_count(self) -> int:
@@ -191,33 +220,26 @@ class FeatureExtractionResult:
 
 @thread_worker(start_thread=False, ignore_errors=True)
 def _run_feature_extraction_job(job: FeatureExtractionJob) -> FeatureExtractionResult:
-    import harpy as hp
-
-    triplets = job.request.triplets
-
-    hp.tb.add_feature_matrix(
-        sdata=job.sdata,
-        labels_name=_resolve_harpy_labels_name_parameter(triplets),
-        image_name=_resolve_harpy_image_name_parameter(triplets, job.request.feature_names),
-        table_name=job.request.harpy_table_name,
-        output_table_name=job.request.harpy_output_table_name,
-        feature_key=job.request.feature_key,
-        features=list(job.request.feature_names),
-        channels=_resolve_harpy_channel_parameter(triplets, job.request.feature_names),
-        feature_matrices_key=_FEATURE_MATRICES_KEY,
-        # Table-name collisions are blocked in the UI/controller; replacing an
-        # existing table would need a broader table and .obsm replacement policy.
-        overwrite_output_table=False,
-        overwrite_feature_key=job.request.overwrite_feature_key,
-        to_coordinate_system=_resolve_harpy_coordinate_system_parameter(triplets),
+    request = job.request
+    calculation = calculate_feature_matrix(
+        job.sdata,
+        table_name=request.table_name,
+        feature_key=request.feature_key,
+        triplets=request.triplets,
+        feature_names=request.feature_names,
+        create_table=request.create_table,
+        overwrite_feature_key=request.overwrite_feature_key,
+        confirmed_existing_entry=request.confirmed_existing_entry,
     )
 
     return FeatureExtractionResult(
         job_id=job.job_id,
         labels_names=job.labels_names,
-        table_name=job.request.table_name,
-        feature_key=job.request.feature_key,
-        change_kind=job.change_kind,
+        table_name=request.table_name,
+        feature_key=request.feature_key,
+        regions=calculation.regions,
+        change_kind=calculation.change_kind,
+        dirty_snapshot=job.dirty_snapshot,
     )
 
 
@@ -227,10 +249,17 @@ class FeatureExtractionController:
     def __init__(
         self,
         *,
+        table_busy_marker: TableBusyMarker,
         on_state_changed: Callable[[], None] | None = None,
         on_table_selection_refresh_required: Callable[[FeatureExtractionResult], None] | None = None,
         on_feature_matrix_changed: Callable[[FeatureExtractionResult], None] | None = None,
     ) -> None:
+        # Marks the job's table busy while the job writes it. The widget passes
+        # app state, which implements `TableBusyMarker`. Required, unlike the
+        # callbacks: without it, Write and Reload would not wait for the job.
+        # It is also kept after `shutdown()`, so a job that outlives the widget
+        # still releases its mark.
+        self._table_busy_marker = table_busy_marker
         self._on_state_changed = on_state_changed
         self._on_table_selection_refresh_required = on_table_selection_refresh_required
         self._on_feature_matrix_changed = on_feature_matrix_changed
@@ -244,19 +273,35 @@ class FeatureExtractionController:
         self._selected_labels_name_hint: str | None = None
         self._selected_coordinate_system_hint: str | None = None
 
-        self._latest_requested_job_id = 0
-        self._active_worker_job_id: int | None = None
-        self._active_worker: Any | None = None
-        # `_active_worker` tracks the job whose result the UI will still
-        # accept. It is cleared as soon as cancellation is requested, but
-        # FunctionWorker.quit() cannot interrupt an already-running synchronous
-        # `hp.tb.add_feature_matrix()` call. A cancelled or superseded job may
-        # therefore keep writing its table after the UI considers it stopped.
-        # Retain every launched job here until its worker emits `finished` so
-        # exact-table reloads remain blocked and widget teardown cannot remove
-        # that reload protection too early.
-        self._in_flight_jobs: dict[int, FeatureExtractionJob] = {}
-        self._release_reload_participant: Callable[[], None] | None = None
+        self._last_job_id = 0
+        # The feature-extraction job whose harpy call has not finished, and its worker:
+        # - `calculate()` sets them; `_on_worker_finished()` clears them when the
+        #   worker emits `finished`.
+        # - At most one job at a time: harpy does not protect concurrent writers
+        #   to one store, so `calculate()` waits while `_job` is set.
+        # - The job is detached while the current selection is not the one it was
+        #   launched for (`_job_detached`); changing the inputs back reattaches
+        #   it. Changing an input does not call `quit()`, which cannot stop a
+        #   running harpy call and would only suppress `returned`. A detached job
+        #   keeps writing; its table change is still published and the table
+        #   choices are refreshed, but the status and selection follow the
+        #   current inputs.
+        # - Until `finished`, the job's table is busy (`_busy_mark`), so it can be
+        #   neither written nor reloaded, and no other job starts on it, also
+        #   when the job is detached or the widget closed. After the widget
+        #   closes, superqt keeps the running worker alive, and its signal
+        #   connections keep this controller alive, so `_on_worker_finished()`
+        #   still releases the mark.
+        # The one-job limit holds per controller: closing the widget mid-run and
+        # opening a new one gives a second controller. That controller does not
+        # start a job on the busy table, but may start one on another table of
+        # the same store. Accepted: rare.
+        # Spatial Query's controller mirrors this job contract for its centers
+        # job. Sharing it in one helper:
+        # https://github.com/vibspatial/spatiato/issues/135
+        self._job: FeatureExtractionJob | None = None
+        self._worker: Any | None = None
+        self._busy_mark: TableBusyMark | None = None
         self._is_shutdown = False
 
         self._status_message = FEATURE_EXTRACTION_IDLE_STATUS
@@ -273,19 +318,14 @@ class FeatureExtractionController:
         return self._status_kind
 
     @property
-    def is_running(self) -> bool:
-        """Return whether a feature-extraction worker is currently active."""
-        return self._active_worker is not None
+    def has_job_in_flight(self) -> bool:
+        """Return whether a harpy job has not finished, also when it was detached.
 
-    @property
-    def active_job_id(self) -> int | None:
-        """Return the currently running feature-extraction job identifier."""
-        return self._active_worker_job_id
-
-    @property
-    def has_in_flight_jobs(self) -> bool:
-        """Return whether any launched Harpy call has not emitted ``finished``."""
-        return bool(self._in_flight_jobs)
+        Such a job may still write its table: in memory and, for backed
+        SpatialData, in the store. It blocks new launches, and keeps its table
+        busy, so the table can be neither written nor reloaded.
+        """
+        return self._job is not None
 
     @property
     def binding_state(self) -> FeatureExtractionBindingState:
@@ -315,7 +355,8 @@ class FeatureExtractionController:
                 not _requires_image(self._selected_feature_names)
                 or all(triplet.image_name is not None for triplet in self._selected_triplets)
             )
-            and not self.is_running
+            # Also a detached job: its harpy call keeps writing until `finished`.
+            and not self.has_job_in_flight
         )
 
     def bind(
@@ -410,6 +451,7 @@ class FeatureExtractionController:
             or labels_name_hint != self._selected_labels_name_hint
             or coordinate_system_hint != self._selected_coordinate_system_hint
         )
+        was_detached = self._job_detached
 
         self._selected_spatialdata = sdata
         self._selected_triplets = triplets
@@ -420,79 +462,134 @@ class FeatureExtractionController:
         self._selected_labels_name_hint = labels_name_hint
         self._selected_coordinate_system_hint = coordinate_system_hint
 
-        if context_changed:
-            self._cancel_pending_and_active_jobs()
-
-        self._update_idle_status()
+        if was_detached and self._job is not None and not self._job_detached:
+            # The inputs changed back to the job's: it is active again.
+            self._set_calculating_status(self._job)
+        else:
+            self._update_idle_status()
         return context_changed
 
-    def calculate(self, *, overwrite_feature_key: bool = False) -> bool:
-        """Launch feature extraction for the current bound inputs."""
+    def check_existing_feature_matrix(
+        self,
+        *,
+        dirty_paths: Iterable[TableComponentPath],
+    ) -> ExistingFeatureMatrix | None:
+        """Classify the bound key's existing feature matrix before a launch.
+
+        One extraction checks the existing entry twice:
+
+        1. here, on the main thread when Calculate is clicked, so the widget
+           can pick its confirmation dialog;
+        2. again in the worker, by `calculate_feature_matrix(...)`, against the
+           `ExistingFeatureMatrix.kind` passed to
+           `calculate(..., confirmed_existing_entry=...)`. A different kind
+           stops the job before anything is removed or calculated, in case the
+           table changed in between.
+
+        Runs with the inputs the job will use. `dirty_paths` are the table's
+        component paths with unsaved changes. Returns `None`, after setting an
+        error status, when nothing may be launched: the key's matrix or
+        metadata has unsaved changes in backed SpatialData, which harpy would
+        drop, or the check raises, for example for rows that harpy would
+        reject. See `docs/development/feature_extraction.md` for the whole flow.
+        """
+        sdata = self._selected_spatialdata
+        table_name = self._selected_table_name
+        feature_key = self._selected_feature_key
+        if sdata is None or table_name is None or feature_key is None or self._create_table:
+            raise RuntimeError("Checking an existing feature matrix requires a bound existing table and feature key.")
+
+        # Only backed data is checked. harpy merges with the existing entry it
+        # reads from the store, so unsaved changes to the key in memory would be
+        # dropped. Unbacked, harpy merges with the matrix in memory, so nothing
+        # is lost; and since unbacked data can't be written or reloaded, a block
+        # here would stop every recalculation of the key.
+        if sdata.is_backed():
+            key_paths = (
+                TableComponentPath("obsm", (feature_key,)),
+                TableComponentPath("uns", (_FEATURE_MATRICES_KEY, feature_key)),
+            )
+            if any(_component_paths_overlap(path, key_path) for path in dirty_paths for key_path in key_paths):
+                self._set_status(
+                    f'Feature extraction: feature matrix "{feature_key}" has unsaved changes; '
+                    "write or reload the table first.",
+                    kind="error",
+                )
+                return None
+
+        try:
+            return check_existing_feature_matrix(
+                sdata,
+                table_name=table_name,
+                feature_key=feature_key,
+                triplets=self._selected_triplets,
+                feature_names=self._selected_feature_names,
+            )
+        except (ValueError, TypeError, FileNotFoundError) as error:
+            self._set_status(f"Feature extraction: {error}", kind="error")
+            return None
+
+    def calculate(
+        self,
+        *,
+        overwrite_feature_key: bool = False,
+        confirmed_existing_entry: ExistingFeatureMatrixKind | None = None,
+        dirty_snapshot: TableDirtySnapshot | None = None,
+    ) -> bool:
+        """Launch feature extraction for the current bound inputs.
+
+        `confirmed_existing_entry` is the kind returned by
+        `check_existing_feature_matrix(...)`, which the worker checks again
+        before it removes or calculates anything. `dirty_snapshot`, the target
+        table's dirty state at launch, is carried back unchanged in the job's
+        results (`FeatureExtractionJob.dirty_snapshot`).
+        """
         if self._is_shutdown:
             return False
-        if self.is_running:
-            self._set_status("Feature extraction: calculation is already running.", kind="info")
+        if self.has_job_in_flight:
+            if self._job_detached:
+                self._set_status(_WAITING_FOR_DETACHED_JOB_STATUS, kind="info")
+            else:
+                self._set_status("Feature extraction: calculation is already running.", kind="info")
             return False
 
-        next_job_id = self._latest_requested_job_id + 1
         job = self._prepare_feature_extraction_job(
-            next_job_id,
+            self._last_job_id + 1,
             overwrite_feature_key=bool(overwrite_feature_key),
+            confirmed_existing_entry=confirmed_existing_entry,
+            dirty_snapshot=dirty_snapshot,
         )
         if job is None:
             return False
+        # Another job writes the table, for example a Spatial Query center
+        # calculation: harpy does not protect concurrent writers. The widget
+        # disables Calculate and says why.
+        busy_reasons = self._table_busy_marker.table_busy_reasons(job.sdata, job.table_name)
+        if busy_reasons:
+            self._set_status(format_table_busy_message(job.table_name, busy_reasons), kind="warning")
+            return False
 
-        self._latest_requested_job_id = job.job_id
+        if self._job is not None:  # pragma: no cover - the checks above return first
+            raise RuntimeError("Feature extraction can only run one job at a time.")
+        self._last_job_id = job.job_id
         worker = self._create_feature_extraction_worker(job)
-        self._active_worker = worker
-        self._active_worker_job_id = job.job_id
-        self._in_flight_jobs[job.job_id] = job
+        self._job = job
+        self._worker = worker
+        self._busy_mark = self._table_busy_marker.mark_table_busy(
+            job.sdata,
+            job.table_name,
+            reason="Feature Extraction is still writing its results. Try again once the calculation has finished.",
+        )
         worker.returned.connect(partial(self._on_worker_returned, job.job_id))
         worker.errored.connect(partial(self._on_worker_errored, job.job_id))
         worker.finished.connect(partial(self._on_worker_finished, job.job_id))
-        if job.triplet_count == 1:
-            labels_name = job.labels_names[0]
-            self._set_status(
-                f'Feature extraction: calculating "{job.feature_key}" for labels element "{labels_name}".',
-                kind="info",
-            )
-        else:
-            self._set_status(
-                f'Feature extraction: calculating "{job.feature_key}" for {job.triplet_count} extraction targets.',
-                kind="info",
-            )
+        self._set_calculating_status(job)
         try:
             worker.start()
         except Exception:
-            self._in_flight_jobs.pop(job.job_id, None)
-            self._active_worker = None
-            self._active_worker_job_id = None
+            self._clear_job()
             raise
         return True
-
-    def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Reject reload while an unfinished Harpy job can still write its table.
-
-        This check deliberately inspects every controller-owned in-flight job,
-        not only ``is_running`` or ``active_job_id``:
-
-        quit requested
-            → returned result is no longer accepted
-            → Harpy write may still be running
-            → keep its table target in ``_in_flight_jobs``
-            → block a matching Reload until ``finished``
-
-        The controller performs no AnnData mutation here. Raising stops the
-        shared reload before live table components are replaced; reusable
-        persistence controls present the message to the user.
-        """
-        if any(
-            job.sdata is request.sdata and job.table_name == request.table_name for job in self._in_flight_jobs.values()
-        ):
-            raise RuntimeError(
-                f'Cannot reload table "{request.table_name}" while Feature Extraction is still writing it. '
-                "Wait for Feature Extraction to finish and try again."
-            )
 
     def shutdown(self, *args: object) -> None:
         """Stop accepting results and detach callbacks owned by the Qt widget."""
@@ -501,53 +598,24 @@ class FeatureExtractionController:
             return
 
         self._is_shutdown = True
-        self._latest_requested_job_id += 1
-        self._cancel_active_worker()
+        # `quit()` cannot stop a running harpy call; it only suppresses
+        # `returned`. The job keeps writing the table, but its change is no
+        # longer published (the callbacks are cleared below), so app state does
+        # not record it. `finished` still fires, so the job still releases its
+        # busy mark.
+        if self._worker is not None:
+            self._worker.quit()
         self._on_state_changed = None
         self._on_table_selection_refresh_required = None
         self._on_feature_matrix_changed = None
-
-    def release_reload_participant_when_safe(self, release: Callable[[], None]) -> None:
-        """Release the detached reload participant after all Harpy calls finish."""
-        if self._release_reload_participant is not None:
-            raise RuntimeError("Feature Extraction reload-participant release is already pending.")
-        self._release_reload_participant = release
-        self._release_reload_participant_if_safe()
-
-    def _release_reload_participant_if_safe(self) -> None:
-        """Run the deferred app-state unregister after all Harpy jobs finish.
-
-        Widget destruction installs an unregister callback through
-        ``release_reload_participant_when_safe()``. Keep that callback pending
-        while any Feature Extraction job remains physically in flight so the
-        controller continues protecting its table from reload. The final
-        worker to finish consumes the callback exactly once.
-
-        This helper is called at both lifecycle boundaries because either one
-        may happen first:
-
-        worker already finished, then widget teardown
-            → the teardown call unregisters immediately
-
-        widget teardown while worker is still busy
-            → the teardown call leaves the unregister pending
-            → the final ``_on_worker_finished()`` call unregisters
-        """
-        if self._in_flight_jobs:
-            return
-
-        release = self._release_reload_participant
-        if release is None:
-            return
-
-        self._release_reload_participant = None
-        release()
 
     def _prepare_feature_extraction_job(
         self,
         job_id: int,
         *,
         overwrite_feature_key: bool,
+        confirmed_existing_entry: ExistingFeatureMatrixKind | None = None,
+        dirty_snapshot: TableDirtySnapshot | None = None,
     ) -> FeatureExtractionJob | None:
         if self._selected_spatialdata is None:
             self._set_status(FEATURE_EXTRACTION_IDLE_STATUS, kind="warning")
@@ -629,13 +697,13 @@ class FeatureExtractionController:
             feature_names=self._selected_feature_names,
             feature_key=self._selected_feature_key,
             overwrite_feature_key=overwrite_feature_key,
+            confirmed_existing_entry=confirmed_existing_entry,
         )
-        table = self._get_bound_table()
         return FeatureExtractionJob(
             job_id=job_id,
             sdata=self._selected_spatialdata,
             request=request,
-            change_kind=("updated" if table is not None and self._selected_feature_key in table.obsm else "created"),
+            dirty_snapshot=dirty_snapshot,
         )
 
     def _set_status(self, message: str, *, kind: str) -> None:
@@ -646,10 +714,10 @@ class FeatureExtractionController:
 
     def _notify_table_selection_refresh_required(self, result: FeatureExtractionResult) -> None:
         # Keep this local widget refresh hook separate from the shared
-        # table-state event. The owning widget uses the concrete result to
-        # refresh table choices and, after create-table writes, promote the new
-        # table into normal existing-table mode before downstream widgets
-        # consume the shared semantic event.
+        # table-state event. The owning widget refreshes its table choices and
+        # keeps the current selection, except that a created table that is still
+        # the create-table target is promoted to existing-table mode. This runs
+        # before downstream widgets consume the shared semantic event.
         if self._on_table_selection_refresh_required is not None:
             self._on_table_selection_refresh_required(result)
 
@@ -716,7 +784,11 @@ class FeatureExtractionController:
             )
             return
 
-        if self.is_running:
+        if self._job is not None:
+            # Keep the job's own status ("calculating …", or its result) while it
+            # matches the selection; explain the wait for a detached one.
+            if self._job_detached:
+                self._set_status(_WAITING_FOR_DETACHED_JOB_STATUS, kind="info")
             return
 
         if self._create_table and self._selected_table_name is not None:
@@ -728,26 +800,65 @@ class FeatureExtractionController:
 
         self._set_status("Feature extraction: ready to calculate.", kind="success")
 
-    def _cancel_pending_and_active_jobs(self) -> None:
-        self._cancel_active_worker()
+    def _set_calculating_status(self, job: FeatureExtractionJob) -> None:
+        if job.triplet_count == 1:
+            message = f'Feature extraction: calculating "{job.feature_key}" for labels element "{job.labels_names[0]}".'
+        else:
+            message = f'Feature extraction: calculating "{job.feature_key}" for {job.triplet_count} extraction targets.'
+        self._set_status(message, kind="info")
 
-    def _cancel_active_worker(self) -> None:
-        if self._active_worker is None:
-            return
+    @property
+    def _job_detached(self) -> bool:
+        """Return whether a job is in flight for another selection than the current one."""
+        job = self._job
+        return job is not None and not self._job_matches_selection(job)
 
-        self._active_worker.quit()
-        self._active_worker = None
-        self._active_worker_job_id = None
+    def _job_matches_selection(self, job: FeatureExtractionJob) -> bool:
+        """Return whether the current selection is the one `job` was launched for."""
+        request = job.request
+        same_mode = request.create_table == self._create_table
+        # Once a create-table job created its table, the widget promotes the
+        # selection from "create <table>" to the existing <table>: still this job.
+        promoted_after_creation = request.create_table and not self._create_table
+        return (
+            job.sdata is self._selected_spatialdata
+            and request.triplets == self._selected_triplets
+            and request.table_name == self._selected_table_name
+            and (same_mode or promoted_after_creation)
+            and request.feature_names == self._selected_feature_names
+            and request.feature_key == self._selected_feature_key
+        )
+
+    def _clear_job(self) -> None:
+        # Every end of a job comes here, so the table is never left busy.
+        self._job = None
+        self._worker = None
+        if self._busy_mark is not None:
+            self._table_busy_marker.release_table_busy(self._busy_mark)
+        self._busy_mark = None
+
+    def _job_for(self, job_id: int) -> FeatureExtractionJob | None:
+        """Return the job in flight if it has `job_id`; signals of other workers are ignored."""
+        job = self._job
+        return job if job is not None and job.job_id == job_id else None
 
     def _create_feature_extraction_worker(self, job: FeatureExtractionJob) -> Any:
         return _run_feature_extraction_job(job)
 
     def _on_worker_returned(self, job_id: int, result: FeatureExtractionResult) -> None:
-        if job_id != self._latest_requested_job_id or job_id != self._active_worker_job_id:
+        # `returned` fires before `finished`, so the job is still in flight.
+        job = self._job_for(job_id)
+        if self._is_shutdown or job is None or job.sdata is not self._selected_spatialdata:
             return
 
+        # Any job may have created its table, also a detached one, so the widget
+        # refreshes its table choices (see `_notify_table_selection_refresh_required`).
         self._notify_table_selection_refresh_required(result)
         self._notify_feature_matrix_changed(result)
+        if self._job_detached:
+            # The status follows the current selection, not this job.
+            return
+
         self._set_status(
             "Feature extraction: "
             f'wrote "{result.feature_key}" into table "{result.table_name}" as '
@@ -757,23 +868,45 @@ class FeatureExtractionController:
         )
 
     def _on_worker_errored(self, job_id: int, error: Exception) -> None:
-        if job_id != self._latest_requested_job_id or job_id != self._active_worker_job_id:
+        job = self._job_for(job_id)
+        if self._is_shutdown or job is None or job.sdata is not self._selected_spatialdata:
             return
 
-        self._set_status(f"Feature extraction: calculation failed: {error}", kind="error")
+        if isinstance(error, FeatureMatrixRemovedError):
+            # The previous matrix is gone, also for a detached job: publish it.
+            self._notify_feature_matrix_changed(
+                FeatureExtractionResult(
+                    job_id=job_id,
+                    labels_names=job.labels_names,
+                    table_name=error.table_name,
+                    feature_key=error.feature_key,
+                    regions=error.regions,
+                    change_kind="removed",
+                    dirty_snapshot=job.dirty_snapshot,
+                )
+            )
+            if not self._job_detached:
+                # The message already starts with "Feature extraction failed".
+                self._set_status(str(error), kind="error")
+            return
+
+        if not self._job_detached:
+            self._set_status(f"Feature extraction: calculation failed: {error}", kind="error")
 
     def _on_worker_finished(self, job_id: int) -> None:
-        # Remove reload protection for every finished job, including one whose
-        # result was cancelled or superseded and is no longer the active job.
-        self._in_flight_jobs.pop(job_id, None)
-
-        if job_id == self._active_worker_job_id:
-            self._active_worker = None
-            self._active_worker_job_id = None
-            if self._on_state_changed is not None:
+        # Clearing the job releases the table's busy mark (`_clear_job()`), also
+        # when the job was detached and is no longer the active job, or the
+        # widget has closed.
+        if self._job_for(job_id) is not None:
+            was_detached = self._job_detached
+            self._clear_job()
+            if was_detached and not self._is_shutdown:
+                # The status still says "waiting for the previous calculation"; show
+                # the current selection's status instead, now that Calculate is
+                # available again.
+                self._update_idle_status()
+            elif self._on_state_changed is not None:
                 self._on_state_changed()
-
-        self._release_reload_participant_if_safe()
 
     def _get_bound_table(self) -> AnnData | None:
         if self._selected_spatialdata is None or self._selected_table_name is None or self._create_table:
@@ -840,6 +973,13 @@ def _get_feature_key_validation_error(feature_key: str | None) -> str | None:
 
     try:
         normalize_spatialdata_name(feature_key, "feature matrix key")
+        validate_feature_key_not_reserved(feature_key)
     except ValueError as error:
         return f"Feature extraction: choose a valid feature matrix key. {error}"
     return None
+
+
+def _component_paths_overlap(first: TableComponentPath, second: TableComponentPath) -> bool:
+    """Return whether the paths are equal, or one contains the other."""
+    shared = min(len(first.keys), len(second.keys))
+    return first.component == second.component and first.keys[:shared] == second.keys[:shared]

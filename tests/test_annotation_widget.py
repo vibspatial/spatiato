@@ -245,21 +245,21 @@ def test_annotation_widget_refreshes_when_shared_sdata_changes(
     assert widget._test_parent.spatial_query.selected_coordinate_system == "global"
 
 
-def test_annotation_widget_shapes_context_updates_reuse_spatial_query_cache_inspection(
+def test_annotation_widget_shapes_context_updates_reuse_spatial_query_centers_status(
     qtbot,
     monkeypatch,
     sdata_blobs: SpatialData,
 ) -> None:
-    """Shapes-target and dirty-state updates must not repeat table digest inspection."""
+    """Shapes-target and dirty-state updates must not check the canonical centers again, which reads the matrix."""
     inspection_count = 0
-    real_inspect = spatial_query_widget_module.inspect_canonical_cache
+    real_status = spatial_query_widget_module.canonical_centers_status
 
     def record_inspection(*args, **kwargs):
         nonlocal inspection_count
         inspection_count += 1
-        return real_inspect(*args, **kwargs)
+        return real_status(*args, **kwargs)
 
-    monkeypatch.setattr(spatial_query_widget_module, "inspect_canonical_cache", record_inspection)
+    monkeypatch.setattr(spatial_query_widget_module, "canonical_centers_status", record_inspection)
     viewer = DummyViewer()
     app_state = get_or_create_app_state(viewer)
     app_state.set_sdata(sdata_blobs)
@@ -278,14 +278,14 @@ def test_annotation_widget_shapes_context_updates_reuse_spatial_query_cache_insp
     spatial_query.annotation_value_edit.setText("tumor")
 
     assert inspection_count == 1
-    cache_report = spatial_query.cache_report
+    centers_status = spatial_query.centers_status
     selected_labels_name = spatial_query.selected_labels_name
     selected_table_name = spatial_query.selected_table_name
 
     parent.shapes_combo.setCurrentIndex(_combo_index_for_text(parent.shapes_combo, "blobs_polygons"))
 
     assert inspection_count == 1
-    assert spatial_query.cache_report is cache_report
+    assert spatial_query.centers_status is centers_status
     assert spatial_query.selected_labels_name == selected_labels_name
     assert spatial_query.selected_table_name == selected_table_name
     assert spatial_query.run_button.isEnabled() is True
@@ -295,7 +295,7 @@ def test_annotation_widget_shapes_context_updates_reuse_spatial_query_cache_insp
     assert parent.annotation_context.has_unsaved_shapes_changes is True
     assert spatial_query.annotation_context is parent.annotation_context
     assert inspection_count == 1
-    assert spatial_query.cache_report is cache_report
+    assert spatial_query.centers_status is centers_status
     assert spatial_query.run_button.isEnabled() is False
 
     parent.shapes_annotation.edit_session_dirty_changed.emit(False)
@@ -403,7 +403,7 @@ def test_annotation_widget_coordinate_change_updates_app_state_and_clears_spatia
         "global",
     )
     assert selected_layer is not None
-    assert spatial_query.cache_report is not None
+    assert spatial_query.centers_status is not None
 
     widget._test_parent.coordinate_system_combo.setCurrentIndex(1)
 
@@ -412,7 +412,7 @@ def test_annotation_widget_coordinate_change_updates_app_state_and_clears_spatia
     assert selected_layer not in viewer.layers
     assert spatial_query.selected_labels_name is None
     assert spatial_query.selected_table_name is None
-    assert spatial_query.cache_report is None
+    assert spatial_query.centers_status is None
     assert spatial_query.run_button.isEnabled() is False
 
 
@@ -679,8 +679,8 @@ def test_annotation_widget_clean_saved_target_change_keeps_saved_layer_without_w
     spatial_query.labels_combo.setCurrentIndex(labels_index)
     spatial_query.new_column_edit.setText("reviewed_annotation")
     spatial_query.annotation_value_edit.setText("tumor")
-    spatial_query_cache_report = spatial_query.cache_report
-    assert spatial_query_cache_report is not None
+    spatial_query_centers_status = spatial_query.centers_status
+    assert spatial_query_centers_status is not None
     widget.create_layer_button.click()
     saved_layer = widget._annotation_layer
     assert saved_layer is not None
@@ -689,7 +689,7 @@ def test_annotation_widget_clean_saved_target_change_keeps_saved_layer_without_w
 
     assert widget._test_parent.annotation_context.saved_shapes_name == "new_regions"
     assert widget._test_parent.spatial_query.annotation_context is widget._test_parent.annotation_context
-    assert widget._test_parent.spatial_query.cache_report is spatial_query_cache_report
+    assert widget._test_parent.spatial_query.centers_status is spatial_query_centers_status
     assert widget._test_parent.spatial_query.run_button.isEnabled() is True
 
     def fail_if_confirmed(*, reason: str) -> bool:

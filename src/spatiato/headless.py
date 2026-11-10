@@ -1,24 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
 
 from spatiato.core.feature_extraction import (
     FeatureExtractionTriplet,
     _normalize_triplets,
     _requires_image,
-    _resolve_harpy_coordinate_system_parameter,
-    _resolve_harpy_image_name_parameter,
-    _resolve_harpy_labels_name_parameter,
+    calculate_feature_matrix,
 )
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND
 from spatiato.core.object_classification.annotation import USER_CLASS_COLORS_KEY
 from spatiato.core.object_classification.classifier import (
-    CLASSIFIER_APPLY_CONFIG_KEY,
     CLASSIFIER_CONFIG_KEY,
     ClassifierApplyResult,
     _validate_feature_matrix_compatible_with_bundle,
@@ -28,12 +23,13 @@ from spatiato.core.object_classification.classifier_export import (
     ClassifierExportBundle,
     read_classifier_export_bundle,
 )
-from spatiato.core.persistence import write_table_prediction_state
+from spatiato.core.persistence import TableComponentPath, persist_table_components
 from spatiato.core.spatialdata import _get_element_coordinate_systems, get_table
 from spatiato.core.validation import normalize_spatialdata_name
 
 if TYPE_CHECKING:
     from spatialdata import SpatialData
+
 
 @dataclass(frozen=True)
 class HeadlessFeatureTarget:
@@ -61,6 +57,14 @@ def compute_features_for_classifier(
     Intensity-channel selection is read from the classifier's exported
     `source_channels` feature metadata so the computed matrix preserves the
     training schema.
+
+    An existing `table.obsm[target.feature_key]` raises unless
+    `target.overwrite_feature_key` is set. Then a matrix harpy calculated with
+    the same features and channels is updated for the target labels elements
+    only, keeping the values of other labels elements. Any other matrix is
+    removed with its metadata and calculated again, so the values of other
+    labels elements are lost, and a warning names them. If `sdata` is backed
+    by zarr, the stored matrix decides, not unsaved changes in memory.
     """
     if classifier.source_kind == CUSTOM_OBSM_SOURCE_KIND:
         raise ValueError(
@@ -74,19 +78,13 @@ def compute_features_for_classifier(
     feature_names = classifier.feature_names
     source_channels = _resolve_classifier_source_channels(classifier)
 
-    import harpy as hp
-
-    hp.tb.add_feature_matrix(
-        sdata=sdata,
-        labels_name=_resolve_harpy_labels_name_parameter(resolved_target.triplets),
-        image_name=_resolve_harpy_image_name_parameter(resolved_target.triplets, feature_names),
+    calculate_feature_matrix(
+        sdata,
         table_name=resolved_target.table_name,
         feature_key=resolved_target.feature_key,
-        features=list(feature_names),
-        channels=None if source_channels is None else list(source_channels),
-        feature_matrices_key=_FEATURE_MATRICES_KEY,
+        triplets=tuple(replace(triplet, channels=source_channels) for triplet in resolved_target.triplets),
+        feature_names=feature_names,
         overwrite_feature_key=resolved_target.overwrite_feature_key,
-        to_coordinate_system=_resolve_harpy_coordinate_system_parameter(resolved_target.triplets),
     )
 
     table = get_table(sdata, resolved_target.table_name)
@@ -102,17 +100,24 @@ def apply_classifier(
     feature_key: str | None = None,
     prediction_regions: Sequence[str] | None = None,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
     classifier_path: str | Path | None = None,
 ) -> ClassifierApplyResult:
     """Apply an exported classifier to an existing feature matrix.
 
     The target table must already contain a compatible feature matrix in
     `.obsm`. When `feature_key` is omitted, the source feature key stored in the
-    classifier is used. Predictions are written in place to `table.obs` using
-    `pred_class_column` and `pred_confidence_column`, and apply provenance is
-    recorded in `table.uns["classifier_apply_config"]`. If `sdata` is backed by
+    classifier is used. Predictions are written in place to `table.obs`: the
+    classes to `pred_class_column`, and their confidences to
+    `f"{pred_class_column}_confidence"`. How they were made is recorded in
+    `table.uns["classifier_config"][pred_class_column]`. That
+    entry replaces the one of whoever wrote the column before; for the default
+    `pred_class`, that may be the Object Classification widget, which then
+    has no model of its own for these predictions. If `sdata` is backed by
     zarr, the updated prediction state is written back to disk automatically.
+
+    The Object Classification widget is not notified when this function
+    changes the SpatialData object it shows. If that object is backed by a
+    zarr store, click Reload in the widget to show the new predictions.
 
     Parameters
     ----------
@@ -130,12 +135,11 @@ def apply_classifier(
         Optional table regions to classify. If omitted, all regions declared in
         the table metadata are classified.
     pred_class_column
-        Column in `table.obs` that will receive predicted class labels.
-    pred_confidence_column
-        Column in `table.obs` that will receive prediction confidences.
+        Column in `table.obs` that will receive predicted class labels. The
+        prediction confidences go to `f"{pred_class_column}_confidence"`.
     classifier_path
-        Optional artifact path to record in `classifier_apply_config`; this
-        does not affect prediction.
+        Optional artifact path to record in the `classifier_config` entry;
+        this does not affect prediction.
 
     The returned `ClassifierApplyResult` summarizes the rows that were written
     and any in-scope rows skipped because of invalid feature values.
@@ -147,7 +151,6 @@ def apply_classifier(
         feature_key=feature_key,
         prediction_regions=prediction_regions,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=classifier_path,
     )
     _write_backed_prediction_state_if_needed(sdata, result)
@@ -162,14 +165,13 @@ def apply_classifier_from_path(
     feature_key: str | None = None,
     prediction_regions: Sequence[str] | None = None,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
 ) -> ClassifierApplyResult:
     """Load a classifier artifact from disk and apply it to an existing feature matrix.
 
     This is a convenience wrapper around `load_classifier(...)` and
     `apply_classifier(...)`. The artifact path is passed through as
     `classifier_path`, so it is recorded in
-    `table.uns["classifier_apply_config"]`.
+    `table.uns["classifier_config"][pred_class_column]`.
     """
     classifier = load_classifier(path)
     return apply_classifier(
@@ -179,7 +181,6 @@ def apply_classifier_from_path(
         feature_key=feature_key,
         prediction_regions=prediction_regions,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=path,
     )
 
@@ -195,7 +196,6 @@ def apply_classifier_with_feature_extraction(
     image_name: str | Sequence[str] | None = None,
     overwrite_feature_key: bool = False,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
     classifier_path: str | Path | None = None,
 ) -> ClassifierApplyResult:
     """Compute the classifier feature matrix on a target dataset, then apply it.
@@ -211,7 +211,7 @@ def apply_classifier_with_feature_extraction(
 
     If `sdata` is backed by zarr, Harpy persists the feature matrix and feature
     metadata during feature extraction, and `apply_classifier(...)` persists
-    the prediction columns and classifier apply metadata.
+    the prediction columns and their `classifier_config` entry.
 
     Parameters
     ----------
@@ -237,14 +237,19 @@ def apply_classifier_with_feature_extraction(
         required when the classifier was trained on intensity features
         and ignored for morphology-only classifiers.
     overwrite_feature_key
-        Whether to replace an existing `table.obsm[feature_key]`.
+        Whether an existing `table.obsm[feature_key]` may be replaced. A matrix
+        harpy calculated with the same features and channels is updated for
+        `labels_name` only, keeping the values of other labels elements. Any
+        other matrix is removed with its metadata and calculated again, so the
+        values of other labels elements are lost, and a warning names them. If
+        `sdata` is backed by zarr, the stored matrix decides, not unsaved
+        changes in memory.
     pred_class_column
-        Column in `table.obs` that will receive predicted class labels.
-    pred_confidence_column
-        Column in `table.obs` that will receive prediction confidences.
+        Column in `table.obs` that will receive predicted class labels. The
+        prediction confidences go to `f"{pred_class_column}_confidence"`.
     classifier_path
-        Optional artifact path to record in `classifier_apply_config`; this
-        does not affect feature extraction or prediction.
+        Optional artifact path to record in the `classifier_config` entry;
+        this does not affect feature extraction or prediction.
 
     The returned `ClassifierApplyResult` summarizes the rows that were written
     and any in-scope rows skipped because of invalid feature values.
@@ -267,7 +272,6 @@ def apply_classifier_with_feature_extraction(
         feature_key=resolved_target.feature_key,
         prediction_regions=tuple(triplet.labels_name for triplet in resolved_target.triplets),
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=classifier_path,
     )
 
@@ -283,14 +287,13 @@ def apply_classifier_with_feature_extraction_from_path(
     image_name: str | Sequence[str] | None = None,
     overwrite_feature_key: bool = False,
     pred_class_column: str = "pred_class",
-    pred_confidence_column: str = "pred_confidence",
 ) -> ClassifierApplyResult:
     """Load a classifier artifact, compute target features, and apply it.
 
     This is a convenience wrapper around `load_classifier(...)` and
     `apply_classifier_with_feature_extraction(...)`. The artifact path is
     passed through as `classifier_path`, so it is recorded in
-    `table.uns["classifier_apply_config"]`.
+    `table.uns["classifier_config"][pred_class_column]`.
 
     Parameters
     ----------
@@ -315,11 +318,16 @@ def apply_classifier_with_feature_extraction_from_path(
         required when the classifier was trained on intensity features
         and ignored for morphology-only classifiers.
     overwrite_feature_key
-        Whether to replace an existing `table.obsm[feature_key]`.
+        Whether an existing `table.obsm[feature_key]` may be replaced. A matrix
+        harpy calculated with the same features and channels is updated for
+        `labels_name` only, keeping the values of other labels elements. Any
+        other matrix is removed with its metadata and calculated again, so the
+        values of other labels elements are lost, and a warning names them. If
+        `sdata` is backed by zarr, the stored matrix decides, not unsaved
+        changes in memory.
     pred_class_column
-        Column in `table.obs` that will receive predicted class labels.
-    pred_confidence_column
-        Column in `table.obs` that will receive prediction confidences.
+        Column in `table.obs` that will receive predicted class labels. The
+        prediction confidences go to `f"{pred_class_column}_confidence"`.
 
     The returned `ClassifierApplyResult` summarizes the rows that were written
     and any in-scope rows skipped because of invalid feature values.
@@ -335,7 +343,6 @@ def apply_classifier_with_feature_extraction_from_path(
         image_name=image_name,
         overwrite_feature_key=overwrite_feature_key,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
         classifier_path=path,
     )
 
@@ -522,13 +529,11 @@ def _write_backed_prediction_state_if_needed(sdata: SpatialData, result: Classif
     if not sdata.is_backed() or sdata.path is None:
         return
 
-    write_table_prediction_state(
-        sdata,
-        table_name=result.table_name,
-        uns_keys=(
-            USER_CLASS_COLORS_KEY,
-            f"{result.pred_class_column}_colors",
-            CLASSIFIER_CONFIG_KEY,
-            CLASSIFIER_APPLY_CONFIG_KEY,
-        ),
-    )
+    # Any `obs` path writes the whole `obs`, so one covers both prediction
+    # columns. Only the `uns` keys in memory are listed: a missing one would be
+    # deleted from the store.
+    table = get_table(sdata, result.table_name)
+    uns_keys = (USER_CLASS_COLORS_KEY, f"{result.pred_class_column}_colors", CLASSIFIER_CONFIG_KEY)
+    paths = {TableComponentPath("obs", (result.pred_class_column,))}
+    paths.update(TableComponentPath("uns", (key,)) for key in uns_keys if key in table.uns)
+    persist_table_components(sdata, table_name=result.table_name, paths=frozenset(paths))

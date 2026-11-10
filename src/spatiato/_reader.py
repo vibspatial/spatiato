@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import napari
-from spatialdata import read_zarr
+from harpy.io import read_zarr
 
 from spatiato._app_state import get_or_create_app_state
 from spatiato.widgets.spatialdata_replacement_dialog import confirm_spatialdata_replacement
@@ -45,6 +45,8 @@ def _read_spatialdata_store(path: PathOrPaths) -> list[LayerData]:
     if app_state.sdata is not None and not confirm_spatialdata_replacement():
         return [(None,)]
 
+    # harpy's reader opens every table matrix lazily, as Dask arrays that read
+    # from the store; `obs`, `var` and `uns` are read into memory.
     sdata = read_zarr(candidate)
     app_state.set_sdata(sdata, discard_current=True)
     _ensure_spatiato_widgets(viewer)

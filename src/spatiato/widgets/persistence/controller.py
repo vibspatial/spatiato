@@ -9,14 +9,15 @@ from spatiato._app_state import (
     SpatiatoAppState,
     TableReloadRequest,
     TableStateChangedEvent,
+    format_table_busy_message,
 )
 from spatiato.core.persistence import (
     TableComponentPath,
     TableComponentReloadResult,
     build_full_table_reload_paths,
+    persist_table_components,
     reload_table_components,
     resolve_table_path,
-    write_table_components,
 )
 from spatiato.core.spatialdata import get_table, get_table_metadata
 
@@ -59,6 +60,14 @@ class PersistenceController:
         return self._app_state.is_table_dirty(self._selected_spatialdata, self._selected_table_name)
 
     @property
+    def table_busy_message(self) -> str | None:
+        """Return why the selected table can be neither written nor reloaded now, or `None`."""
+        reasons = self._app_state.table_busy_reasons(self._selected_spatialdata, self._selected_table_name)
+        if not reasons or self._selected_table_name is None:
+            return None
+        return format_table_busy_message(self._selected_table_name, reasons)
+
+    @property
     def selected_store_path(self) -> Path | None:
         """Return the backed zarr path for the current SpatialData selection."""
         if self._selected_spatialdata is None or self._selected_spatialdata.path is None:
@@ -84,13 +93,20 @@ class PersistenceController:
         self._selected_table_name = table_name
 
     def write_table_state(self) -> str:
-        """Persist the selected table's captured dirty components."""
+        """Persist the selected table's captured dirty components, and return its path in the store.
+
+        A table without unsaved changes is left as it is. Raises
+        `TableBusyError`, and writes nothing, when the table is busy: another
+        job, for example a Feature Extraction calculation, is still writing it.
+        """
         sdata = self._require_selected_spatialdata()
         table_name = self._require_selected_table_name()
+        self._app_state.require_table_not_busy(sdata, table_name)
         snapshot = self._app_state.snapshot_table_dirty_state(sdata, table_name)
         if not snapshot.paths:
-            raise ValueError(f"Table `{table_name}` has no unsynced components to write.")
-        result = write_table_components(
+            # Nothing to write: the store already has every recorded change.
+            return self._resolve_table_path(sdata, get_table(sdata, table_name), table_name)
+        result = persist_table_components(
             sdata,
             table_name=table_name,
             paths=snapshot.paths,

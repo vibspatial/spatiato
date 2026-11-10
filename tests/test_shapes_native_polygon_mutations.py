@@ -45,8 +45,8 @@ def test_native_direct_first_next_runs_press_setup_and_yields_before_polygon_mut
 ) -> None:
     """Verify that the first ``next(...)`` runs only mouse-press setup.
 
-    It identifies raw vertex 39, initializes drag and selection/highlight
-    state, and then yields. It does not move polygon data, call
+    It identifies raw vertex 39, initializes drag and selection state, and
+    then yields. It does not move polygon data, call
     ``_data_view.edit(...)``, triangulate, mark the layer as moving, or emit a
     data-change event. Spatiato's edit guard depends on this yield boundary to
     reuse napari's press setup while retaining control before napari mutates or
@@ -55,7 +55,6 @@ def test_native_direct_first_next_runs_press_setup_and_yields_before_polygon_mut
     layer = _make_direct_regression_layer()
     before_press = np.asarray(layer.data[0], dtype=float).copy()
     data_actions: list[ActionType] = []
-    highlight_calls = 0
 
     layer.events.data.connect(lambda event: data_actions.append(event.action))
     monkeypatch.setattr(
@@ -63,15 +62,6 @@ def test_native_direct_first_next_runs_press_setup_and_yields_before_polygon_mut
         "get_value",
         lambda position, world=True: (0, TRIANGULATION_REGRESSION_MOVED_VERTEX_INDEX),
     )
-
-    original_set_highlight = layer._set_highlight
-
-    def record_highlight(*args: object, **kwargs: object) -> None:
-        nonlocal highlight_calls
-        highlight_calls += 1
-        original_set_highlight(*args, **kwargs)
-
-    monkeypatch.setattr(layer, "_set_highlight", record_highlight)
 
     def fail_edit(*args: object, **kwargs: object) -> None:
         raise AssertionError("The first native direct yield must occur before `_data_view.edit(...)`.")
@@ -96,7 +86,6 @@ def test_native_direct_first_next_runs_press_setup_and_yields_before_polygon_mut
         assert layer._moving_value == (0, TRIANGULATION_REGRESSION_MOVED_VERTEX_INDEX)
         assert layer._drag_start is not None
         assert layer.selected_data == {0}
-        assert highlight_calls == 1
         assert np.array_equal(np.asarray(layer.data[0], dtype=float), before_press)
         assert layer._is_moving is False
         assert data_actions == []

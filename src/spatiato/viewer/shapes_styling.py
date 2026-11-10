@@ -16,6 +16,7 @@ from spatiato.core._color_source import (
     ShapeColorValueKind,
     ShapeColumnColorSourceSpec,
     TableColorSourceSpec,
+    format_var_matrix,
     validate_shape_color_value_kind,
 )
 from spatiato.core.class_palette import (
@@ -23,7 +24,8 @@ from spatiato.core.class_palette import (
     resolve_table_categorical_palette,
     validate_categorical_palette_source,
 )
-from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata
+from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata, get_table_var_matrix
+from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
     build_string_categorical_values,
     categorical_rgba_for_values,
@@ -31,6 +33,7 @@ from spatiato.viewer._styling import (
     default_categorical_palette_for_categories,
     is_string_like_series,
     normalize_category_value,
+    zeros_mean_not_detected,
 )
 
 if TYPE_CHECKING:
@@ -263,6 +266,7 @@ def apply_table_color_source_to_shapes_layer(
         source_row_id_by_rendered_row=source_row_id_by_rendered_row,
     )
 
+    not_detected_rows = None
     if style_spec.value_kind == "instance" or (
         style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key
     ):
@@ -278,10 +282,12 @@ def apply_table_color_source_to_shapes_layer(
             aligned_values=aligned_values,
             column_name=style_spec.value_key,
         )
-    elif style_spec.source_kind == "x_var":
+    elif style_spec.source_kind == "var":
         style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(
             aligned_values.rendered_row_values
         )
+        if zeros_mean_not_detected(feature_values):
+            not_detected_rows = (feature_values == 0.0).to_numpy(dtype=bool)
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
 
@@ -297,6 +303,7 @@ def apply_table_color_source_to_shapes_layer(
             layer,
             rendered_row_colors,
             rendered_row_has_table_row=aligned_values.rendered_row_has_table_row,
+            not_detected_rows=not_detected_rows,
             fill=fill,
         )
     elif isinstance(layer, Points):
@@ -304,6 +311,7 @@ def apply_table_color_source_to_shapes_layer(
             layer,
             rendered_row_colors,
             rendered_row_has_table_row=aligned_values.rendered_row_has_table_row,
+            not_detected_rows=not_detected_rows,
         )
     else:  # pragma: no cover - defensive for future layer subclasses.
         raise TypeError(f"Unsupported styled shapes layer type: {type(layer)!r}.")
@@ -321,11 +329,7 @@ def build_styled_shapes_layer_name(
     style_spec: ShapeColumnColorSourceSpec | TableColorSourceSpec,
 ) -> str:
     """Return the user-facing layer name for one styled shapes variant."""
-    if style_spec.source_kind == "obs_column":
-        return f"{shapes_name}[obs:{style_spec.value_key}]"
-    if style_spec.source_kind == "x_var":
-        return f"{shapes_name}[X:{style_spec.value_key}]"
-    return f"{shapes_name}[shapes_column:{style_spec.value_key}]"
+    return f"{shapes_name}[{style_spec.source_label}]"
 
 
 def _validate_source_row_id_by_rendered_row(
@@ -555,7 +559,7 @@ def _get_table_color_values_by_instance(
         if style_spec.value_key not in table.obs:
             raise ValueError(f"Observation column `{style_spec.value_key}` is not available in the selected table.")
         values = region_rows[style_spec.value_key]
-    elif style_spec.source_kind == "x_var":
+    elif style_spec.source_kind == "var":
         var_name = style_spec.value_key
         if var_name not in table.var_names:
             raise ValueError(f"Var `{var_name}` is not available in the selected table.")
@@ -564,16 +568,16 @@ def _get_table_color_values_by_instance(
         if not isinstance(var_index, (int, np.integer)):
             raise ValueError(f"Var `{var_name}` does not resolve to one unique column in `table.var_names`.")
 
+        matrix = get_table_var_matrix(table, style_spec.var_layer)
         obs_positions = table.obs.index.get_indexer(region_rows.index)
         if np.any(obs_positions < 0):
-            raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
+            raise ValueError(
+                f"Could not align linked table rows back to `{format_var_matrix(style_spec.var_layer)}[:, {var_name!r}]` "
+                "for viewer coloring."
+            )
 
-        column_values = table.X[obs_positions, int(var_index)]
-        if hasattr(column_values, "toarray"):
-            x_values = column_values.toarray().reshape(-1)
-        else:
-            x_values = np.asarray(column_values).reshape(-1)
-        values = pd.Series(x_values, index=region_rows.index, name=var_name)
+        var_values = read_matrix_column(matrix, int(var_index), rows=obs_positions)
+        values = pd.Series(var_values, index=region_rows.index, name=var_name)
     else:
         raise ValueError(f"Unsupported table color source kind `{style_spec.source_kind}`.")
 
@@ -1017,8 +1021,14 @@ def _apply_table_rendered_row_colors_to_shapes_layer(
     rendered_row_colors: np.ndarray,
     *,
     rendered_row_has_table_row: np.ndarray,
+    not_detected_rows: np.ndarray | None = None,
     fill: bool = False,
 ) -> None:
+    """Apply table-backed row colors to a Shapes layer.
+
+    Shapes without a table row, and rows in `not_detected_rows` (exact zeros
+    of a non-negative `var` column), are drawn fully transparent.
+    """
     if len(rendered_row_has_table_row) != len(layer.data):
         raise ValueError("Rendered-row table coverage must contain one value for each rendered napari shape row.")
 
@@ -1038,9 +1048,11 @@ def _apply_table_rendered_row_colors_to_shapes_layer(
     # appear as missing in `rendered_row_values`, so color builders map both to
     # gray. Use the table-row coverage mask to keep missing table values gray
     # while making shapes with no table row fully transparent.
-    unannotated_rows = ~rendered_row_has_table_row
-    face_color[unannotated_rows, 3] = 0.0
-    edge_color[unannotated_rows, 3] = 0.0
+    hidden_rows = ~rendered_row_has_table_row
+    if not_detected_rows is not None:
+        hidden_rows = hidden_rows | not_detected_rows
+    face_color[hidden_rows, 3] = 0.0
+    edge_color[hidden_rows, 3] = 0.0
     layer.face_color = face_color
     layer.edge_color = edge_color
     refresh = getattr(layer, "refresh", None)
@@ -1053,7 +1065,13 @@ def _apply_table_rendered_row_colors_to_points_layer(
     rendered_row_colors: np.ndarray,
     *,
     rendered_row_has_table_row: np.ndarray,
+    not_detected_rows: np.ndarray | None = None,
 ) -> None:
+    """Apply table-backed row colors to a Points layer of point-radius shapes.
+
+    Points without a table row, and rows in `not_detected_rows` (exact zeros
+    of a non-negative `var` column), are drawn fully transparent.
+    """
     if len(rendered_row_has_table_row) != len(layer.data):
         raise ValueError("Rendered-row table coverage must contain one value for each rendered napari point row.")
 
@@ -1066,7 +1084,10 @@ def _apply_table_rendered_row_colors_to_points_layer(
     # Keep the same distinction as table-backed Shapes layers: annotated rows
     # with missing selected values stay gray, while points with no table row are
     # transparent.
-    colors[~rendered_row_has_table_row, 3] = 0.0
+    hidden_rows = ~rendered_row_has_table_row
+    if not_detected_rows is not None:
+        hidden_rows = hidden_rows | not_detected_rows
+    colors[hidden_rows, 3] = 0.0
     layer.face_color = colors
     layer.border_color = colors
     layer.border_width = 0

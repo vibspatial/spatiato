@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 
 import anndata as ad
@@ -1873,7 +1874,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_creates_registered_overlay_w
     assert result.palette_source == "stored"
     assert result.coercion_applied is False
     assert result.layer in viewer.layers
-    assert result.layer.name == "blobs_labels[obs:cell_type]"
+    assert result.layer.name == "blobs_labels[obs: cell_type]"
     assert isinstance(result.layer.colormap, CompactLabelColormap)
     binding = adapter.layer_bindings.get_binding(result.layer)
     assert isinstance(binding, LabelsLayerBinding)
@@ -1891,9 +1892,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_creates_registered_overlay_w
     assert odd_feature_row["index"] == odd_instance
     assert odd_feature_row["instance_id"] == odd_instance
     assert np.allclose(result.layer.colormap.map(odd_instance), np.asarray(to_rgba("#ff0000"), dtype=np.float32))
-    assert np.allclose(
-        result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32)
-    )
+    assert np.allclose(result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdata_blobs) -> None:
@@ -1901,7 +1900,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdat
     adapter = ViewerAdapter(viewer)
     style_spec = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="channel_0_sum",
         value_kind="continuous",
     )
@@ -1914,29 +1913,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdat
     assert second.created is False
     assert second.value_kind == "continuous"
     assert len(viewer.layers) == 1
-
-
-def test_viewer_adapter_ensure_styled_labels_loaded_force_syncs_after_recolor(
-    monkeypatch: pytest.MonkeyPatch,
-    sdata_blobs,
-) -> None:
-    viewer = DummyViewer()
-    adapter = ViewerAdapter(viewer)
-    sync_calls: list[Labels] = []
-    style_spec = TableColorSourceSpec(
-        table_name="table",
-        source_kind="x_var",
-        value_key="channel_0_sum",
-        value_kind="continuous",
-    )
-
-    monkeypatch.setattr(adapter, "sync_labels_display_after_colormap_change", sync_calls.append)
-
-    first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
-    second = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
-
-    assert first.layer is second.layer
-    assert sync_calls == [first.layer, first.layer]
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_updates_reused_variant_from_current_table(
@@ -1994,7 +1970,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_creates_distinct_variants_fo
     )
     style_b = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="channel_0_sum",
         value_kind="continuous",
     )
@@ -2059,9 +2035,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_bool_obs_categoricall
     assert features.loc[odd_instance, "is_even"] == np.False_
     assert features.loc[even_instance, "is_even"] == np.True_
     assert np.allclose(result.layer.colormap.map(odd_instance), np.asarray(to_rgba("#ff0000"), dtype=np.float32))
-    assert np.allclose(
-        result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32)
-    )
+    assert np.allclose(result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_colors_binary_int_obs_categorically(sdata_blobs) -> None:
@@ -2096,6 +2070,27 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_binary_int_obs_catego
     assert np.allclose(result.layer.colormap.map(one_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
 
 
+def test_viewer_adapter_ensure_styled_labels_loaded_colors_a_single_value_int_obs_continuously(sdata_blobs) -> None:
+    # Only exactly {0, 1} is binary: an integer column of only 1s is continuous,
+    # as discovery lists it and as shapes styling colors it.
+    table = sdata_blobs["table"]
+    table.obs["all_ones"] = pd.Series(1, index=table.obs.index, dtype="int64")
+
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="obs_column",
+        value_key="all_ones",
+        value_kind="continuous",
+    )
+
+    result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+
+    assert result.value_kind == "continuous"
+    assert result.palette_source is None
+
+
 def test_viewer_adapter_ensure_styled_labels_loaded_colors_non_binary_int_obs_continuously(sdata_blobs) -> None:
     table = sdata_blobs["table"]
     table.obs["object_score"] = pd.Series(
@@ -2124,9 +2119,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_non_binary_int_obs_co
     assert float(features.loc[min_instance, "object_score"]) == float(min_instance)
     assert float(features.loc[max_instance, "object_score"]) == float(max_instance)
     assert isinstance(result.layer.colormap, CompactLabelColormap)
-    assert not np.allclose(
-        result.layer.colormap.map(min_instance), result.layer.colormap.map(max_instance)
-    )
+    assert not np.allclose(result.layer.colormap.map(min_instance), result.layer.colormap.map(max_instance))
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_colors_instance_key_as_labels(sdata_blobs) -> None:
@@ -2146,7 +2139,7 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_instance_key_as_label
     assert result.palette_source is None
     assert result.coercion_applied is False
     assert isinstance(result.layer.colormap, CyclicLabelColormap)
-    assert result.layer.name == "blobs_labels[obs:instance_id]"
+    assert result.layer.name == "blobs_labels[obs: instance_id]"
     assert "style_value_kind" not in result.layer.metadata
     assert list(result.layer.features.columns) == ["index", "instance_id"]
 
@@ -2260,22 +2253,51 @@ def test_viewer_adapter_ensure_styled_labels_loaded_warns_for_high_cardinality_s
     assert "Spatiato will render it with the default categorical palette anyway" in warning_messages[0]
 
 
-def test_viewer_adapter_ensure_styled_labels_loaded_x_var_is_continuous(sdata_blobs) -> None:
+@pytest.mark.parametrize(
+    ("var_layer", "expected_name"),
+    [(None, "blobs_labels[vars (X): channel_1_sum]"), ("counts", "blobs_labels[vars (counts): channel_1_sum]")],
+)
+def test_viewer_adapter_ensure_styled_labels_loaded_names_a_var_layer_after_its_matrix_and_var(
+    sdata_blobs, var_layer: str | None, expected_name: str
+) -> None:
+    sdata_blobs["table"].layers["counts"] = sdata_blobs["table"].X.copy()
     viewer = DummyViewer()
     adapter = ViewerAdapter(viewer)
     style_spec = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="channel_1_sum",
         value_kind="continuous",
+        var_layer=var_layer,
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
 
-    assert result.value_kind == "continuous"
-    assert result.palette_source is None
-    assert result.coercion_applied is False
-    assert isinstance(result.layer.colormap, CompactLabelColormap)
+    assert result.layer.name == expected_name
+
+
+def test_viewer_adapter_keeps_one_styled_labels_layer_per_matrix_of_a_var(sdata_blobs) -> None:
+    sdata_blobs["table"].layers["counts"] = sdata_blobs["table"].X.copy()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    x_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="var",
+        value_key="channel_1_sum",
+        value_kind="continuous",
+    )
+    counts_spec = replace(x_spec, var_layer="counts")
+
+    x_result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", x_spec)
+    counts_result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", counts_spec)
+    counts_again = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", counts_spec)
+
+    assert x_result.created is True
+    assert counts_result.created is True
+    assert counts_result.layer is not x_result.layer
+    assert counts_again.created is False
+    assert counts_again.layer is counts_result.layer
+    assert adapter.get_loaded_styled_labels_layer(sdata_blobs, "blobs_labels", x_spec, "global") is x_result.layer
 
 
 def test_viewer_adapter_ensure_labels_loaded_reuses_matching_existing_layer(sdata_blobs) -> None:
@@ -2852,7 +2874,7 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_registered_variant_w
     assert result.palette_source == "stored"
     assert result.coercion_applied is False
     assert result.layer in viewer.layers
-    assert result.layer.name == "cell_boundaries[shapes_column:cell_type]"
+    assert result.layer.name == "cell_boundaries[column: cell_type]"
     assert adapter.get_loaded_primary_shapes_layer(sdata, "cell_boundaries", "global") is None
     binding = get_shapes_binding(adapter, result.layer)
     assert binding.shapes_role == "styled"
@@ -2911,7 +2933,7 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_point_backed_categor
     assert result.shapes_rendering_mode == "points"
     assert isinstance(result.layer, Points)
     assert result.layer in viewer.layers
-    assert result.layer.name == "cell_centroids[shapes_column:cell_type]"
+    assert result.layer.name == "cell_centroids[column: cell_type]"
     assert adapter.get_loaded_primary_shapes_layer(sdata, "cell_centroids", "global") is None
     assert adapter.get_loaded_styled_shapes_layer(sdata, "cell_centroids", style_spec, "global") is result.layer
     binding = get_shapes_binding(adapter, result.layer)
@@ -3043,7 +3065,7 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_table_backed_variant
     assert result.unannotated_source_shape_count == 1
     assert result.unannotated_rendered_shape_count == 1
     assert result.layer in viewer.layers
-    assert result.layer.name == "cell_boundaries[obs:cell_type]"
+    assert result.layer.name == "cell_boundaries[obs: cell_type]"
     assert adapter.get_loaded_primary_shapes_layer(sdata, "cell_boundaries", "global") is None
     binding = get_shapes_binding(adapter, result.layer)
     assert binding.shapes_role == "styled"
@@ -3084,7 +3106,7 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_point_backed_table_v
     assert result.shapes_rendering_mode == "points"
     assert isinstance(result.layer, Points)
     assert result.layer in viewer.layers
-    assert result.layer.name == "cell_centroids[obs:cell_type]"
+    assert result.layer.name == "cell_centroids[obs: cell_type]"
     binding = get_shapes_binding(adapter, result.layer)
     assert binding.shapes_role == "styled"
     assert binding.shapes_rendering_mode == "points"
@@ -3129,13 +3151,13 @@ def test_viewer_adapter_point_backed_table_styling_keeps_data_driven_colors_afte
     assert all(symbol.value == "square" for symbol in result.layer.symbol)
 
 
-def test_viewer_adapter_point_backed_table_x_var_styling() -> None:
+def test_viewer_adapter_point_backed_table_var_styling() -> None:
     sdata = make_table_backed_point_radius_shapes_sdata()
     viewer = DummyViewer()
     adapter = ViewerAdapter(viewer)
     style_spec = TableColorSourceSpec(
         table_name="table",
-        source_kind="x_var",
+        source_kind="var",
         value_key="GeneA",
         value_kind="continuous",
     )
@@ -3148,7 +3170,7 @@ def test_viewer_adapter_point_backed_table_x_var_styling() -> None:
     assert result.coercion_applied is False
     assert result.unannotated_source_shape_count == 1
     assert result.unannotated_rendered_shape_count == 1
-    assert result.layer.name == "cell_centroids[X:GeneA]"
+    assert result.layer.name == "cell_centroids[vars (X): GeneA]"
     assert get_shapes_binding(adapter, result.layer).shapes_rendering_mode == "points"
     assert result.layer.features["instance_id"].to_list() == ["cell_1", "cell_2", "cell_3"]
     assert result.layer.features["GeneA"].to_list()[:2] == [1.0, 2.0]
@@ -3479,8 +3501,8 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_distinct_variants_fo
 
     assert first.layer is not second.layer
     assert len(viewer.layers) == 2
-    assert first.layer.name == "cell_boundaries[obs:cell_type]"
-    assert second.layer.name == "cell_boundaries[obs:cell_type]"
+    assert first.layer.name == "cell_boundaries[obs: cell_type]"
+    assert second.layer.name == "cell_boundaries[obs: cell_type]"
     assert adapter.get_loaded_styled_shapes_layer(sdata, "cell_boundaries", table_a_style, "global") is first.layer
     assert adapter.get_loaded_styled_shapes_layer(sdata, "cell_boundaries", table_b_style, "global") is second.layer
     assert adapter.get_loaded_styled_shapes_layers(sdata, "cell_boundaries", "global") == [first.layer, second.layer]

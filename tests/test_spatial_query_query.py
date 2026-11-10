@@ -7,18 +7,16 @@ import pytest
 from dask.callbacks import Callback
 from shapely.geometry import Polygon
 from spatialdata import SpatialData
-from spatialdata.models import ShapesModel
+from spatialdata.models import Labels3DModel, ShapesModel
 from spatialdata.transformations import Affine, Identity, set_transformation
 
 import spatiato.core.spatial_query.query as query_module
 from spatiato.core.spatial_query import (
     CanonicalCenterQueryRequest,
-    CanonicalCentersResult,
-    CanonicalRegionBinding,
     build_canonical_center_query_request,
-    build_canonical_source_signature,
     evaluate_canonical_center_query,
 )
+from spatiato.core.spatial_query.canonical_centers import CanonicalCentersRegion
 
 
 def test_query_includes_boundaries_excludes_holes_and_reads_no_labels_tasks(
@@ -32,7 +30,6 @@ def test_query_includes_boundaries_excludes_holes_and_reads_no_labels_tasks(
     disjoint_polygon = Polygon([(20, 20), (22, 20), (22, 22), (20, 22)])
     _add_shapes(sdata_blobs, "query", [polygon_with_hole, disjoint_polygon])
     canonical_centers = _canonical_centers(
-        sdata_blobs,
         instance_ids=[5, 2, 9, 4, 7, 6, 11],
         centers_xy=[(1, 1), (0, 5), (3, 5), (5, 5), (15, 15), (21, 21), (100, 100)],
     )
@@ -61,7 +58,6 @@ def test_query_includes_boundaries_excludes_holes_and_reads_no_labels_tasks(
     assert request.polygons == (polygon_with_hole, disjoint_polygon)
     assert not request.polygons_to_labels_affine.flags.writeable
     assert result.canonical_centers is canonical_centers
-    assert result.binding is canonical_centers.binding
     assert result.eligible_instance_count == 7
     assert result.matched_instance_count == 4
     # Instance 4 has center (5, 5), strictly inside the polygon hole, and is therefore excluded.
@@ -104,7 +100,6 @@ def test_request_uses_spatialdata_element_to_element_transformation(
     expected_affine = np.linalg.inv(labels_to_aligned) @ shapes_to_aligned
     transformed_center = expected_affine @ np.array([1.0, 1.0, 1.0])
     canonical_centers = _canonical_centers(
-        sdata_blobs,
         instance_ids=[8],
         centers_xy=[tuple(transformed_center[:2])],
     )
@@ -141,7 +136,6 @@ def test_request_uses_the_selected_region_coordinate_frame(
         to_coordinate_system="global_1",
     )
     canonical_centers = _canonical_centers(
-        sdata_blobs_multi_region,
         labels_name="blobs_labels_2",
         instance_ids=[1],
         centers_xy=[(-99, -24)],
@@ -175,7 +169,6 @@ def test_query_applies_supported_xy_affines(
     polygon = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
     transformed_center = affine @ np.array([1.0, 1.0, 1.0])
     canonical_centers = _canonical_centers(
-        sdata_blobs,
         instance_ids=[3],
         centers_xy=[tuple(transformed_center[:2])],
     )
@@ -194,7 +187,6 @@ def test_request_rejects_shapes_that_are_not_editable(
     sdata_blobs: SpatialData,
 ) -> None:
     canonical_centers = _canonical_centers(
-        sdata_blobs,
         instance_ids=[1],
         centers_xy=[(0, 0)],
     )
@@ -203,6 +195,26 @@ def test_request_rejects_shapes_that_are_not_editable(
         build_canonical_center_query_request(
             sdata_blobs,
             shapes_name="blobs_multipolygons",
+            coordinate_system="global",
+            canonical_centers=canonical_centers,
+        )
+
+
+def test_request_rejects_a_labels_element_that_is_not_2d(
+    sdata_blobs: SpatialData,
+) -> None:
+    _add_shapes(sdata_blobs, "query", [Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])])
+    sdata_blobs.labels["labels_3d"] = Labels3DModel.parse(np.zeros((2, 4, 4), dtype=np.int32), dims=("z", "y", "x"))
+    canonical_centers = _canonical_centers(
+        labels_name="labels_3d",
+        instance_ids=[1],
+        centers_xy=[(0, 0)],
+    )
+
+    with pytest.raises(ValueError, match="not a 2-D integer labels element"):
+        build_canonical_center_query_request(
+            sdata_blobs,
+            shapes_name="query",
             coordinate_system="global",
             canonical_centers=canonical_centers,
         )
@@ -224,28 +236,20 @@ def _add_shapes(
 
 
 def _canonical_centers(
-    sdata: SpatialData,
     *,
     labels_name: str = "blobs_labels",
     instance_ids: list[int],
     centers_xy: list[tuple[float, float]],
-) -> CanonicalCentersResult:
+) -> CanonicalCentersRegion:
     if len(instance_ids) != len(centers_xy):
         raise ValueError("Test instance IDs and centers must have equal lengths.")
     centers = np.zeros((len(instance_ids), 3), dtype=np.float64)
     centers[:, 1] = [center_y for _, center_y in centers_xy]
     centers[:, 2] = [center_x for center_x, _ in centers_xy]
-    binding = CanonicalRegionBinding(
+    return CanonicalCentersRegion(
         table_name="table",
         labels_name=labels_name,
-        region_key="region",
-        instance_key="instance_id",
-        row_positions=np.arange(len(instance_ids), dtype=np.intp),
+        row_positions=np.arange(len(instance_ids), dtype=np.int64),
         instance_ids=np.asarray(instance_ids, dtype=np.int64),
-    )
-    return CanonicalCentersResult(
-        source_signature=build_canonical_source_signature(sdata, labels_name),
-        binding=binding,
         centers=centers,
-        cache_update=None,
     )

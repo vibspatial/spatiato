@@ -4,6 +4,7 @@ import ast
 from dataclasses import replace
 from pathlib import Path
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,7 +18,7 @@ from spatiato.core.feature_matrix_metadata import (
     register_feature_matrix_metadata,
 )
 from spatiato.core.object_classification.classifier import (
-    CLASSIFIER_APPLY_CONFIG_KEY,
+    CLASSIFIER_CONFIG_KEY,
     PRED_CLASS_COLUMN,
     PRED_CONFIDENCE_COLUMN,
 )
@@ -82,26 +83,16 @@ def _make_classifier_bundle(
     train_labels = np.where(feature_matrix[:, 0] > 0.5, 2, 1).astype(np.int64)
     classifier = RandomForestClassifier(n_estimators=25, random_state=0, n_jobs=1)
     classifier.fit(feature_matrix, train_labels)
-    regions = _table_regions(table)
-    classifier_config = {
-        "model_type": "RandomForestClassifier",
+    model_provenance = {
         "feature_key": feature_key,
-        "table_name": table_name,
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-05-05T09:00:00+00:00",
-        "n_labeled_objects": int(table.n_obs),
-        "n_features": int(feature_matrix.shape[1]),
-        "class_labels_seen": [1, 2],
+        "model_type": "RandomForestClassifier",
         "rf_params": {"n_estimators": 25, "random_state": 0, "n_jobs": 1},
         "training_scope": "all",
-        "training_regions": list(regions),
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "all",
-        "prediction_regions": list(regions),
-        "n_predicted_rows": int(table.n_obs),
+        "training_regions": list(_table_regions(table)),
+        "n_features": int(feature_matrix.shape[1]),
+        "training_timestamp": "2026-05-05T09:00:00+00:00",
+        "n_training_labels": int(table.n_obs),
+        "class_labels_seen": [1, 2],
     }
     return ClassifierExportBundle(
         schema_version=CLASSIFIER_EXPORT_SCHEMA_VERSION,
@@ -109,7 +100,7 @@ def _make_classifier_bundle(
         spatiato_version="0.0.0-test",
         sklearn_version=None,
         estimator=classifier,
-        source_classifier_config=classifier_config,
+        model_provenance=model_provenance,
         source_feature_metadata=dict(table.uns[_FEATURE_MATRICES_KEY][feature_key]),
     )
 
@@ -133,25 +124,16 @@ def _make_area_classifier_bundle() -> ClassifierExportBundle:
         spatiato_version="0.0.0-test",
         sklearn_version=None,
         estimator=classifier,
-        source_classifier_config={
-            "model_type": "RandomForestClassifier",
+        model_provenance={
             "feature_key": "area_features",
-            "table_name": "source_table",
-            "roi_mode": "none",
-            "trained": True,
-            "eligible": True,
-            "reason": "Ready to train.",
-            "training_timestamp": "2026-05-05T09:00:00+00:00",
-            "n_labeled_objects": 2,
-            "n_features": 1,
-            "class_labels_seen": [1, 2],
+            "model_type": "RandomForestClassifier",
             "rf_params": {"n_estimators": 10, "random_state": 0, "n_jobs": 1},
             "training_scope": "all",
             "training_regions": ["source_labels"],
-            "n_training_rows": 2,
-            "prediction_scope": "all",
-            "prediction_regions": ["source_labels"],
-            "n_predicted_rows": 2,
+            "n_features": 1,
+            "training_timestamp": "2026-05-05T09:00:00+00:00",
+            "n_training_labels": 2,
+            "class_labels_seen": [1, 2],
         },
         source_feature_metadata={
             "feature_columns": ["area"],
@@ -189,7 +171,7 @@ def _set_invalid_feature_rows_for_region(
     table.obsm[feature_key] = feature_matrix
 
 
-def test_apply_classifier_from_path_writes_predictions_and_apply_config(
+def test_apply_classifier_from_path_writes_predictions_and_config_entry(
     tmp_path: Path,
     sdata_blobs: SpatialData,
 ) -> None:
@@ -205,7 +187,8 @@ def test_apply_classifier_from_path_writes_predictions_and_apply_config(
     feature_matrix = np.asarray(table.obsm["features_1"], dtype=np.float64)
     expected_classes = bundle.estimator.predict(feature_matrix)
     expected_confidences = bundle.estimator.predict_proba(feature_matrix).max(axis=1)
-    config = table.uns[CLASSIFIER_APPLY_CONFIG_KEY]
+    assert set(table.uns[CLASSIFIER_CONFIG_KEY]) == {PRED_CLASS_COLUMN}
+    entry = table.uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]
 
     assert result.table_name == "table"
     assert result.feature_key == "features_1"
@@ -214,14 +197,18 @@ def test_apply_classifier_from_path_writes_predictions_and_apply_config(
     assert result.n_skipped_feature_invalid_rows == 0
     assert table.obs[PRED_CLASS_COLUMN].astype("string").astype(int).to_numpy().tolist() == expected_classes.tolist()
     assert np.allclose(table.obs[PRED_CONFIDENCE_COLUMN].to_numpy(dtype=np.float64), expected_confidences)
-    assert config["applied"] is True
-    assert config["classifier_path"] == str(classifier_path)
-    assert config["source_classifier_config"] == bundle.source_classifier_config
-    assert config["table_name"] == "table"
-    assert config["feature_key"] == "features_1"
-    assert config["prediction_regions"] == ["blobs_labels"]
-    assert config["pred_class_column"] == PRED_CLASS_COLUMN
-    assert config["pred_confidence_column"] == PRED_CONFIDENCE_COLUMN
+    assert entry == {
+        "source": "apply_classifier",
+        "pred_class_column": PRED_CLASS_COLUMN,
+        "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+        "feature_key": "features_1",
+        "prediction_regions": ["blobs_labels"],
+        "prediction_timestamp": result.applied_at,
+        "prediction_scope": None,
+        "classifier_path": str(classifier_path),
+        "reason": None,
+        "model_provenance": bundle.model_provenance,
+    }
 
 
 def test_write_classifier_export_bundle_rejects_missing_source_kind(tmp_path: Path) -> None:
@@ -238,22 +225,57 @@ def test_apply_classifier_can_write_custom_prediction_columns(sdata_blobs: Spati
     _set_deterministic_features(sdata_blobs)
     _set_feature_metadata(sdata_blobs)
     classifier = _make_classifier_bundle(sdata_blobs)
+    table = sdata_blobs["table"]
+    # The widget's predictions and entry, which this apply leaves alone.
+    table.obs[PRED_CLASS_COLUMN] = pd.Categorical(np.full(table.n_obs, 7, dtype=np.int64), categories=[7])
+    table.obs[PRED_CONFIDENCE_COLUMN] = pd.Series(np.full(table.n_obs, 0.66), index=table.obs.index, dtype="float64")
+    widget_entry = {"source": "widget", "pred_class_column": PRED_CLASS_COLUMN}
+    table.uns[CLASSIFIER_CONFIG_KEY] = {PRED_CLASS_COLUMN: widget_entry}
 
     result = headless.apply_classifier(
         sdata_blobs,
         classifier=classifier,
         table_name="table",
         pred_class_column="headless_class",
-        pred_confidence_column="headless_confidence",
     )
 
-    table = sdata_blobs["table"]
+    # The confidences go to the class column's own confidence column.
     assert result.pred_class_column == "headless_class"
-    assert result.pred_confidence_column == "headless_confidence"
+    assert result.pred_confidence_column == "headless_class_confidence"
     assert "headless_class" in table.obs
-    assert "headless_confidence" in table.obs
-    assert table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["classifier_path"] is None
-    assert table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["pred_class_column"] == "headless_class"
+    assert "headless_class_confidence" in table.obs
+    entry = table.uns[CLASSIFIER_CONFIG_KEY]["headless_class"]
+    assert entry["classifier_path"] is None
+    assert entry["pred_class_column"] == "headless_class"
+    assert entry["pred_confidence_column"] == "headless_class_confidence"
+    # The default columns and their entry are untouched, and no `pred_confidence` appears.
+    assert table.obs[PRED_CLASS_COLUMN].eq(7).all()
+    assert table.obs[PRED_CONFIDENCE_COLUMN].eq(0.66).all()
+    assert "pred_confidence" not in table.obs
+    assert table.uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN] == widget_entry
+
+
+def test_apply_classifier_replaces_the_entry_of_its_pred_class_column_and_keeps_other_entries(
+    sdata_blobs: SpatialData,
+) -> None:
+    """Writing `pred_class` replaces the widget's `classifier_config["pred_class"]` entry.
+
+    The entry of another column stays.
+    """
+    _set_deterministic_features(sdata_blobs)
+    _set_feature_metadata(sdata_blobs)
+    classifier = _make_classifier_bundle(sdata_blobs)
+    other_entry = {"source": "apply_classifier", "pred_class_column": "other_class"}
+    sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY] = {
+        PRED_CLASS_COLUMN: {"source": "widget", "pred_class_column": PRED_CLASS_COLUMN},
+        "other_class": other_entry,
+    }
+
+    headless.apply_classifier(sdata_blobs, classifier=classifier, table_name="table")
+
+    config = sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY]
+    assert config[PRED_CLASS_COLUMN]["source"] == "apply_classifier"
+    assert config["other_class"] == other_entry
 
 
 def test_apply_classifier_rejects_spatialdata_invalid_prediction_column_names(sdata_blobs: SpatialData) -> None:
@@ -464,7 +486,6 @@ def test_compute_features_for_classifier_rejects_spatialdata_invalid_feature_key
 def test_compute_features_for_classifier_returns_normalized_target(sdata_blobs: SpatialData) -> None:
     bundle = _make_area_classifier_bundle()
     table = sdata_blobs["table"]
-    table.obsm["computed_area"] = np.zeros((table.n_obs, 1), dtype=np.float64)
 
     resolved_target = headless.compute_features_for_classifier(
         sdata_blobs,
@@ -484,6 +505,39 @@ def test_compute_features_for_classifier_returns_normalized_target(sdata_blobs: 
     assert list(metadata["feature_columns"]) == ["area"]
 
 
+def test_compute_features_for_classifier_requires_overwrite_for_existing_matrix(sdata_blobs: SpatialData) -> None:
+    bundle = _make_area_classifier_bundle()
+    target = headless.HeadlessFeatureTarget(
+        table_name="table",
+        feature_key="computed_area",
+        triplets=(headless.FeatureExtractionTriplet("global", "blobs_labels", None),),
+    )
+    headless.compute_features_for_classifier(sdata_blobs, bundle, target=target)
+
+    with pytest.raises(ValueError, match="already exists"):
+        headless.compute_features_for_classifier(sdata_blobs, bundle, target=target)
+
+
+def test_compute_features_for_classifier_replaces_custom_matrix_when_overwriting(sdata_blobs: SpatialData) -> None:
+    bundle = _make_area_classifier_bundle()
+    table = sdata_blobs["table"]
+    table.obsm["computed_area"] = np.zeros((table.n_obs, 3), dtype=np.float64)
+
+    headless.compute_features_for_classifier(
+        sdata_blobs,
+        bundle,
+        target=headless.HeadlessFeatureTarget(
+            table_name="table",
+            feature_key="computed_area",
+            triplets=(headless.FeatureExtractionTriplet("global", "blobs_labels", None),),
+            overwrite_feature_key=True,
+        ),
+    )
+
+    assert table.obsm["computed_area"].shape == (table.n_obs, 1)
+    assert list(table.uns[_FEATURE_MATRICES_KEY]["computed_area"]["feature_columns"]) == ["area"]
+
+
 def test_apply_classifier_with_feature_extraction_writes_predictions(sdata_blobs: SpatialData) -> None:
     classifier = _make_area_classifier_bundle()
 
@@ -495,7 +549,6 @@ def test_apply_classifier_with_feature_extraction_writes_predictions(sdata_blobs
         feature_key="computed_area",
         coordinate_system="global",
         pred_class_column="with_features_class",
-        pred_confidence_column="with_features_confidence",
     )
 
     table = sdata_blobs["table"]
@@ -503,8 +556,8 @@ def test_apply_classifier_with_feature_extraction_writes_predictions(sdata_blobs
     assert result.pred_class_column == "with_features_class"
     assert "computed_area" in table.obsm
     assert "with_features_class" in table.obs
-    assert "with_features_confidence" in table.obs
-    assert table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["feature_key"] == "computed_area"
+    assert "with_features_class_confidence" in table.obs
+    assert table.uns[CLASSIFIER_CONFIG_KEY]["with_features_class"]["feature_key"] == "computed_area"
 
 
 def test_apply_classifier_with_feature_extraction_rejects_incompatible_feature_columns(
@@ -524,7 +577,7 @@ def test_apply_classifier_with_feature_extraction_rejects_incompatible_feature_c
         )
 
     assert PRED_CLASS_COLUMN not in sdata_blobs["table"].obs
-    assert CLASSIFIER_APPLY_CONFIG_KEY not in sdata_blobs["table"].uns
+    assert CLASSIFIER_CONFIG_KEY not in sdata_blobs["table"].uns
 
 
 def test_apply_classifier_with_feature_extraction_requires_explicit_ambiguous_coordinate_system(
@@ -558,31 +611,34 @@ def test_apply_classifier_from_path_persists_backed_prediction_state(
         classifier_path,
         table_name="table",
         pred_class_column="headless_class",
-        pred_confidence_column="headless_confidence",
     )
 
     table = backed_sdata_blobs["table"]
     reread = read_zarr(backed_sdata_blobs.path)
     disk_table = reread["table"]
-    config = disk_table.uns[CLASSIFIER_APPLY_CONFIG_KEY]
+    entry = disk_table.uns[CLASSIFIER_CONFIG_KEY]["headless_class"]
 
     assert result.table_name == "table"
     assert "headless_class" in disk_table.obs
-    assert "headless_confidence" in disk_table.obs
+    assert "headless_class_confidence" in disk_table.obs
     assert "headless_class_colors" in disk_table.uns
     assert (
         disk_table.obs["headless_class"].astype("string").tolist()
         == table.obs["headless_class"].astype("string").tolist()
     )
     assert np.allclose(
-        disk_table.obs["headless_confidence"].to_numpy(dtype=np.float64),
-        table.obs["headless_confidence"].to_numpy(dtype=np.float64),
+        disk_table.obs["headless_class_confidence"].to_numpy(dtype=np.float64),
+        table.obs["headless_class_confidence"].to_numpy(dtype=np.float64),
     )
-    assert config["classifier_path"] == str(classifier_path)
-    assert config["table_name"] == "table"
-    assert config["feature_key"] == "features_1"
-    assert config["pred_class_column"] == "headless_class"
-    assert config["pred_confidence_column"] == "headless_confidence"
+    # The whole entry round-trips through the store, including its `None` fields.
+    assert entry["source"] == "apply_classifier"
+    assert entry["classifier_path"] == str(classifier_path)
+    assert entry["feature_key"] == "features_1"
+    assert entry["pred_class_column"] == "headless_class"
+    assert entry["pred_confidence_column"] == "headless_class_confidence"
+    assert entry["prediction_scope"] is None
+    assert entry["reason"] is None
+    assert entry["model_provenance"]["class_labels_seen"].tolist() == [1, 2]
 
 
 def test_apply_classifier_with_feature_extraction_from_path_persists_backed_feature_and_prediction_state(
@@ -599,7 +655,6 @@ def test_apply_classifier_with_feature_extraction_from_path_persists_backed_feat
         table_name="table",
         labels_name="blobs_labels",
         pred_class_column="with_features_class",
-        pred_confidence_column="with_features_confidence",
     )
 
     reread = read_zarr(backed_sdata_blobs.path)
@@ -612,9 +667,10 @@ def test_apply_classifier_with_feature_extraction_from_path_persists_backed_feat
         bundle.feature_columns
     )
     assert "with_features_class" in disk_table.obs
-    assert "with_features_confidence" in disk_table.obs
-    assert disk_table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["classifier_path"] == str(classifier_path)
-    assert disk_table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["feature_key"] == "area_features"
+    assert "with_features_class_confidence" in disk_table.obs
+    entry = disk_table.uns[CLASSIFIER_CONFIG_KEY]["with_features_class"]
+    assert entry["classifier_path"] == str(classifier_path)
+    assert entry["feature_key"] == "area_features"
 
 
 def test_apply_classifier_rejects_missing_feature_key(sdata_blobs: SpatialData) -> None:
@@ -776,7 +832,57 @@ def test_apply_classifier_clears_invalid_rows_in_prediction_scope(
     assert table.obs.loc[valid_rows, PRED_CONFIDENCE_COLUMN].between(0.0, 1.0).all()
     assert table.obs.loc[invalid_rows, PRED_CLASS_COLUMN].isna().all()
     assert table.obs.loc[invalid_rows, PRED_CONFIDENCE_COLUMN].isna().all()
-    assert table.uns[CLASSIFIER_APPLY_CONFIG_KEY]["n_skipped_feature_invalid_rows"] == int(invalid_rows.sum())
+
+
+def test_apply_classifier_predicts_the_same_from_a_lazy_matrix(sdata_blobs_multi_region: SpatialData) -> None:
+    _set_deterministic_features(sdata_blobs_multi_region, table_name="table_multi")
+    _set_feature_metadata(sdata_blobs_multi_region, table_name="table_multi")
+    bundle = _make_classifier_bundle(sdata_blobs_multi_region, table_name="table_multi")
+    table = sdata_blobs_multi_region["table_multi"]
+    values = np.asarray(table.obsm["features_1"], dtype=np.float64)
+
+    headless.apply_classifier(sdata_blobs_multi_region, bundle, table_name="table_multi")
+    in_memory_classes = table.obs[PRED_CLASS_COLUMN].astype("string").tolist()
+    in_memory_confidences = table.obs[PRED_CONFIDENCE_COLUMN].to_numpy(dtype=np.float64)
+
+    table.obsm["features_1"] = da.from_array(values, chunks=(7, -1))
+    headless.apply_classifier(sdata_blobs_multi_region, bundle, table_name="table_multi")
+
+    assert table.obs[PRED_CLASS_COLUMN].astype("string").tolist() == in_memory_classes
+    np.testing.assert_array_equal(table.obs[PRED_CONFIDENCE_COLUMN].to_numpy(dtype=np.float64), in_memory_confidences)
+
+
+def _fail_for_the_second_region(block: np.ndarray, block_info: dict | None = None) -> np.ndarray:
+    # Called for every computed block; the second chunk holds the rows of "blobs_labels_2".
+    if block_info is not None and block_info[0]["chunk-location"][0] == 1:
+        raise AssertionError("rows outside the prediction scope must not be read")
+    return block
+
+
+def test_apply_classifier_reads_only_the_prediction_rows(sdata_blobs_multi_region: SpatialData) -> None:
+    _set_deterministic_features(sdata_blobs_multi_region, table_name="table_multi")
+    _set_feature_metadata(sdata_blobs_multi_region, table_name="table_multi")
+    bundle = _make_classifier_bundle(sdata_blobs_multi_region, table_name="table_multi")
+    table = sdata_blobs_multi_region["table_multi"]
+    region_values = table.obs["region"].astype("string").to_numpy()
+    n_first_region = int((region_values == "blobs_labels").sum())
+    # Test setup: the fixture keeps each region's rows contiguous, one chunk per region.
+    assert (region_values[:n_first_region] == "blobs_labels").all()
+    values = np.asarray(table.obsm["features_1"], dtype=np.float64)
+    table.obsm["features_1"] = da.from_array(values, chunks=(n_first_region, -1)).map_blocks(
+        _fail_for_the_second_region,
+        dtype=values.dtype,
+    )
+
+    result = headless.apply_classifier(
+        sdata_blobs_multi_region,
+        bundle,
+        table_name="table_multi",
+        prediction_regions=["blobs_labels"],
+    )
+
+    assert result.n_predicted_rows == n_first_region
+    assert table.obs[PRED_CLASS_COLUMN].iloc[:n_first_region].notna().all()
 
 
 def test_headless_module_avoids_direct_interactive_classifier_imports() -> None:

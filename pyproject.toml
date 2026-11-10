@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "spatiato"
-version = "0.2.1"
+version = "0.3.0"
 description = "A spatial omics interface for napari."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
@@ -43,12 +43,13 @@ classifiers = [
 dependencies = [
     "dask[dataframe]",
     "filelock>=3.20.1",
-    "harpy-analysis>=0.4.4",
-    "spatialdata>=0.7.2",
+    "harpy-analysis>=0.5.3",
+    "spatialdata>=0.8.0",
     "joblib",
     "lazy-loader>=0.4",
     "loguru",
-    "napari[all]>=0.4.18",
+    "napari[all]>=0.10.0",
+    "numba>=0.58.0",
     "pandas<3.0",
     "pyarrow",
     "pyqtgraph>=0.13.7",

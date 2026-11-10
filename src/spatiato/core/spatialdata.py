@@ -2,22 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import pandas as pd
 from spatialdata import get_element_annotators
 from spatialdata.models import TableModel, get_axes_names
 from spatialdata.transformations import get_transformation
 from xarray import DataArray
 
-from spatiato.core._color_source import (
-    ShapeColorValueKind,
-    ShapeColumnColorSourceSpec,
-    TableColorSourceSpec,
-    TableColorValueKind,
-)
+from spatiato.core.feature_matrix_metadata import RESERVED_OBSM_KEYS
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -269,91 +262,26 @@ def validate_table_binding(sdata: SpatialData, labels_name: str, table_name: str
 
 
 def get_table_obsm_keys(sdata: SpatialData, table_name: str) -> list[str]:
-    """Return the available feature matrix keys from `adata.obsm` for a table in a SpatialData object."""
-    table = get_table(sdata, table_name)
-    return sorted(table.obsm.keys())
+    """Return the `adata.obsm` keys of a table that can hold a feature matrix, sorted.
 
-
-def get_table_obs_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
-    """Return colorable `obs` columns for one linked table."""
-    table = get_table(sdata, table_name)
-    table_metadata = get_table_metadata(sdata, table_name)
-    excluded_columns = {table_metadata.region_key}
-
-    options: list[TableColorSourceSpec] = []
-    for column_name in table.obs.columns:
-        if column_name in excluded_columns:
-            continue
-
-        if column_name == table_metadata.instance_key:
-            value_kind = "instance"
-        else:
-            value_kind = _classify_obs_color_source(table.obs[column_name])
-        if value_kind is None:
-            continue
-
-        options.append(
-            TableColorSourceSpec(
-                table_name=table_name,
-                source_kind="obs_column",
-                value_key=str(column_name),
-                value_kind=value_kind,
-            )
-        )
-
-    return options
-
-
-def get_table_x_var_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
-    """Return colorable `X[:, var_name]` sources for one linked table."""
-    table = get_table(sdata, table_name)
-    return [
-        TableColorSourceSpec(
-            table_name=table_name,
-            source_kind="x_var",
-            value_key=str(var_name),
-            value_kind="continuous",
-        )
-        for var_name in table.var_names
-    ]
-
-
-def get_table_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
-    """Return all colorable table-backed sources for one linked table."""
-    return get_table_obs_color_source_options(sdata, table_name) + get_table_x_var_color_source_options(
-        sdata, table_name
-    )
-
-
-def get_shape_column_color_source_options(sdata: SpatialData, shapes_name: str) -> list[ShapeColumnColorSourceSpec]:
-    """Return colorable columns stored directly on a shapes GeoDataFrame.
-
-    This discovers values that can color `sdata.shapes[shapes_name]` from the
-    shapes element itself. Linked AnnData table `.obs` and `X[:, var]` sources
-    are discovered separately with `get_table_color_source_options(...)`.
+    The keys reserved for spatial coordinates (`RESERVED_OBSM_KEYS`) are left out.
     """
-    shapes = sdata.shapes[shapes_name]
-    geometry_column_name = _get_geometry_column_name(shapes)
+    table = get_table(sdata, table_name)
+    return sorted(key for key in table.obsm.keys() if key not in RESERVED_OBSM_KEYS)
 
-    options: list[ShapeColumnColorSourceSpec] = []
-    for column_name in shapes.columns:
-        column_key = str(column_name)
-        if column_name == geometry_column_name or _is_shape_color_helper_column(column_key):
-            continue
 
-        value_kind = _classify_shape_column_color_source(shapes[column_name])
-        if value_kind is None:
-            continue
+def get_table_var_matrix(table: AnnData, layer: str | None) -> Any:
+    """Return the matrix a var source reads, as attached: `X` for `layer=None`, else `layers[layer]`.
 
-        options.append(
-            ShapeColumnColorSourceSpec(
-                source_kind="shape_column",
-                value_key=column_key,
-                value_kind=value_kind,
-            )
-        )
-
-    return options
+    No value is read here, so a lazy or backed matrix stays lazy.
+    """
+    if layer is None:
+        if table.X is None:
+            raise ValueError("The selected table has no `X`.")
+        return table.X
+    if layer not in table.layers:
+        raise ValueError(f'Layer "{layer}" is not available in the selected table.')
+    return table.layers[layer]
 
 
 def get_spatialdata_labels_options_from_sdata(sdata: SpatialData) -> list[SpatialDataLabelsOption]:
@@ -699,81 +627,6 @@ def _flatten_string_values(value: Any) -> list[str]:
         return flattened
 
     return [str(value)]
-
-
-def _classify_obs_color_source(column: pd.Series) -> TableColorValueKind | None:
-    return _classify_scalar_column_color_source(column)
-
-
-def _classify_shape_column_color_source(column: pd.Series) -> ShapeColorValueKind | None:
-    return _classify_scalar_column_color_source(column)
-
-
-def _classify_scalar_column_color_source(column: pd.Series) -> ShapeColorValueKind | None:
-    if isinstance(column.dtype, pd.CategoricalDtype):
-        return "categorical"
-
-    non_null = column.dropna()
-    if non_null.empty:
-        return None
-
-    if pd.api.types.is_bool_dtype(column.dtype):
-        return "categorical"
-
-    if pd.api.types.is_integer_dtype(column.dtype):
-        return "categorical" if _has_exact_binary_zero_one_values(non_null.tolist()) else "continuous"
-
-    if pd.api.types.is_float_dtype(column.dtype):
-        return "continuous"
-
-    return _classify_scalar_values_as_color_source(non_null.tolist())
-
-
-def _classify_scalar_values_as_color_source(
-    values: Sequence[Any],
-) -> ShapeColorValueKind | None:
-    if all(_is_bool_scalar(value) for value in values):
-        return "categorical"
-
-    if all(_is_integer_scalar(value) for value in values):
-        return "categorical" if _has_exact_binary_zero_one_values(values) else "continuous"
-
-    if all(_is_real_scalar(value) for value in values):
-        return "continuous"
-
-    if all(_is_string_scalar(value) for value in values):
-        return "categorical"
-
-    return None
-
-
-def _has_exact_binary_zero_one_values(values: Sequence[Any]) -> bool:
-    unique_values = {int(value) for value in values}
-    return unique_values == {0, 1}
-
-
-def _get_geometry_column_name(shapes_element: Any) -> Any:
-    return getattr(getattr(shapes_element, "geometry", None), "name", "geometry")
-
-
-def _is_shape_color_helper_column(column_name: str) -> bool:
-    return column_name.endswith(("_colors", "_color", ".color"))
-
-
-def _is_bool_scalar(value: Any) -> bool:
-    return isinstance(value, bool | np.bool_)
-
-
-def _is_integer_scalar(value: Any) -> bool:
-    return isinstance(value, Integral) and not _is_bool_scalar(value)
-
-
-def _is_real_scalar(value: Any) -> bool:
-    return isinstance(value, Real) and not _is_bool_scalar(value)
-
-
-def _is_string_scalar(value: Any) -> bool:
-    return isinstance(value, str | bytes | np.str_ | np.bytes_)
 
 
 def _is_pickable_labels_layer(layer: Any) -> bool:

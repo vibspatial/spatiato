@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from spatiato.core._color_source import ShapeColumnColorSourceSpec, TableColorSourceSpec, TableColorValueKind
 from spatiato.widgets.viewer.status_card import (
     _ViewerStatusCardSpec,
     build_image_loaded_card_spec,
@@ -15,6 +16,22 @@ from spatiato.widgets.viewer.status_card import (
     build_viewer_error_card_spec,
     build_viewer_feedback_card_spec,
 )
+
+
+def _obs_source(value_key: str, *, value_kind: TableColorValueKind = "categorical") -> TableColorSourceSpec:
+    return TableColorSourceSpec(
+        table_name="table", source_kind="obs_column", value_key=value_key, value_kind=value_kind
+    )
+
+
+def _var_source(value_key: str, *, var_layer: str | None = None) -> TableColorSourceSpec:
+    return TableColorSourceSpec(
+        table_name="table", source_kind="var", value_key=value_key, value_kind="continuous", var_layer=var_layer
+    )
+
+
+def _shape_column_source(value_key: str) -> ShapeColumnColorSourceSpec:
+    return ShapeColumnColorSourceSpec(source_kind="shape_column", value_key=value_key, value_kind="categorical")
 
 
 def test_viewer_status_card_spec_rejects_invalid_kind() -> None:
@@ -113,7 +130,7 @@ def test_build_primary_labels_loaded_card_spec_uses_tooltip_for_shortened_names(
 def test_build_styled_labels_card_spec_reports_stored_palette() -> None:
     request = SimpleNamespace(
         labels_name="blobs_labels",
-        selected_color_source=SimpleNamespace(source_kind="obs_column", value_key="cell_type"),
+        selected_color_source=_obs_source("cell_type"),
     )
     result = SimpleNamespace(
         created=True,
@@ -127,7 +144,7 @@ def test_build_styled_labels_card_spec_reports_stored_palette() -> None:
     assert spec.title == "Colored Overlay Created"
     assert spec.kind == "success"
     assert spec.lines == (
-        'Created colored overlay for obs["cell_type"] on labels element "blobs_labels".',
+        'Created colored overlay "obs: cell_type" on labels element "blobs_labels".',
         "Used the stored categorical palette.",
     )
 
@@ -136,7 +153,7 @@ def test_build_styled_labels_card_spec_uses_tooltip_for_shortened_names() -> Non
     labels_name = "labels_" + "x" * 80
     request = SimpleNamespace(
         labels_name=labels_name,
-        selected_color_source=SimpleNamespace(source_kind="obs_column", value_key="cell_type"),
+        selected_color_source=_obs_source("cell_type"),
     )
     result = SimpleNamespace(
         created=True,
@@ -148,13 +165,13 @@ def test_build_styled_labels_card_spec_uses_tooltip_for_shortened_names() -> Non
     spec = build_styled_labels_card_spec(request, result)
 
     assert labels_name not in spec.lines[0]
-    assert spec.tooltip_message == f'Created colored overlay for obs["cell_type"] on labels element "{labels_name}".'
+    assert spec.tooltip_message == f'Created colored overlay "obs: cell_type" on labels element "{labels_name}".'
 
 
 def test_build_styled_labels_card_spec_reports_instance_coloring() -> None:
     request = SimpleNamespace(
         labels_name="blobs_labels",
-        selected_color_source=SimpleNamespace(source_kind="obs_column", value_key="instance_id"),
+        selected_color_source=_obs_source("instance_id", value_kind="instance"),
     )
     result = SimpleNamespace(
         created=True,
@@ -210,7 +227,7 @@ def test_build_primary_shapes_loaded_card_spec_reports_skipped_geometries() -> N
 def test_build_styled_shapes_card_spec_combines_palette_and_geometry_warnings() -> None:
     request = SimpleNamespace(
         shapes_name="blobs_circles",
-        selected_color_source=SimpleNamespace(value_key="cell_type"),
+        selected_color_source=_shape_column_source("cell_type"),
     )
     result = SimpleNamespace(
         created=False,
@@ -226,7 +243,7 @@ def test_build_styled_shapes_card_spec_combines_palette_and_geometry_warnings() 
     assert spec.title == "Styled Shapes Updated With Warning"
     assert spec.kind == "warning"
     assert spec.lines == (
-        'Updated styled shapes layer for column "cell_type" on shapes element "blobs_circles".',
+        'Updated styled shapes layer "column: cell_type" on shapes element "blobs_circles".',
         "Used the default categorical palette because no stored palette was present.",
         "Skipped 1 empty, invalid, or unsupported geometries while loading renderable shapes.",
     )
@@ -235,7 +252,7 @@ def test_build_styled_shapes_card_spec_combines_palette_and_geometry_warnings() 
 def test_build_styled_shapes_card_spec_formats_table_obs_source() -> None:
     request = SimpleNamespace(
         shapes_name="blobs_circles",
-        selected_color_source=SimpleNamespace(source_kind="obs_column", value_key="cell_type"),
+        selected_color_source=_obs_source("cell_type"),
     )
     result = SimpleNamespace(
         created=True,
@@ -253,15 +270,19 @@ def test_build_styled_shapes_card_spec_formats_table_obs_source() -> None:
     assert spec.title == "Styled Shapes Created"
     assert spec.kind == "success"
     assert spec.lines == (
-        'Created styled shapes layer for obs["cell_type"] on shapes element "blobs_circles".',
+        'Created styled shapes layer "obs: cell_type" on shapes element "blobs_circles".',
         "Used the stored categorical palette.",
     )
 
 
-def test_build_styled_shapes_card_spec_formats_table_x_source() -> None:
+@pytest.mark.parametrize(
+    ("var_layer", "expected_source"),
+    [(None, "vars (X): GeneA"), ("counts", "vars (counts): GeneA")],
+)
+def test_build_styled_shapes_card_spec_formats_table_var_source(var_layer: str | None, expected_source: str) -> None:
     request = SimpleNamespace(
         shapes_name="blobs_circles",
-        selected_color_source=SimpleNamespace(source_kind="x_var", value_key="GeneA"),
+        selected_color_source=_var_source("GeneA", var_layer=var_layer),
     )
     result = SimpleNamespace(
         created=True,
@@ -278,13 +299,13 @@ def test_build_styled_shapes_card_spec_formats_table_x_source() -> None:
 
     assert spec.title == "Styled Shapes Created"
     assert spec.kind == "success"
-    assert spec.lines == ('Created styled shapes layer for X[:, "GeneA"] on shapes element "blobs_circles".',)
+    assert spec.lines == (f'Created styled shapes layer "{expected_source}" on shapes element "blobs_circles".',)
 
 
 def test_build_styled_shapes_card_spec_reports_table_backed_instance_coloring() -> None:
     request = SimpleNamespace(
         shapes_name="blobs_circles",
-        selected_color_source=SimpleNamespace(source_kind="obs_column", value_key="instance_id"),
+        selected_color_source=_obs_source("instance_id", value_kind="instance"),
     )
     result = SimpleNamespace(
         created=True,
@@ -302,7 +323,7 @@ def test_build_styled_shapes_card_spec_reports_table_backed_instance_coloring() 
     assert spec.title == "Styled Shapes Created"
     assert spec.kind == "success"
     assert spec.lines == (
-        'Created styled shapes layer for obs["instance_id"] on shapes element "blobs_circles".',
+        'Created styled shapes layer "obs: instance_id" on shapes element "blobs_circles".',
         "Used instance colors.",
     )
 
@@ -310,7 +331,7 @@ def test_build_styled_shapes_card_spec_reports_table_backed_instance_coloring() 
 def test_build_styled_shapes_card_spec_reports_partial_table_coverage_as_info() -> None:
     request = SimpleNamespace(
         shapes_name="blobs_circles",
-        selected_color_source=SimpleNamespace(source_kind="obs_column", value_key="cell_type"),
+        selected_color_source=_obs_source("cell_type"),
     )
     result = SimpleNamespace(
         created=True,
@@ -328,7 +349,7 @@ def test_build_styled_shapes_card_spec_reports_partial_table_coverage_as_info() 
     assert spec.title == "Styled Shapes Created"
     assert spec.kind == "info"
     assert spec.lines == (
-        'Created styled shapes layer for obs["cell_type"] on shapes element "blobs_circles".',
+        'Created styled shapes layer "obs: cell_type" on shapes element "blobs_circles".',
         "Used the stored categorical palette.",
         "Rendered 2 shapes transparent because 1 source shape has no row in the linked table.",
     )
@@ -338,7 +359,7 @@ def test_build_styled_shapes_card_spec_uses_tooltip_for_shortened_names() -> Non
     shapes_name = "shapes_" + "x" * 80
     request = SimpleNamespace(
         shapes_name=shapes_name,
-        selected_color_source=SimpleNamespace(value_key="cell_type"),
+        selected_color_source=_shape_column_source("cell_type"),
     )
     result = SimpleNamespace(
         created=True,
@@ -352,9 +373,7 @@ def test_build_styled_shapes_card_spec_uses_tooltip_for_shortened_names() -> Non
     spec = build_styled_shapes_card_spec(request, result)
 
     assert shapes_name not in spec.lines[0]
-    assert (
-        spec.tooltip_message == f'Created styled shapes layer for column "cell_type" on shapes element "{shapes_name}".'
-    )
+    assert spec.tooltip_message == f'Created styled shapes layer "column: cell_type" on shapes element "{shapes_name}".'
 
 
 def test_build_styled_shapes_card_spec_rejects_missing_color_source() -> None:

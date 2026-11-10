@@ -426,8 +426,8 @@ class ObjectClassificationWidget(QWidget):
         app_state = self._app_state
         participant = self
         self.destroyed.connect(
-            lambda *_args, app_state=app_state, participant=participant: (
-                app_state.unregister_table_reload_participant(participant)
+            lambda *_args, app_state=app_state, participant=participant: app_state.unregister_table_reload_participant(
+                participant
             )
         )
 
@@ -577,11 +577,11 @@ class ObjectClassificationWidget(QWidget):
         next_table_binding_error = self._validate_selected_table_binding()
         next_effective_table_name = None if next_table_binding_error is not None else self.selected_table_name
 
-        if (
-            next_effective_table_name != previous_effective_table_name
-            or self.selected_feature_key != previous_feature_key
-        ):
-            self._bind_current_selection()
+        if next_effective_table_name != previous_effective_table_name:
+            self._bind_current_selection(classifier_dirty_reason="the annotation table changed")
+            return
+        if self.selected_feature_key != previous_feature_key:
+            self._bind_current_selection(classifier_dirty_reason="the feature matrix changed")
             return
 
         if (
@@ -594,7 +594,18 @@ class ObjectClassificationWidget(QWidget):
         self._update_selection_status()
 
     def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
-        """Freeze classifier work before a consumed table is reloaded."""
+        """Freeze classifier work before a consumed table is reloaded.
+
+        Classifier jobs only compute in a worker; their results are written to
+        the table on the main thread. So they never make the table busy, and a
+        reload does not wait for them: it cancels them here instead. A
+        cancelled job's result, computed from the table being replaced, is
+        discarded and never written to the table.
+
+        This is a defense, see `TableReloadParticipant`: the controller also
+        cancels these jobs when the widget receives the `reloaded` event
+        (`reset_after_reload()`).
+        """
         if request.sdata is not self.selected_spatialdata or request.table_name != self.selected_table_name:
             return
         self._classifier_controller.freeze_for_reload()
@@ -1423,7 +1434,7 @@ class ObjectClassificationWidget(QWidget):
         elif self.selected_color_by == COLOR_BY_PRED_CLASS:
             tooltip = 'Color the labels layer by "pred_class" using the stable user-class palette.'
         elif self.selected_color_by == COLOR_BY_PRED_CONFIDENCE:
-            tooltip = 'Color the labels layer by continuous "pred_confidence" values.'
+            tooltip = f'Color the labels layer by continuous "{COLOR_BY_PRED_CONFIDENCE}" values.'
         else:
             tooltip = "Choose how to color the labels layer."
 
@@ -1497,8 +1508,11 @@ class ObjectClassificationWidget(QWidget):
             tooltip = "Choose a feature matrix before training the classifier."
         elif self._classifier_controller.is_training:
             tooltip = "A classifier training job is currently running."
-        elif classifier_preparation_summary is not None and not classifier_preparation_summary.eligible:
-            tooltip = classifier_preparation_summary.reason
+        elif (
+            classifier_preparation_summary is not None
+            and classifier_preparation_summary.training_blocker_reason is not None
+        ):
+            tooltip = classifier_preparation_summary.training_blocker_reason
         elif self._classifier_controller.is_dirty:
             tooltip = "The classifier model is stale. Click Train Classifier to refresh predictions."
         else:
@@ -1612,7 +1626,7 @@ class ObjectClassificationWidget(QWidget):
         path = self._normalize_classifier_export_path(Path(selected_path))
         try:
             bundle = self._classifier_controller.export_classifier(path)
-        except ValueError as error:
+        except Exception as error:  # noqa: BLE001 - this UI boundary must report every export failure, also a failed file write.
             self._set_classifier_export_feedback(str(error), error=True)
             self._update_classifier_controls()
             return
@@ -1650,7 +1664,6 @@ class ObjectClassificationWidget(QWidget):
                 # table-backed colors with the shared neutral style because
                 # the rejected table cannot provide trustworthy class values.
                 apply_neutral_labels_style(layer)
-                self._app_state.viewer_adapter.sync_labels_display_after_colormap_change(layer)
             self._layer_styling_error = None
             self._update_warning_status_card()
             return

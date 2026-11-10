@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import anndata as ad
+import dask.array as da
+import harpy.table.io._components as harpy_components_module
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,20 +11,11 @@ from harpy.utils._keys import _FEATURE_MATRICES_KEY
 from spatialdata import SpatialData, read_zarr
 from spatialdata.models import TableModel
 
-import spatiato.core.persistence as persistence_module
+import spatiato.widgets.persistence.controller as persistence_controller_module
 from spatiato._app_state import SpatiatoAppState, TableStateChangedEvent
 from spatiato.core.feature_matrix_metadata import CUSTOM_OBSM_SOURCE_KIND, register_feature_matrix_metadata
 from spatiato.core.object_classification.annotation import USER_CLASS_COLORS_KEY, USER_CLASS_COLUMN
 from spatiato.core.persistence import TableComponentPath
-from spatiato.core.spatial_query import (
-    CANONICAL_CACHE_PATHS,
-    CANONICAL_OBSM_KEY,
-    CanonicalCacheState,
-    CanonicalCentersResult,
-    apply_canonical_cache_update,
-    build_canonical_cache_update_payload,
-    inspect_canonical_cache,
-)
 from spatiato.core.spatialdata import get_table, get_table_metadata
 from spatiato.widgets.object_classification.controller import (
     CLASSIFIER_CONFIG_KEY,
@@ -56,24 +49,6 @@ def _record_mutation(
     )
 
 
-def _apply_canonical_cache(sdata: SpatialData) -> CanonicalCentersResult:
-    report = inspect_canonical_cache(sdata, table_name="table", labels_name="blobs_labels")
-    centers = np.zeros((report.binding.n_obs, 3), dtype=np.float64)
-    centers[:, 1:] = np.arange(report.binding.n_obs * 2, dtype=np.float64).reshape(-1, 2)
-    payload = build_canonical_cache_update_payload(
-        binding=report.binding,
-        centers=centers,
-        source_signature=report.source_signature,
-    )
-    cache_update = apply_canonical_cache_update(sdata, payload)
-    return CanonicalCentersResult(
-        source_signature=payload.source_signature,
-        binding=payload.binding,
-        centers=payload.centers,
-        cache_update=cache_update,
-    )
-
-
 def test_persistence_controller_requires_backed_spatialdata(sdata_blobs: SpatialData) -> None:
     controller = PersistenceController()
     controller.bind(sdata_blobs, "table")
@@ -82,66 +57,97 @@ def test_persistence_controller_requires_backed_spatialdata(sdata_blobs: Spatial
         controller.write_table_state()
 
 
-def test_canonical_cache_update_round_trips_as_one_dirty_consistency_unit(
-    backed_sdata_blobs: SpatialData,
-) -> None:
-    app_state = SpatiatoAppState()
-    controller = PersistenceController(app_state)
-    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
-    _apply_canonical_cache(backed_sdata_blobs)
-
-    _record_mutation(app_state, backed_sdata_blobs, *CANONICAL_CACHE_PATHS)
-
-    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == CANONICAL_CACHE_PATHS
-
-    controller.write_table_state()
-    reopened = read_zarr(backed_sdata_blobs.path)
-
-    assert controller.has_unsynced_table_changes is False
-    assert (
-        inspect_canonical_cache(reopened, table_name="table", labels_name="blobs_labels").state
-        is CanonicalCacheState.VALID
-    )
-
-
-def test_failed_second_canonical_write_acknowledges_neither_path(
+def test_persistence_controller_write_of_a_clean_table_writes_nothing(
     backed_sdata_blobs: SpatialData,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app_state = SpatiatoAppState()
     controller = PersistenceController(app_state)
     controller.bind(backed_sdata_blobs, "table", "blobs_labels")
-    _apply_canonical_cache(backed_sdata_blobs)
-    _record_mutation(app_state, backed_sdata_blobs, *CANONICAL_CACHE_PATHS)
-    real_write_elem = persistence_module.ad.io.write_elem
-    canonical_write_count = 0
 
-    def fail_second_canonical_write(group, key, value, *args, **kwargs):
-        nonlocal canonical_write_count
-        if key == CANONICAL_OBSM_KEY:
-            canonical_write_count += 1
-            if canonical_write_count == 2:
-                raise RuntimeError("injected canonical metadata write failure")
-        return real_write_elem(group, key, value, *args, **kwargs)
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("A table without unsaved changes must not be written.")
 
-    monkeypatch.setattr(persistence_module.ad.io, "write_elem", fail_second_canonical_write)
+    monkeypatch.setattr(persistence_controller_module, "persist_table_components", fail_if_called)
 
-    with pytest.raises(RuntimeError, match="injected canonical metadata write failure"):
+    assert controller.write_table_state() == "tables/table"
+    assert app_state.is_table_dirty(backed_sdata_blobs, "table") is False
+
+
+def test_failed_write_changes_nothing_and_acknowledges_none_of_its_paths(
+    backed_sdata_blobs: SpatialData,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Write that fails after harpy published it is rolled back, in the store and in memory."""
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
+    table = backed_sdata_blobs["table"]
+    stored_features = np.asarray(read_zarr(backed_sdata_blobs.path)["table"].obsm["features_1"]).copy()
+    obsm_path = TableComponentPath("obsm", ("features_1",))
+    uns_path = TableComponentPath("uns", ("extension_metadata", "result"))
+    table.obsm["features_1"] = np.zeros_like(np.asarray(table.obsm["features_1"]))
+    table.uns["extension_metadata"] = {"result": {"version": 1}}
+    _record_mutation(app_state, backed_sdata_blobs, obsm_path, uns_path)
+    attached_features = table.obsm["features_1"]
+
+    def fail_installation(table, updates):
+        del table, updates
+        raise RuntimeError("injected installation failure")
+
+    # harpy has published both paths when it installs them in memory; this fails.
+    monkeypatch.setattr(harpy_components_module, "_install_memory_updates", fail_installation)
+    with pytest.raises(RuntimeError, match="injected installation failure"):
         controller.write_table_state()
 
-    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == CANONICAL_CACHE_PATHS
+    # The store and the attached table are as before the Write, and nothing is acknowledged.
+    reread = read_zarr(backed_sdata_blobs.path)["table"]
+    np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), stored_features)
+    assert "extension_metadata" not in reread.uns
+    assert table.obsm["features_1"] is attached_features
+    assert app_state.snapshot_table_dirty_state(backed_sdata_blobs, "table").paths == {obsm_path, uns_path}
 
-    controller.reload_table_state()
+    # So Write can be retried.
+    monkeypatch.undo()
+    controller.write_table_state()
 
+    reread = read_zarr(backed_sdata_blobs.path)["table"]
     assert controller.has_unsynced_table_changes is False
-    assert (
-        inspect_canonical_cache(
-            backed_sdata_blobs,
-            table_name="table",
-            labels_name="blobs_labels",
-        ).state
-        is CanonicalCacheState.INVALID
+    np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), 0)
+    assert reread.uns["extension_metadata"]["result"]["version"] == 1
+
+
+def test_write_replaces_and_deletes_in_one_call_and_attaches_written_obsm_lazily(
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """A Write follows memory: present paths are written, absent ones deleted, and written `obsm` reopened lazily."""
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
+    table = backed_sdata_blobs["table"]
+    written_features = np.full_like(np.asarray(table.obsm["features_1"], dtype=np.float64), 0.5)
+    table.obsm["features_1"] = written_features
+    del table.obsm["features_2"]
+    table.uns["extension_metadata"] = {"result": {"version": 2}}
+    _record_mutation(
+        app_state,
+        backed_sdata_blobs,
+        TableComponentPath("obsm", ("features_1",)),
+        TableComponentPath("obsm", ("features_2",)),
+        TableComponentPath("uns", ("extension_metadata", "result")),
     )
+
+    controller.write_table_state()
+
+    reread = read_zarr(backed_sdata_blobs.path)["table"]
+    assert sorted(reread.obsm.keys()) == ["features_1"]
+    np.testing.assert_array_equal(np.asarray(reread.obsm["features_1"]), written_features)
+    assert reread.uns["extension_metadata"]["result"]["version"] == 2
+    # The written entry is now a lazy view of the store, with the written values.
+    assert isinstance(table.obsm["features_1"], da.Array)
+    np.testing.assert_array_equal(table.obsm["features_1"].compute(), written_features)
+    assert "features_2" not in table.obsm
+    assert controller.has_unsynced_table_changes is False
 
 
 def test_persistence_controller_tracks_dirty_state_per_selected_table(
@@ -230,24 +236,28 @@ def test_persistence_controller_syncs_table_obs_and_colors_to_backed_store(backe
     backed_sdata_blobs["table"].uns[USER_CLASS_COLORS_KEY] = ["#222222"]
     backed_sdata_blobs["table"].uns[PRED_CLASS_COLORS_KEY] = ["#222222"]
     backed_sdata_blobs["table"].uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table",
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 1,
-        "n_features": 4,
-        "class_labels_seen": [2],
-        "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
-        "training_scope": "all",
-        "training_regions": ["blobs_labels"],
-        "n_training_rows": backed_sdata_blobs["table"].n_obs,
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "n_predicted_rows": backed_sdata_blobs["table"].n_obs,
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": ["blobs_labels"],
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": "selected_segmentation_only",
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
+                "training_scope": "all",
+                "training_regions": ["blobs_labels"],
+                "n_features": 4,
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": 1,
+                "class_labels_seen": [2],
+            },
+        }
     }
     _record_mutation(
         app_state,
@@ -276,8 +286,11 @@ def test_persistence_controller_syncs_table_obs_and_colors_to_backed_store(backe
     assert reread["table"].obs[PRED_CONFIDENCE_COLUMN].max() == 0.95
     assert list(reread["table"].uns[USER_CLASS_COLORS_KEY]) == ["#222222"]
     assert list(reread["table"].uns[PRED_CLASS_COLORS_KEY]) == ["#222222"]
-    assert reread["table"].uns[CLASSIFIER_CONFIG_KEY]["feature_key"] == "features_1"
-    assert reread["table"].uns[CLASSIFIER_CONFIG_KEY]["prediction_scope"] == "selected_segmentation_only"
+    assert reread["table"].uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]["feature_key"] == "features_1"
+    assert (
+        reread["table"].uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]["prediction_scope"]
+        == "selected_segmentation_only"
+    )
     assert sorted(reread["table"].obsm.keys()) == ["features_1", "features_2"]
 
 
@@ -382,7 +395,7 @@ def test_persistence_controller_reloads_registered_custom_feature_matrix_metadat
     metadata = table.uns[_FEATURE_MATRICES_KEY][feature_key]
 
     assert result.table_path == "tables/table"
-    assert np.array_equal(table.obsm[feature_key], disk_features)
+    np.testing.assert_array_equal(np.asarray(table.obsm[feature_key]), disk_features)
     assert metadata["source_kind"] == CUSTOM_OBSM_SOURCE_KIND
     assert list(metadata["feature_columns"]) == feature_columns
     assert len(emitted_events) == 1
@@ -410,24 +423,28 @@ def test_persistence_controller_syncs_multi_region_classifier_config_fields(
     table.uns[USER_CLASS_COLORS_KEY] = ["#111111", "#222222"]
     table.uns[PRED_CLASS_COLORS_KEY] = ["#111111", "#222222"]
     table.uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table_multi",
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": int(table.n_obs),
-        "n_features": int(table.obsm["features_1"].shape[1]),
-        "class_labels_seen": [1, 2],
-        "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
-        "training_scope": "all",
-        "training_regions": regions,
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "all",
-        "prediction_regions": regions,
-        "n_predicted_rows": int(table.n_obs),
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": regions,
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": "all",
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": {"n_estimators": 100, "random_state": 0, "n_jobs": 1},
+                "training_scope": "all",
+                "training_regions": regions,
+                "n_features": int(table.obsm["features_1"].shape[1]),
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": int(table.n_obs),
+                "class_labels_seen": [1, 2],
+            },
+        }
     }
     _record_mutation(
         app_state,
@@ -443,17 +460,18 @@ def test_persistence_controller_syncs_multi_region_classifier_config_fields(
 
     table_path = controller.write_table_state()
     reread = read_zarr(backed_sdata_blobs_multi_region.path)
-    config = reread["table_multi"].uns[CLASSIFIER_CONFIG_KEY]
+    entry = reread["table_multi"].uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]
 
     assert table_path == "tables/table_multi"
-    assert config["table_name"] == "table_multi"
-    assert config["feature_key"] == "features_1"
-    assert config["training_scope"] == "all"
-    assert list(config["training_regions"]) == regions
-    assert config["n_training_rows"] == table.n_obs
-    assert config["prediction_scope"] == "all"
-    assert list(config["prediction_regions"]) == regions
-    assert config["n_predicted_rows"] == table.n_obs
+    assert entry["feature_key"] == "features_1"
+    assert entry["model_provenance"]["training_scope"] == "all"
+    assert list(entry["model_provenance"]["training_regions"]) == regions
+    assert entry["prediction_scope"] == "all"
+    assert list(entry["prediction_regions"]) == regions
+    assert entry["model_provenance"]["n_training_labels"] == table.n_obs
+    # A trained entry has no reason; `None` survives the round trip.
+    assert "reason" in entry
+    assert entry["reason"] is None
     assert reread["table_multi"].obs[PRED_CLASS_COLUMN].tolist().count(1) == int(
         (region_values == "blobs_labels").sum()
     )
@@ -580,7 +598,127 @@ def test_persistence_controller_reloads_obsm_key_written_directly_to_disk_group(
 
     assert table_path == "tables/table"
     assert sorted(table.obsm.keys()) == ["features_1", "features_2", "features_3"]
-    assert np.array_equal(table.obsm["features_3"], features_3)
+    # Reload reads every `obsm` entry lazily, as views of the store.
+    for key in table.obsm:
+        assert isinstance(table.obsm[key], da.Array)
+    np.testing.assert_array_equal(table.obsm["features_3"].compute(), features_3)
+
+
+def test_full_reload_removes_what_exists_only_in_memory(backed_sdata_blobs: SpatialData) -> None:
+    """A full reload makes memory follow the store: entries absent from the store leave memory.
+
+    That covers an `obsm` key deleted from the store; an `obsm` key, `obs`
+    column and `uns` key added in memory and recorded as dirty, whose dirty
+    state the reload clears; and an `uns` key added outside Spatiato's
+    tracking, as in the napari console.
+    """
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table")
+    table = backed_sdata_blobs["table"]
+    obsm = dict(table.obsm)
+    del obsm["features_2"]
+    _write_disk_snapshot_state(backed_sdata_blobs, obs=table.obs.copy(), obsm=obsm, uns=dict(table.uns))
+    table.obsm["memory_features"] = np.zeros((table.n_obs, 2))
+    table.obs["memory_column"] = 1.0
+    table.uns["memory_flag"] = {"source": "memory"}
+    _record_mutation(
+        app_state,
+        backed_sdata_blobs,
+        TableComponentPath("obsm", ("memory_features",)),
+        TableComponentPath("obs", ("memory_column",)),
+        TableComponentPath("uns", ("memory_flag",)),
+    )
+    table.uns["untracked_flag"] = {"source": "console"}
+
+    controller.reload_table_state()
+
+    assert sorted(table.obsm.keys()) == ["features_1"]
+    assert "memory_column" not in table.obs
+    assert sorted(table.uns.keys()) == [TableModel.ATTRS_KEY]
+    assert controller.has_unsynced_table_changes is False
+
+
+def test_reload_takes_a_path_under_spatialdata_attrs_from_the_attrs_it_reads(
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """A requested path under `spatialdata_attrs` comes from the attrs read for the binding check.
+
+    harpy refuses overlapping paths in one request, so the reload reads
+    `spatialdata_attrs` once and takes the nested `region` path from it.
+    """
+    controller = PersistenceController()
+    controller.bind(backed_sdata_blobs, "table", "blobs_labels")
+    table = backed_sdata_blobs["table"]
+    uns = dict(table.uns)
+    uns[TableModel.ATTRS_KEY] = {
+        **uns[TableModel.ATTRS_KEY],
+        TableModel.REGION_KEY: np.array(["blobs_labels"]),
+    }
+    _write_disk_snapshot_state(backed_sdata_blobs, obs=table.obs.copy(), obsm=dict(table.obsm), uns=uns)
+    region_path = TableComponentPath("uns", (TableModel.ATTRS_KEY, TableModel.REGION_KEY))
+    # Test setup: memory holds the region as a string, the store as an array.
+    assert table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] == "blobs_labels"
+
+    result = controller.reload_table_components(frozenset({region_path}))
+
+    assert result.reloaded_paths == frozenset({region_path})
+    # The stored array is normalized back to a list of region names.
+    assert table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY] == ["blobs_labels"]
+
+
+def test_reload_of_a_nested_uns_path_without_a_parent_adds_no_parent(
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """A nested `uns` path whose parent exists neither in memory nor in the store leaves `uns` as it is.
+
+    The path is absent from the store, so there is nothing to install and
+    nothing to remove; the reload must not create its parent as an empty
+    mapping.
+    """
+    controller = PersistenceController()
+    controller.bind(backed_sdata_blobs, "table")
+    table = backed_sdata_blobs["table"]
+    nested_path = TableComponentPath("uns", ("parent", "child"))
+    uns_keys_before = sorted(table.uns.keys())
+
+    result = controller.reload_table_components(frozenset({nested_path}))
+
+    assert result.reloaded_paths == frozenset({nested_path})
+    assert sorted(table.uns.keys()) == uns_keys_before
+
+
+def test_failed_reload_restores_the_previous_table_components(
+    monkeypatch: pytest.MonkeyPatch,
+    backed_sdata_blobs: SpatialData,
+) -> None:
+    """When validation fails after the install, the previous `obs`, `obsm` and `uns` come back.
+
+    Nothing from the store stays in memory, and the dirty state is unchanged.
+    """
+    app_state = SpatiatoAppState()
+    controller = PersistenceController(app_state)
+    controller.bind(backed_sdata_blobs, "table")
+    table = backed_sdata_blobs["table"]
+    _write_disk_snapshot_payload(backed_sdata_blobs)
+    _record_mutation(app_state, backed_sdata_blobs, TableComponentPath("obs", (USER_CLASS_COLUMN,)))
+    obs_before = table.obs.copy()
+    features_before = table.obsm["features_1"]
+    uns_keys_before = sorted(table.uns.keys())
+
+    def fail_validation(_table: object) -> None:
+        raise ValueError("validation failed after the install")
+
+    monkeypatch.setattr(TableModel, "validate", fail_validation)
+
+    with pytest.raises(ValueError, match="validation failed after the install"):
+        controller.reload_table_state()
+
+    pd.testing.assert_frame_equal(table.obs, obs_before)
+    assert "disk_features" not in table.obsm
+    assert table.obsm["features_1"] is features_before
+    assert sorted(table.uns.keys()) == uns_keys_before
+    assert controller.has_unsynced_table_changes is True
 
 
 def test_persistence_controller_normalizes_numpy_array_region_attrs_when_reloading(

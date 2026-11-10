@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -9,11 +10,15 @@ from typing import Any
 
 from spatiato.viewer.tiled_points.napari.layer import TiledPointsLayerModel
 
-# This custom layer relies on private napari registration and rendering APIs.
-# Admit only the version pair evaluated by this integration until another pair
-# has its complete layer, controls, and VisPy lifecycle explicitly qualified.
-_SUPPORTED_NAPARI_VERSION = "0.7.1"
-_SUPPORTED_VISPY_VERSION = "0.16.2"
+# This custom layer relies on private napari registration and rendering APIs,
+# tested with napari 0.10.0 and VisPy 0.17.0. Newer versions are admitted
+# without that qualification and may break, so run the tiled-points tests when
+# bumping napari. `_load_napari_compatibility` still fails cleanly if napari
+# moves or renames the private registries.
+_MINIMUM_NAPARI_VERSION = "0.10.0"
+_MINIMUM_VISPY_VERSION = "0.17.0"
+# Leading release number, e.g. (0, 10, 1) for "0.10.1rc1" or "0.10.1.dev3+g1".
+_RELEASE_PATTERN = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 _MISSING = object()
 
 
@@ -132,15 +137,36 @@ def _load_napari_compatibility() -> _NapariCompatibility:
 
 
 def _require_supported_versions(compatibility: _NapariCompatibility) -> None:
-    if (
-        compatibility.napari_version != _SUPPORTED_NAPARI_VERSION
-        or compatibility.vispy_version != _SUPPORTED_VISPY_VERSION
+    if not (
+        _is_at_least(compatibility.napari_version, _MINIMUM_NAPARI_VERSION)
+        and _is_at_least(compatibility.vispy_version, _MINIMUM_VISPY_VERSION)
     ):
         raise TiledPointsLayerCompatibilityError(
-            "The tiled-points renderer currently supports exactly "
-            f"napari {_SUPPORTED_NAPARI_VERSION} with VisPy {_SUPPORTED_VISPY_VERSION}; "
+            "The tiled-points renderer requires "
+            f"napari >= {_MINIMUM_NAPARI_VERSION} with VisPy >= {_MINIMUM_VISPY_VERSION}; "
             f"found napari {compatibility.napari_version} with VisPy {compatibility.vispy_version}."
         )
+
+
+def _is_at_least(installed: str, minimum: str) -> bool:
+    """Return whether the installed release number is at least the minimum.
+
+    Only the release number counts, so a pre-release or development build of
+    the minimum release is admitted. An unrecognized version string is not.
+    """
+    installed_release = _release(installed)
+    minimum_release = _release(minimum)
+    if installed_release is None or minimum_release is None:
+        return False
+    return installed_release >= minimum_release
+
+
+def _release(version_text: str) -> tuple[int, int, int] | None:
+    match = _RELEASE_PATTERN.match(version_text)
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch or 0)
 
 
 def _unregister_tiled_points_layer_for_testing() -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -25,8 +25,9 @@ from qtpy.QtWidgets import (
 
 from spatiato._app_state import (
     SpatiatoAppState,
-    TableDirtySnapshot,
+    TableBusyStateChangedEvent,
     TableStateChangedEvent,
+    format_table_busy_message,
     get_or_create_app_state,
 )
 from spatiato.core.persistence import TableComponentPath
@@ -38,7 +39,6 @@ from spatiato.core.spatialdata import (
     get_image_channel_names_from_sdata,
     get_spatialdata_feature_extraction_image_discovery_for_coordinate_system_and_label_from_sdata,
     get_spatialdata_feature_extraction_label_discovery_for_coordinate_system_from_sdata,
-    get_table,
     validate_table_annotation_coverage,
     validate_table_region_instance_ids,
 )
@@ -157,24 +157,8 @@ _DEFAULT_FEATURE_MATRIX_KEY = "features"
 _DEFAULT_NEW_TABLE_NAME = "features_table"
 
 
-def _shutdown_feature_extraction_controller(
-    app_state: SpatiatoAppState,
-    controller: FeatureExtractionController,
-) -> None:
-    """Detach the destroyed widget without opening a table-reload race.
-
-    Requesting worker cancellation prevents late results from reaching the
-    widget, but an already-running ``hp.tb.add_feature_matrix()`` call may
-    continue writing its table. Keep the controller registered as an app-state
-    table-reload participant until every physical Harpy call has finished:
-
-    widget destroyed while Harpy is writing
-        → detach widget callbacks
-        → retain the controller's matching-table reload guard
-        → unregister the controller after the final worker finishes
-    """
-    controller.shutdown()
-    controller.release_reload_participant_when_safe(lambda: app_state.unregister_table_reload_participant(controller))
+def _quoted_names(names: Sequence[str]) -> str:
+    return ", ".join(f'"{name}"' for name in names)
 
 
 _CREATE_TABLE_OPTION_TEXT = "Create table..."
@@ -214,12 +198,6 @@ class _FeatureExtractionTableComboData:
     @classmethod
     def create_table(cls) -> _FeatureExtractionTableComboData:
         return cls(_FeatureExtractionTableComboMode.CREATE_TABLE)
-
-
-@dataclass(frozen=True)
-class _ActiveFeatureExtractionSnapshot:
-    job_id: int
-    dirty_snapshot: TableDirtySnapshot
 
 
 @dataclass(frozen=True)
@@ -426,8 +404,8 @@ class FeatureExtractionWidget(QWidget):
             on_state_changed=self._on_controller_state_changed,
             on_table_selection_refresh_required=self._on_controller_table_selection_refresh_required,
             on_feature_matrix_changed=self._on_controller_feature_matrix_changed,
+            table_busy_marker=self._app_state,
         )
-        self._active_feature_extraction_snapshot: _ActiveFeatureExtractionSnapshot | None = None
 
         self._label_options: list[SpatialDataLabelsOption] = []
         self._selected_label_option: SpatialDataLabelsOption | None = None
@@ -683,18 +661,15 @@ class FeatureExtractionWidget(QWidget):
 
         self._app_state.sdata_changed.connect(self._on_sdata_changed)
         self._app_state.table_state_changed.connect(self._on_table_state_changed)
-        # Feature Extraction writes through Harpy from its worker. Register the
-        # controller—not this QWidget—so exact-table reload protection can
-        # safely outlive Qt teardown until every non-cooperative call finishes.
-        self._app_state.register_table_reload_participant(self._feature_extraction_controller)
-        app_state = self._app_state
-        controller = self._feature_extraction_controller
-        self.destroyed.connect(
-            lambda *_args, app_state=app_state, controller=controller: _shutdown_feature_extraction_controller(
-                app_state,
-                controller,
-            )
-        )
+        self._app_state.table_busy_state_changed.connect(self._on_table_busy_state_changed)
+        # Widget teardown while a job is still running:
+        #
+        #     widget destroyed
+        #       → controller.shutdown(): detached from the widget, worker asked to quit
+        #       ... harpy keeps writing; the table stays busy ...
+        #     worker finished
+        #       → controller._on_worker_finished() → _clear_job(): busy mark released
+        self.destroyed.connect(self._feature_extraction_controller.shutdown)
         self._update_intensity_features_hint()
         self.refresh_from_sdata(self._app_state.sdata)
 
@@ -2099,52 +2074,78 @@ class FeatureExtractionWidget(QWidget):
         self._bind_current_selection()
 
     def _calculate_feature_matrix(self) -> None:
-        feature_key = self.selected_feature_key
-        # `overwrite_feature_key` is effectively tri-state in this method:
-        # `False` means run normally without overwrite, `True` means the user
-        # confirmed replacing an existing key, and `None` means the overwrite
-        # prompt was canceled so calculation should abort.
-        overwrite_feature_key = False
-        can_check_existing_feature_key = (
-            feature_key is not None
-            and self.selected_spatialdata is not None
-            and self.selected_table_name is not None
-            and self._table_target_state.error_text is None
-            and not self._create_table
-        )
-        # Only inspect `.obsm` when the current table binding is valid enough
-        # to read the selected table safely. The controller still decides
-        # whether calculation can actually run.
-        if can_check_existing_feature_key:
-            table = get_table(self.selected_spatialdata, self.selected_table_name)
-            if feature_key in table.obsm:
-                overwrite_feature_key = self._prompt_overwrite_feature_key_confirmation(
+        controller = self._feature_extraction_controller
+        binding = controller.binding_state
+        sdata, table_name, feature_key = binding.sdata, binding.table_name, binding.feature_key
+        if binding.create_table or not controller.can_calculate or None in (sdata, table_name, feature_key):
+            # A new table has no existing entry to check. Otherwise the
+            # controller cannot launch, and `calculate()` reports why.
+            controller.calculate()
+            return
+
+        # Take the table's dirty state once, at launch. It is used twice:
+        # - its paths go to `check_existing_feature_matrix(...)` below, which
+        #   refuses to launch (backed SpatialData) while the key's paths have
+        #   unsaved changes;
+        # - the snapshot itself goes to `calculate(...)` and comes back in the
+        #   job's result, which `_on_controller_feature_matrix_changed(...)`
+        #   records with `record_persisted_table_change(...)`.
+        dirty_snapshot = self._app_state.snapshot_table_dirty_state(sdata, table_name)
+        # The first of two checks of the existing entry: it picks the dialog,
+        # and the worker checks again against the confirmed kind
+        # (see docs/development/feature_extraction.md).
+        existing = controller.check_existing_feature_matrix(dirty_paths=dirty_snapshot.paths)
+        if existing is None:
+            return  # Blocked, or the check failed; the controller's status says why.
+
+        match existing.kind:
+            case "absent":
+                confirmed = True
+            case "compatible":
+                confirmed = self._confirm_regional_update(
                     feature_key,
-                    self.selected_table_name,
+                    table_name,
+                    tuple(triplet.labels_name for triplet in binding.triplets),
                 )
-                if overwrite_feature_key is None:
-                    return
+            case "incompatible":
+                confirmed = self._confirm_full_replacement(
+                    feature_key,
+                    existing.reason or "",
+                    existing.unselected_regions,
+                )
+        if not confirmed:
+            return
 
-        sdata = self.selected_spatialdata
-        table_name = self._table_target_state.bound_table_name
-        snapshot = (
-            None
-            if sdata is None or table_name is None
-            else self._app_state.snapshot_table_dirty_state(sdata, table_name)
+        controller.calculate(
+            overwrite_feature_key=existing.kind != "absent",
+            confirmed_existing_entry=existing.kind,
+            dirty_snapshot=dirty_snapshot,
         )
-        launched = self._feature_extraction_controller.calculate(overwrite_feature_key=overwrite_feature_key)
-        job_id = self._feature_extraction_controller.active_job_id
-        if launched and job_id is not None and snapshot is not None:
-            self._active_feature_extraction_snapshot = _ActiveFeatureExtractionSnapshot(
-                job_id=job_id,
-                dirty_snapshot=snapshot,
-            )
 
-    def _prompt_overwrite_feature_key_confirmation(
-        self,
-        feature_key: str,
-        table_name: str | None,
-    ) -> bool | None:
+    def _confirm_regional_update(self, feature_key: str, table_name: str, labels_names: Sequence[str]) -> bool:
+        """Ask to replace the values of the selected labels elements in a compatible matrix."""
+        return self._confirm_feature_matrix_replacement(
+            title="Existing Feature Matrix",
+            lines=[
+                f'Feature matrix "{feature_key}" already exists in table "{table_name}".',
+                f"Replace its values for the selected labels element(s) {_quoted_names(labels_names)}? "
+                "Values for other labels elements are kept.",
+            ],
+            button_text="Replace selected regions",
+        )
+
+    def _confirm_full_replacement(self, feature_key: str, reason: str, lost_labels_names: Sequence[str]) -> bool:
+        """Ask to remove an incompatible matrix and calculate it again."""
+        lines = [f'Feature matrix "{feature_key}" exists but cannot be updated by region, because {reason}.']
+        if lost_labels_names:
+            lines.append(f"Replacing it removes the values for labels element(s) {_quoted_names(lost_labels_names)}.")
+        return self._confirm_feature_matrix_replacement(
+            title="Incompatible Feature Matrix",
+            lines=lines,
+            button_text="Replace entire feature matrix",
+        )
+
+    def _confirm_feature_matrix_replacement(self, *, title: str, lines: Sequence[str], button_text: str) -> bool:
         dialog = QDialog(self)
         dialog.setWindowTitle("Feature Matrix Already Exists")
         dialog.setModal(True)
@@ -2154,40 +2155,30 @@ class FeatureExtractionWidget(QWidget):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
 
-        warning_message = (
-            f'Table "{table_name}" already contains ".obsm[{feature_key!r}]".'
-            if table_name is not None
-            else f'The selected table already contains ".obsm[{feature_key!r}]".'
-        )
         warning_card = QLabel()
         warning_card.setWordWrap(True)
-        set_status_card(
-            warning_card,
-            title="Existing Feature Matrix",
-            lines=[warning_message, "Do you want to replace it?"],
-            kind="warning",
-        )
+        set_status_card(warning_card, title=title, lines=list(lines), kind="warning")
         layout.addWidget(warning_card)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(10)
         button_row.addStretch(1)
 
-        overwrite_button = QPushButton("Replace feature matrix")
+        replace_button = QPushButton(button_text)
         cancel_button = QPushButton("Cancel")
 
-        overwrite_button.setStyleSheet(PRIMARY_BUTTON_STYLESHEET)
+        replace_button.setStyleSheet(PRIMARY_BUTTON_STYLESHEET)
         cancel_button.setStyleSheet(SECONDARY_BUTTON_STYLESHEET)
 
-        button_row.addWidget(overwrite_button)
+        button_row.addWidget(replace_button)
         button_row.addWidget(cancel_button)
         layout.addLayout(button_row)
 
-        overwrite_button.clicked.connect(dialog.accept)
+        replace_button.clicked.connect(dialog.accept)
         cancel_button.clicked.connect(dialog.reject)
         cancel_button.setDefault(True)
 
-        return True if dialog.exec() == QDialog.DialogCode.Accepted else None
+        return dialog.exec() == QDialog.DialogCode.Accepted
 
     def _has_intensity_features_selected(self) -> bool:
         return any(self._feature_checkboxes[name].isChecked() for name in _INTENSITY_FEATURES)
@@ -2497,6 +2488,13 @@ class FeatureExtractionWidget(QWidget):
         if not self._feature_extraction_controller.can_calculate:
             return self._feature_extraction_controller.status_message
 
+        # Another job, for example a Spatial Query center calculation, writes
+        # the table (`table_busy_state_changed` refreshes this).
+        binding = self._feature_extraction_controller.binding_state
+        busy_reasons = self._app_state.table_busy_reasons(binding.sdata, binding.table_name)
+        if busy_reasons and binding.table_name is not None:
+            return format_table_busy_message(binding.table_name, busy_reasons)
+
         return None
 
     def _update_calculate_controls(self) -> None:
@@ -2509,13 +2507,25 @@ class FeatureExtractionWidget(QWidget):
         self._set_tooltip(self.calculate_button, blocking_reason)
 
     def _on_controller_state_changed(self) -> None:
-        if not self._feature_extraction_controller.is_running:
-            self._active_feature_extraction_snapshot = None
         self._update_feature_extraction_feedback()
         self._update_calculate_controls()
 
+    def _on_table_busy_state_changed(self, value: object) -> None:
+        """Disable or enable Calculate while a job writes the bound table."""
+        if not isinstance(value, TableBusyStateChangedEvent):
+            return
+        binding = self._feature_extraction_controller.binding_state
+        if value.sdata is not binding.sdata or value.table_name != binding.table_name:
+            return
+        self._update_calculate_controls()
+
     def _on_controller_table_selection_refresh_required(self, result: FeatureExtractionResult) -> None:
-        self._refresh_table_names(preferred_existing_table_name=result.table_name)
+        # The job may have created its table, so rebuild the table choices. Keep
+        # the current selection, also after a detached job, unless the created
+        # table is still the create-table target: then promote it to an existing
+        # table, since creating it again would fail.
+        is_create_target = self.selected_new_table_name == result.table_name
+        self._refresh_table_names(preferred_existing_table_name=result.table_name if is_create_target else None)
         self._bind_current_selection()
 
     def _on_controller_feature_matrix_changed(self, result: FeatureExtractionResult) -> None:
@@ -2532,26 +2542,23 @@ class FeatureExtractionWidget(QWidget):
                     TableComponentPath("uns", ("feature_matrices", result.feature_key)),
                 }
             ),
-            regions=result.labels_names,
+            regions=result.regions,
             change_kind=result.change_kind,
             source="feature_extraction",
         )
         if sdata.is_backed():
-            active_snapshot = self._active_feature_extraction_snapshot
-            snapshot = (
-                active_snapshot.dirty_snapshot
-                if active_snapshot is not None and active_snapshot.job_id == result.job_id
-                else TableDirtySnapshot(sdata=sdata, table_name=result.table_name, captured_path_tokens=())
-            )
-            if active_snapshot is not None and active_snapshot.job_id == result.job_id:
-                self._active_feature_extraction_snapshot = None
-            # Contract: for backed SpatialData, `hp.tb.add_feature_matrix()`
-            # has already persisted both the feature-matrix obsm entry and its
-            # companion uns metadata before this success callback runs. This
-            # call only reconciles shared dirty state and publishes the event.
-            self._app_state.record_persisted_table_change(event, snapshot)
+            # harpy has already written the change to the store, so memory and
+            # store agree: `hp.tb.add_feature_matrix()` wrote `obsm/<key>` and
+            # `uns/feature_matrices/<key>`, or, for a "removed" result,
+            # `hp.tb.io.remove_table_components()` deleted them. Record the
+            # change as persisted: this marks nothing dirty. With the launch
+            # snapshot, it also clears the key's paths if they were dirty at
+            # launch and have not changed since; other dirty paths stay dirty.
+            # That does not normally happen: Calculate refuses to launch while
+            # the key's paths have unsaved changes. A job that creates a new
+            # table has no launch snapshot, so it clears nothing.
+            self._app_state.record_persisted_table_change(event, result.dirty_snapshot)
         else:
-            active_snapshot = self._active_feature_extraction_snapshot
-            if active_snapshot is not None and active_snapshot.job_id == result.job_id:
-                self._active_feature_extraction_snapshot = None
+            # Without a store, the change exists only in memory. Record it as
+            # an unsaved mutation: this marks its paths dirty.
             self._app_state.record_table_mutation(event)

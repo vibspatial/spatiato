@@ -1,21 +1,30 @@
 from __future__ import annotations
 
 import anndata as ad
+import dask.array as da
+import harpy as hp
 import numpy as np
+import pandas as pd
 import pytest
+import zarr
+from anndata.abc import CSRDataset
 from scipy import sparse
+from spatialdata import SpatialData
+from spatialdata.models import TableModel
 
 from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_FEATURE_NAME,
     CUSTOM_OBSM_SOURCE_KIND,
     HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
     FeatureMatrixMetadataState,
+    feature_matrix_n_features,
     inspect_feature_matrix_metadata,
     is_custom_obsm_feature_metadata,
     normalize_feature_columns,
     normalize_feature_matrix_source_kind,
     register_feature_matrix_metadata,
 )
+from spatiato.core.object_classification.classifier import _validate_current_feature_matrix_matches_columns
 
 _FEATURE_MATRICES_KEY = "feature_matrices"
 
@@ -36,6 +45,17 @@ def test_register_feature_matrix_metadata_rejects_missing_obsm_key() -> None:
 
     with pytest.raises(ValueError, match='Feature matrix "missing" is not available in ".obsm"'):
         register_feature_matrix_metadata(table, "missing")
+
+
+@pytest.mark.parametrize("feature_key", ["spatial", "spatial_canonical"])
+def test_register_feature_matrix_metadata_rejects_a_reserved_key(feature_key: str) -> None:
+    table = _make_table()
+    table.obsm[feature_key] = np.zeros((table.n_obs, 2))
+
+    with pytest.raises(ValueError, match=f'`.obsm` key "{feature_key}" is reserved for spatial coordinates'):
+        register_feature_matrix_metadata(table, feature_key)
+
+    assert "feature_matrices" not in table.uns
 
 
 def test_register_feature_matrix_metadata_registers_one_dimensional_matrix() -> None:
@@ -231,6 +251,103 @@ def test_inspect_feature_matrix_metadata_reports_wrong_row_count_as_invalid_matr
     assert state.status == "invalid_matrix"
     assert state.source_kind is None
     assert state.error == "Feature matrix has 2 rows but the table has 3 observations."
+
+
+def _unreadable_dask_matrix(shape: tuple[int, int], meta: object) -> da.Array:
+    """Return a Dask array whose shape and dtype are known but whose values fail to compute."""
+
+    def fail_to_read(block_info: object = None) -> None:
+        raise AssertionError("the feature matrix values were read")
+
+    return da.map_blocks(fail_to_read, chunks=((shape[0],), (shape[1],)), dtype=np.float64, meta=meta)
+
+
+@pytest.mark.parametrize(
+    ("meta", "backend"),
+    [(np.empty((0, 0)), "numpy"), (sparse.csr_matrix((0, 0)), "sparse")],
+    ids=["dense", "sparse"],
+)
+def test_feature_matrix_metadata_reads_only_shape_and_dtype_of_a_lazy_matrix(meta: object, backend: str) -> None:
+    matrix = _unreadable_dask_matrix((3, 4), meta)
+    # Test setup: reading the values fails.
+    with pytest.raises(AssertionError, match="values were read"):
+        matrix.compute()
+    table = _FeatureMatrixTable(obsm={"lazy": matrix})
+
+    unregistered = inspect_feature_matrix_metadata(table, "lazy")
+    metadata = register_feature_matrix_metadata(table, "lazy")
+    registered = inspect_feature_matrix_metadata(table, "lazy")
+
+    assert unregistered.status == "unregistered"
+    assert unregistered.n_features == 4
+    assert metadata["backend"] == backend
+    assert metadata["dtype"] == "float64"
+    assert registered.status == "registered_valid"
+    assert registered.n_features == 4
+
+
+def _fail_on_value_reads(monkeypatch: pytest.MonkeyPatch, handle: object) -> None:
+    """Make every way of reading the values of a backed handle fail."""
+
+    def fail_to_read(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the feature matrix values were read")
+
+    # `__array__` serves `np.asarray(...)`; `to_memory` loads a `CSRDataset`.
+    for name in ("__getitem__", "__array__", "to_memory"):
+        if hasattr(type(handle), name):
+            monkeypatch.setattr(type(handle), name, fail_to_read)
+
+
+@pytest.mark.parametrize("component", [("obsm", "dense"), ("X",)], ids=["zarr_array", "csr_dataset"])
+def test_feature_matrix_n_features_reads_a_backed_matrix_without_loading_it(
+    component: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    adata = ad.AnnData(X=sparse.csr_matrix(np.eye(3, 5)))
+    adata.obsm["dense"] = np.zeros((3, 5))
+    path = tmp_path / "table.zarr"
+    SpatialData(tables={"table": TableModel.parse(adata)}).write(path)
+    backed = hp.tb.io.read_table_components(path, table_name="table", components=[component], mode="backed")[component]
+    # Test setup: harpy's reader attaches a backed handle, and reading its values fails.
+    assert isinstance(backed, (zarr.Array, CSRDataset))
+    _fail_on_value_reads(monkeypatch, backed)
+    with pytest.raises(AssertionError, match="values were read"):
+        backed[:]
+
+    assert feature_matrix_n_features(backed, 3) == 5
+
+
+def test_classifier_column_check_reads_only_the_shape_of_a_lazy_matrix() -> None:
+    table = _FeatureMatrixTable(obsm={"lazy": _unreadable_dask_matrix((3, 4), np.empty((0, 0)))})
+
+    _validate_current_feature_matrix_matches_columns(table, "lazy", ("a", "b", "c", "d"))
+    with pytest.raises(ValueError, match="has 4 column"):
+        _validate_current_feature_matrix_matches_columns(table, "lazy", ("a", "b"))
+
+
+def test_feature_matrix_n_features_counts_a_one_dimensional_matrix_as_one_column() -> None:
+    assert feature_matrix_n_features(np.zeros(3), 3) == 1
+
+
+def test_inspect_feature_matrix_metadata_reports_object_matrix_as_invalid() -> None:
+    table = _FeatureMatrixTable(obsm={"values": np.array([[1, 2]] * 3, dtype=object)})
+
+    state = inspect_feature_matrix_metadata(table, "values")
+
+    assert state.status == "invalid_matrix"
+    assert state.error == "Feature matrix dtype `object` is not numeric."
+
+
+def test_inspect_feature_matrix_metadata_reports_dataframe_as_invalid() -> None:
+    table = _FeatureMatrixTable(obsm={"values": pd.DataFrame({"area": [1.0, 2.0, 3.0]})})
+
+    state = inspect_feature_matrix_metadata(table, "values")
+
+    assert state.status == "invalid_matrix"
+    assert state.error == (
+        "Feature matrices must be arrays, not DataFrames; store the values as an array, for example with `.to_numpy()`."
+    )
 
 
 def test_inspect_feature_matrix_metadata_reports_unregistered_matrix() -> None:

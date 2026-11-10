@@ -10,7 +10,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from spatialdata import SpatialData, read_zarr
+from harpy.io import read_zarr
+from spatialdata import SpatialData
 from spatialdata.datasets import blobs
 
 from spatiato.datasets import blobs_multi_region, blobs_points_repartitioned
@@ -74,7 +75,11 @@ def sdata_blobs_points_repartitioned() -> SpatialData:
 
 @pytest.fixture
 def backed_sdata_blobs(tmp_path) -> SpatialData:
-    """Return a backed SpatialData test object stored in a temporary zarr directory."""
+    """Return a backed SpatialData test object stored in a temporary zarr directory.
+
+    The backed fixtures open their store with harpy's reader, as Spatiato
+    does, so their table matrices are lazy Dask arrays.
+    """
     path = tmp_path / "blobs.zarr"
     sdata = _make_sdata_blobs()
     sdata.write(path)

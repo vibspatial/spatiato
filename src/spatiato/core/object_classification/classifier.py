@@ -5,8 +5,9 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 from harpy.utils._keys import _FEATURE_MATRICES_KEY
@@ -19,13 +20,14 @@ from spatiato.core.class_palette import (
 )
 from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
+    feature_matrix_n_features,
     normalize_feature_columns,
-    normalize_feature_matrix,
     normalize_feature_matrix_source_kind,
 )
 from spatiato.core.object_classification.annotation import USER_CLASS_COLUMN
 from spatiato.core.object_classification.classifier_export import ClassifierExportBundle
 from spatiato.core.spatialdata import get_table, get_table_metadata
+from spatiato.core.table_matrix import read_matrix_rows
 from spatiato.core.validation import normalize_spatialdata_dataframe_column_name
 
 try:
@@ -44,11 +46,21 @@ if TYPE_CHECKING:
 BoolArray = NDArray[np.bool_]
 TableRowPositions = NDArray[np.int64]
 
+
+def prediction_confidence_column(pred_class_column: str) -> str:
+    """Return the confidence column that goes with the prediction class column `pred_class_column`.
+
+    It is derived, not chosen, as the palette is (`f"{pred_class_column}_colors"`),
+    so two class columns can never share one confidence column.
+    """
+    return f"{pred_class_column}_confidence"
+
+
 PRED_CLASS_COLUMN = "pred_class"
 PRED_CLASS_COLORS_KEY = f"{PRED_CLASS_COLUMN}_colors"
-PRED_CONFIDENCE_COLUMN = "pred_confidence"
+PRED_CONFIDENCE_COLUMN = prediction_confidence_column(PRED_CLASS_COLUMN)
 CLASSIFIER_CONFIG_KEY = "classifier_config"
-CLASSIFIER_APPLY_CONFIG_KEY = "classifier_apply_config"
+ClassifierConfigSource = Literal["widget", "apply_classifier"]
 
 
 class ObjectClassificationStateError(ValueError):
@@ -148,6 +160,88 @@ class ClassifierApplyResult:
     applied_at: str
 
 
+def build_classifier_config_entry(
+    *,
+    source: ClassifierConfigSource,
+    pred_class_column: str,
+    feature_key: str,
+    prediction_regions: Sequence[str],
+    prediction_timestamp: str,
+    prediction_scope: str | None,
+    classifier_path: str | None,
+    reason: str | None,
+    model_provenance: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Return one entry of `uns["classifier_config"]`.
+
+    `uns["classifier_config"]` maps each prediction class column to one
+    entry: who last wrote that column, and how. The Object Classification
+    widget writes the `pred_class` entry, and `apply_classifier(...)` the
+    entry of its `pred_class_column`. Whoever writes a column replaces its
+    entry (`store_classifier_config_entry(...)`), so no writer removes
+    another's entry. The prediction counts are not stored: the class column
+    within `prediction_regions` holds them. The entry also records the
+    confidence column, `prediction_confidence_column(pred_class_column)`, so
+    it describes itself.
+
+    Parameters
+    ----------
+    source
+        Who wrote the columns: `"widget"` or `"apply_classifier"`.
+    pred_class_column
+        The column of predicted classes, and the entry's key.
+    feature_key
+        The `obsm` key of the matrix the predictions were computed from.
+    prediction_regions
+        The labels elements whose rows this writer cleared and predicted.
+    prediction_timestamp
+        When the columns were written, in ISO 8601.
+    prediction_scope
+        The widget's prediction scope mode; `None` for `apply_classifier(...)`.
+    classifier_path
+        The exported classifier file `apply_classifier(...)` applied, if
+        given; `None` for the widget.
+    reason
+        Why no model was trained, or `None`.
+    model_provenance
+        How the model was obtained, or `None` when no model was trained:
+        `feature_key` (the key the model was trained on), `model_type`,
+        `rf_params`, `training_scope`, `training_regions`, `n_features`,
+        `training_timestamp`, `n_training_labels` and `class_labels_seen`.
+        The export bundle carries the same mapping.
+    """
+    return {
+        "source": source,
+        "pred_class_column": pred_class_column,
+        "pred_confidence_column": prediction_confidence_column(pred_class_column),
+        "feature_key": feature_key,
+        "prediction_regions": list(prediction_regions),
+        "prediction_timestamp": prediction_timestamp,
+        "prediction_scope": prediction_scope,
+        "classifier_path": classifier_path,
+        "reason": reason,
+        "model_provenance": None if model_provenance is None else deepcopy(dict(model_provenance)),
+    }
+
+
+def store_classifier_config_entry(table: AnnData, entry: dict[str, object]) -> None:
+    """Store `entry` in `uns["classifier_config"]`, under its prediction class column.
+
+    It replaces the entry of whoever wrote that column before, and leaves the
+    entries of other columns alone.
+    """
+    table.uns.setdefault(CLASSIFIER_CONFIG_KEY, {})[entry["pred_class_column"]] = entry
+
+
+def get_classifier_config_entry(table: AnnData, pred_class_column: str) -> Mapping[str, object] | None:
+    """Return the `uns["classifier_config"]` entry of `pred_class_column`, or `None`."""
+    config = table.uns.get(CLASSIFIER_CONFIG_KEY)
+    if not isinstance(config, Mapping):
+        return None
+    entry = config.get(pred_class_column)
+    return entry if isinstance(entry, Mapping) else None
+
+
 def apply_classifier(
     sdata: SpatialData,
     bundle: ClassifierExportBundle,
@@ -156,27 +250,27 @@ def apply_classifier(
     feature_key: str | None = None,
     prediction_regions: Sequence[str] | None = None,
     pred_class_column: str = PRED_CLASS_COLUMN,
-    pred_confidence_column: str = PRED_CONFIDENCE_COLUMN,
     classifier_path: str | Path | None = None,
 ) -> ClassifierApplyResult:
-    """Apply an exported classifier bundle to an existing compatible feature matrix."""
+    """Apply an exported classifier bundle to an existing compatible feature matrix.
+
+    The confidences go to `prediction_confidence_column(pred_class_column)`.
+    """
     resolved_table_name = _normalize_nonempty_str(table_name, "table_name")
     resolved_feature_key = (
         bundle.feature_key if feature_key is None else _normalize_nonempty_str(feature_key, "feature_key")
     )
     resolved_pred_class_column = normalize_spatialdata_dataframe_column_name(pred_class_column, "pred_class_column")
-    resolved_pred_confidence_column = normalize_spatialdata_dataframe_column_name(
-        pred_confidence_column,
-        "pred_confidence_column",
-    )
-    if resolved_pred_class_column == resolved_pred_confidence_column:
-        raise ValueError("pred_class_column and pred_confidence_column must be different.")
 
     table = get_table(sdata, resolved_table_name)
     metadata = get_table_metadata(sdata, resolved_table_name)
     _validate_feature_matrix_compatible_with_bundle(table, resolved_feature_key, bundle)
-    feature_matrix = normalize_feature_matrix(table.obsm[resolved_feature_key], table.n_obs, copy=False)
-    _validate_estimator_matches_feature_matrix(bundle, feature_matrix, resolved_feature_key)
+    feature_matrix = table.obsm[resolved_feature_key]
+    _validate_estimator_matches_feature_matrix(
+        bundle,
+        feature_matrix_n_features(feature_matrix, table.n_obs),
+        resolved_feature_key,
+    )
 
     # Resolve the requested regions against the table metadata so typos fail instead of being skipped silently.
     resolved_prediction_regions = _resolve_prediction_regions(prediction_regions, metadata.regions)
@@ -185,13 +279,12 @@ def apply_classifier(
         metadata.region_key,
         resolved_prediction_regions,
     )
-    feature_valid_row_mask = _get_finite_feature_row_mask(feature_matrix)
-    valid_in_scope_mask = feature_valid_row_mask[raw_prediction_positions]
-    prediction_positions = np.asarray(raw_prediction_positions[valid_in_scope_mask], dtype=np.int64)
+    # Only the prediction rows are read; those without finite features are skipped.
+    predict_features, prediction_finite = _read_rows_with_finite_features(feature_matrix, raw_prediction_positions)
+    prediction_positions = np.asarray(raw_prediction_positions[prediction_finite], dtype=np.int64)
 
     if prediction_positions.size:
-        predict_features = feature_matrix[prediction_positions]
-        pred_classes, pred_confidences = _predict_classifier(bundle, predict_features)
+        pred_classes, pred_confidences = _predict_classes_and_confidences(bundle.estimator, predict_features)
     else:
         pred_classes = np.array([], dtype=np.int64)
         pred_confidences = np.array([], dtype=np.float64)
@@ -206,12 +299,20 @@ def apply_classifier(
         pred_classes=pred_classes,
         pred_confidences=pred_confidences,
         pred_class_column=resolved_pred_class_column,
-        pred_confidence_column=resolved_pred_confidence_column,
     )
-    table.uns[CLASSIFIER_APPLY_CONFIG_KEY] = _build_classifier_apply_config(
-        bundle,
-        result,
-        classifier_path=classifier_path,
+    store_classifier_config_entry(
+        table,
+        build_classifier_config_entry(
+            source="apply_classifier",
+            pred_class_column=result.pred_class_column,
+            feature_key=result.feature_key,
+            prediction_regions=result.prediction_regions,
+            prediction_timestamp=result.applied_at,
+            prediction_scope=None,
+            classifier_path=None if classifier_path is None else str(classifier_path),
+            reason=None,
+            model_provenance=bundle.model_provenance,
+        ),
     )
     return result
 
@@ -227,7 +328,6 @@ def _write_classifier_predictions(
     pred_classes: np.ndarray,
     pred_confidences: np.ndarray,
     pred_class_column: str = PRED_CLASS_COLUMN,
-    pred_confidence_column: str = PRED_CONFIDENCE_COLUMN,
 ) -> ClassifierApplyResult:
     prediction_state_change = _update_table_prediction_state(
         table,
@@ -236,7 +336,6 @@ def _write_classifier_predictions(
         pred_classes=pred_classes,
         pred_confidences=pred_confidences,
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
     )
 
     return ClassifierApplyResult(
@@ -248,7 +347,7 @@ def _write_classifier_predictions(
             raw_prediction_table_row_positions.size - prediction_table_row_positions.size
         ),
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
+        pred_confidence_column=prediction_confidence_column(pred_class_column),
         prediction_state_change=prediction_state_change,
         applied_at=datetime.now(UTC).isoformat(),
     )
@@ -306,15 +405,15 @@ def _validate_current_feature_matrix_matches_columns(
     custom_obsm: bool = False,
 ) -> None:
     try:
-        feature_matrix = normalize_feature_matrix(table.obsm[feature_key], table.n_obs, copy=False)
+        n_features = feature_matrix_n_features(table.obsm[feature_key], table.n_obs)
     except KeyError as error:
         raise ValueError(f"Feature matrix `{feature_key}` is not available in `.obsm`.") from error
 
-    if int(feature_matrix.shape[1]) != len(feature_columns):
+    if n_features != len(feature_columns):
         raise ValueError(
             _format_feature_matrix_width_mismatch_error(
                 feature_key,
-                n_features=int(feature_matrix.shape[1]),
+                n_features=n_features,
                 metadata_n_features=len(feature_columns),
                 custom_obsm=custom_obsm,
             )
@@ -323,13 +422,13 @@ def _validate_current_feature_matrix_matches_columns(
 
 def _validate_estimator_matches_feature_matrix(
     bundle: ClassifierExportBundle,
-    feature_matrix: Any,
+    n_features: int,
     feature_key: str,
 ) -> None:
     estimator_feature_count = getattr(bundle.estimator, "n_features_in_", None)
-    if estimator_feature_count is not None and int(estimator_feature_count) != int(feature_matrix.shape[1]):
+    if estimator_feature_count is not None and int(estimator_feature_count) != n_features:
         raise ValueError(
-            f"Feature matrix `{feature_key}` has {int(feature_matrix.shape[1])} column(s), but the classifier "
+            f"Feature matrix `{feature_key}` has {n_features} column(s), but the classifier "
             f"estimator expects {int(estimator_feature_count)} feature column(s)."
         )
 
@@ -374,32 +473,17 @@ def _resolve_prediction_regions(
     return normalized_regions
 
 
-def _predict_classifier(bundle: ClassifierExportBundle, predict_features: Any) -> tuple[np.ndarray, np.ndarray]:
-    pred_classes = np.asarray(bundle.estimator.predict(predict_features), dtype=np.int64)
-    pred_proba = np.asarray(bundle.estimator.predict_proba(predict_features), dtype=np.float64)
-    pred_confidences = pred_proba.max(axis=1)
-    return pred_classes, pred_confidences
+def _predict_classes_and_confidences(estimator: Any, features: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return each row's predicted class and its probability, with one pass over the forest.
 
-
-def _build_classifier_apply_config(
-    bundle: ClassifierExportBundle,
-    result: ClassifierApplyResult,
-    *,
-    classifier_path: str | Path | None,
-) -> dict[str, object]:
-    return {
-        "applied": True,
-        "apply_timestamp": result.applied_at,
-        "classifier_path": None if classifier_path is None else str(classifier_path),
-        "source_classifier_config": deepcopy(bundle.source_classifier_config),
-        "table_name": result.table_name,
-        "feature_key": result.feature_key,
-        "prediction_regions": list(result.prediction_regions),
-        "n_predicted_rows": result.n_predicted_rows,
-        "n_skipped_feature_invalid_rows": result.n_skipped_feature_invalid_rows,
-        "pred_class_column": result.pred_class_column,
-        "pred_confidence_column": result.pred_confidence_column,
-    }
+    For a single-output classifier, `predict(...)` is
+    `classes_[argmax(predict_proba(...))]`, so calling both would run every
+    tree twice.
+    """
+    pred_proba = np.asarray(estimator.predict_proba(features), dtype=np.float64)
+    best = np.argmax(pred_proba, axis=1)
+    pred_classes = np.asarray(estimator.classes_.take(best), dtype=np.int64)
+    return pred_classes, pred_proba.max(axis=1)
 
 
 def _normalize_nonempty_str(value: str, name: str) -> str:
@@ -422,6 +506,24 @@ def _get_finite_feature_row_mask(feature_matrix: Any) -> BoolArray:
 
     finite_feature_mask = np.isfinite(np.asarray(feature_matrix, dtype=np.float64))
     return np.asarray(finite_feature_mask.all(axis=1), dtype=bool)
+
+
+def _read_rows_with_finite_features(matrix: Any, positions: TableRowPositions) -> tuple[Any, BoolArray]:
+    """Read the rows at `positions` into memory, and return those whose features are all finite, with that mask.
+
+    This is the only place where Object Classification reads feature values:
+    in the widget's classifier worker, and in headless `apply_classifier(...)`.
+    The widget's main thread reads none.
+    """
+    # As in `feature_matrix_n_features(...)`, a 1-D matrix counts as one column.
+    if isinstance(matrix, (np.ndarray, da.Array)) and matrix.ndim == 1:
+        matrix = matrix.reshape(-1, 1)
+    # The feature values of these rows are read into memory here.
+    rows = read_matrix_rows(matrix, positions)
+    if not issparse(rows):
+        rows = np.asarray(rows, dtype=np.float64)
+    finite = _get_finite_feature_row_mask(rows)
+    return rows[finite], finite
 
 
 def _resolve_region_row_positions(obs: pd.DataFrame, region_key: str, regions: tuple[str, ...]) -> TableRowPositions:
@@ -466,7 +568,6 @@ def _clear_predictions_for_row_positions(
     prediction_table_row_positions: TableRowPositions,
     *,
     pred_class_column: str = PRED_CLASS_COLUMN,
-    pred_confidence_column: str = PRED_CONFIDENCE_COLUMN,
 ) -> PredictionStateChange:
     """Clear stale predictions when no replacement result can be produced.
 
@@ -486,18 +587,17 @@ def _clear_predictions_for_row_positions(
     prediction_table_row_positions
         Table row positions whose existing predictions must be cleared.
     pred_class_column
-        Observation column containing categorical prediction classes.
-    pred_confidence_column
-        Observation column containing floating-point prediction confidence.
+        Observation column containing categorical prediction classes. Its
+        confidence column is `prediction_confidence_column(pred_class_column)`.
 
     Returns
     -------
     PredictionStateChange
         Flags identifying the prediction columns or palette that changed.
     """
-    # Clearing removes existing prediction values; it must not create
-    # ``pred_class`` or ``pred_confidence`` merely because clear was requested.
-    if pred_class_column not in table.obs and pred_confidence_column not in table.obs:
+    # Clearing removes existing prediction values; it must not create the
+    # class or confidence column merely because clear was requested.
+    if pred_class_column not in table.obs and prediction_confidence_column(pred_class_column) not in table.obs:
         return PredictionStateChange(
             pred_class_changed=False,
             pred_confidence_changed=False,
@@ -511,7 +611,6 @@ def _clear_predictions_for_row_positions(
         pred_classes=np.array([], dtype=np.int64),
         pred_confidences=np.array([], dtype=np.float64),
         pred_class_column=pred_class_column,
-        pred_confidence_column=pred_confidence_column,
     )
 
 
@@ -523,7 +622,6 @@ def _update_table_prediction_state(
     pred_classes: np.ndarray,
     pred_confidences: np.ndarray,
     pred_class_column: str,
-    pred_confidence_column: str,
 ) -> PredictionStateChange:
     """Conditionally mutate in-memory prediction columns and their palette.
 
@@ -546,9 +644,9 @@ def _update_table_prediction_state(
         Replacement confidence values aligned one-to-one with
         ``prediction_row_positions``.
     pred_class_column
-        Observation column containing categorical prediction classes.
-    pred_confidence_column
-        Observation column containing floating-point prediction confidence.
+        Observation column containing categorical prediction classes. The
+        floating-point confidences go to
+        `prediction_confidence_column(pred_class_column)`.
 
     Returns
     -------
@@ -564,6 +662,7 @@ def _update_table_prediction_state(
     prediction state as a no-op must return before invoking this mutation
     boundary.
     """
+    pred_confidence_column = prediction_confidence_column(pred_class_column)
     has_pred_class = pred_class_column in table.obs
     has_pred_confidence = pred_confidence_column in table.obs
     if has_pred_class != has_pred_confidence:
@@ -600,9 +699,7 @@ def _update_table_prediction_state(
         raise ValueError("Prediction row positions and class values must have equal lengths.")
     if prediction_row_positions.size != normalized_pred_confidences.size:
         raise ValueError("Prediction row positions and confidence values must have equal lengths.")
-    if prediction_row_positions.size and not bool(
-        np.isin(prediction_row_positions, clear_row_positions).all()
-    ):
+    if prediction_row_positions.size and not bool(np.isin(prediction_row_positions, clear_row_positions).all()):
         raise ValueError("Prediction row positions must be a subset of clear row positions.")
     if normalized_pred_classes.size and bool((normalized_pred_classes <= 0).any()):
         raise ValueError("Predicted class ids must be positive integers.")
@@ -620,8 +717,8 @@ def _update_table_prediction_state(
         replacement_pred_confidence.iloc[prediction_row_positions] = normalized_pred_confidences
 
     pred_class_changed = not has_pred_class or not replacement_pred_class.equals(table.obs[pred_class_column])
-    pred_confidence_changed = (
-        not has_pred_confidence or not replacement_pred_confidence.equals(table.obs[pred_confidence_column])
+    pred_confidence_changed = not has_pred_confidence or not replacement_pred_confidence.equals(
+        table.obs[pred_confidence_column]
     )
     next_palette = _derive_prediction_palette(
         table,
@@ -670,8 +767,7 @@ def _derive_prediction_palette(
         user_color_lookup = dict(zip(user_categories, user_colors, strict=True))
 
     return [
-        user_color_lookup.get(int(class_id), default_labeled_class_color(int(class_id)))
-        for class_id in pred_categories
+        user_color_lookup.get(int(class_id), default_labeled_class_color(int(class_id))) for class_id in pred_categories
     ]
 
 

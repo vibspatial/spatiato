@@ -19,7 +19,6 @@ from spatiato.core.spatialdata import (
     get_annotating_table_names,
     get_coordinate_system_names_from_sdata,
     get_image_channel_names_from_sdata,
-    get_shape_column_color_source_options,
     get_spatialdata_feature_extraction_image_discovery_for_coordinate_system_and_label_from_sdata,
     get_spatialdata_feature_extraction_label_discovery_for_coordinate_system_from_sdata,
     get_spatialdata_image_options_for_coordinate_system_from_sdata,
@@ -31,11 +30,9 @@ from spatiato.core.spatialdata import (
     get_spatialdata_shapes_options_from_sdata,
     get_table,
     get_table_annotated_labels_names,
-    get_table_color_source_options,
     get_table_metadata,
-    get_table_obs_color_source_options,
     get_table_obsm_keys,
-    get_table_x_var_color_source_options,
+    get_table_var_matrix,
     normalize_table_metadata,
     validate_table_annotation_coverage,
     validate_table_binding,
@@ -135,76 +132,27 @@ def test_get_table_obsm_keys_returns_sorted_feature_matrix_keys(sdata_blobs: Spa
     assert obsm_keys == ["features_1", "features_2"]
 
 
-def test_get_table_obs_color_source_options_classifies_supported_columns(sdata_blobs: SpatialData) -> None:
+def test_get_table_obsm_keys_leaves_out_the_keys_reserved_for_spatial_coordinates(sdata_blobs: SpatialData) -> None:
     table = sdata_blobs["table"]
-    n_obs = table.n_obs
-    repeated_values = ["a", "b"] * (n_obs // 2) + (["a"] if n_obs % 2 else [])
+    table.obsm["spatial"] = np.zeros((table.n_obs, 2))
+    table.obsm["spatial_canonical"] = np.zeros((table.n_obs, 3))
 
-    table.obs["cat_obs"] = pd.Categorical(repeated_values)
-    table.obs["bool_obs"] = pd.Series([index % 2 == 0 for index in range(n_obs)], index=table.obs.index)
-    table.obs["binary_int_obs"] = pd.Series([index % 2 for index in range(n_obs)], index=table.obs.index, dtype="int64")
-    table.obs["int_obs"] = pd.Series(np.arange(n_obs), index=table.obs.index, dtype="int64")
-    table.obs["float_obs"] = pd.Series(np.linspace(0.0, 1.0, n_obs), index=table.obs.index, dtype="float64")
-    table.obs["string_obs"] = pd.Series(repeated_values, index=table.obs.index, dtype="object")
-    table.obs["string_id_obs"] = pd.Series(
-        [f"cell-{index:04d}" for index in range(n_obs)],
-        index=table.obs.index,
-        dtype="object",
-    )
-    table.obs["cat_id_obs"] = pd.Categorical([f"cell-{index:04d}" for index in range(n_obs)])
-    table.obs["datetime_obs"] = pd.date_range("2024-01-01", periods=n_obs)
-    table.obs["object_obs"] = pd.Series(
-        [{"index": index} for index in range(n_obs)], index=table.obs.index, dtype="object"
-    )
-
-    options = get_table_obs_color_source_options(sdata_blobs, "table")
-
-    option_by_key = {option.value_key: option for option in options}
-
-    assert "region" not in option_by_key
-    assert option_by_key["instance_id"].value_kind == "instance"
-    assert option_by_key["cat_obs"].value_kind == "categorical"
-    assert option_by_key["bool_obs"].value_kind == "categorical"
-    assert option_by_key["binary_int_obs"].value_kind == "categorical"
-    assert option_by_key["int_obs"].value_kind == "continuous"
-    assert option_by_key["float_obs"].value_kind == "continuous"
-    assert option_by_key["string_obs"].value_kind == "categorical"
-    assert option_by_key["string_id_obs"].value_kind == "categorical"
-    assert option_by_key["cat_id_obs"].value_kind == "categorical"
-    assert "datetime_obs" not in option_by_key
-    assert "object_obs" not in option_by_key
-    assert option_by_key["cat_obs"].source_kind == "obs_column"
-    assert option_by_key["instance_id"].source_kind == "obs_column"
-    assert option_by_key["cat_obs"].display_name == "cat_obs"
-    assert option_by_key["instance_id"].display_name == "instance_id"
-    assert option_by_key["cat_obs"].identity == ("table", "obs_column", "cat_obs")
-    assert option_by_key["instance_id"].identity == ("table", "obs_column", "instance_id")
+    assert get_table_obsm_keys(sdata_blobs, "table") == ["features_1", "features_2"]
 
 
-def test_get_table_x_var_color_source_options_exposes_var_names_as_continuous_sources(
-    sdata_blobs: SpatialData,
-) -> None:
-    options = get_table_x_var_color_source_options(sdata_blobs, "table")
-
-    assert [option.value_key for option in options] == ["channel_0_sum", "channel_1_sum", "channel_2_sum"]
-    assert all(option.source_kind == "x_var" for option in options)
-    assert all(option.value_kind == "continuous" for option in options)
-    assert [option.display_name for option in options] == ["channel_0_sum", "channel_1_sum", "channel_2_sum"]
-
-
-def test_get_table_color_source_options_combines_obs_and_x_var_sources(sdata_blobs: SpatialData) -> None:
+def test_get_table_var_matrix_returns_x_or_the_layer_as_attached(sdata_blobs: SpatialData) -> None:
     table = sdata_blobs["table"]
-    table.obs["cat_obs"] = pd.Categorical(["a"] * table.n_obs)
+    counts = table.X.copy()
+    table.layers["counts"] = counts
 
-    options = get_table_color_source_options(sdata_blobs, "table")
+    assert get_table_var_matrix(table, None) is table.X
+    assert get_table_var_matrix(table, "counts") is table.layers["counts"]
+    with pytest.raises(ValueError, match='Layer "raw" is not available in the selected table'):
+        get_table_var_matrix(table, "raw")
 
-    assert [option.identity for option in options] == [
-        ("table", "obs_column", "instance_id"),
-        ("table", "obs_column", "cat_obs"),
-        ("table", "x_var", "channel_0_sum"),
-        ("table", "x_var", "channel_1_sum"),
-        ("table", "x_var", "channel_2_sum"),
-    ]
+    table.X = None
+    with pytest.raises(ValueError, match="The selected table has no `X`"):
+        get_table_var_matrix(table, None)
 
 
 def test_shape_color_source_spec_identity_and_display_name() -> None:
@@ -216,54 +164,6 @@ def test_shape_color_source_spec_identity_and_display_name() -> None:
 
     assert source.identity == ("shape_column", "cell_type")
     assert source.display_name == "cell_type"
-
-
-def test_get_shape_column_color_source_options_classifies_supported_columns() -> None:
-    geodataframe = gpd.GeoDataFrame(
-        {
-            "cat_shape": pd.Categorical(["a", "b", "a"]),
-            "bool_shape": pd.Series([True, False, True], dtype="bool"),
-            "binary_int_shape": pd.Series([0, 1, 0], dtype="int64"),
-            "int_shape": pd.Series([1, 2, 3], dtype="int64"),
-            "float_shape": pd.Series([0.1, 0.2, 0.3], dtype="float64"),
-            "string_shape": pd.Series(["alpha", "beta", "alpha"], dtype="object"),
-            "radius": pd.Series([5.0, 6.0, 7.0], dtype="float64"),
-            "cat_shape_colors": ["red", "blue", "red"],
-            "manual_color": ["red", "blue", "red"],
-            "style.color": ["red", "blue", "red"],
-            "all_missing": pd.Series([None, None, None], dtype="object"),
-            "mixed_shape": pd.Series(["alpha", 1, "beta"], dtype="object"),
-            "object_shape": pd.Series([{"a": 1}, {"b": 2}, {"c": 3}], dtype="object"),
-        },
-        geometry=[
-            Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
-            Polygon([(2, 0), (3, 0), (3, 1), (2, 1)]),
-            Polygon([(4, 0), (5, 0), (5, 1), (4, 1)]),
-        ],
-    )
-    fake_sdata = DummySpatialData(shapes={"cell_boundaries": geodataframe})
-
-    options = get_shape_column_color_source_options(fake_sdata, "cell_boundaries")
-
-    option_by_key = {option.value_key: option for option in options}
-
-    assert "geometry" not in option_by_key
-    assert "cat_shape_colors" not in option_by_key
-    assert "manual_color" not in option_by_key
-    assert "style.color" not in option_by_key
-    assert "all_missing" not in option_by_key
-    assert "mixed_shape" not in option_by_key
-    assert "object_shape" not in option_by_key
-    assert option_by_key["cat_shape"].value_kind == "categorical"
-    assert option_by_key["bool_shape"].value_kind == "categorical"
-    assert option_by_key["binary_int_shape"].value_kind == "categorical"
-    assert option_by_key["int_shape"].value_kind == "continuous"
-    assert option_by_key["float_shape"].value_kind == "continuous"
-    assert option_by_key["string_shape"].value_kind == "categorical"
-    assert option_by_key["radius"].value_kind == "continuous"
-    assert option_by_key["cat_shape"].source_kind == "shape_column"
-    assert option_by_key["cat_shape"].display_name == "cat_shape"
-    assert option_by_key["cat_shape"].identity == ("shape_column", "cat_shape")
 
 
 def test_get_table_metadata_resolves_table_metadata(sdata_blobs: SpatialData) -> None:

@@ -65,7 +65,8 @@ class _FakeLabelsEvents:
 
 
 class _FakeLabelsLayer:
-    def __init__(self) -> None:
+    def __init__(self, dtype: type[np.integer] = np.int32) -> None:
+        self.data = np.zeros((1, 1), dtype=dtype)
         self.colormap: DirectLabelColormap | None = None
         self.features = pd.DataFrame()
         self.refresh_count = 0
@@ -80,30 +81,16 @@ class _FakeLabelsLayer:
 class _FakeViewerAdapter:
     def __init__(self, layer: _FakeLabelsLayer) -> None:
         self._layer = layer
-        self.sync_display_layers: list[_FakeLabelsLayer] = []
 
     def get_loaded_primary_labels_layer(self, *args: Any, **kwargs: Any) -> _FakeLabelsLayer:
         del args, kwargs
         return self._layer
-
-    def sync_labels_display_after_colormap_change(self, layer: _FakeLabelsLayer) -> None:
-        self.sync_display_layers.append(layer)
 
 
 def _make_controller(sdata: SpatialData, layer: _FakeLabelsLayer) -> ViewerStylingController:
     controller = ViewerStylingController(_FakeViewerAdapter(layer))
     controller.bind(sdata, "blobs_labels", "table")
     return controller
-
-
-def _make_controller_with_adapter(
-    sdata: SpatialData,
-    layer: _FakeLabelsLayer,
-) -> tuple[ViewerStylingController, _FakeViewerAdapter]:
-    adapter = _FakeViewerAdapter(layer)
-    controller = ViewerStylingController(adapter)
-    controller.bind(sdata, "blobs_labels", "table")
-    return controller, adapter
 
 
 def _feature_rows(
@@ -255,15 +242,14 @@ def test_user_class_coloring_uses_missing_palette_fallback_without_table_mutatio
     np.testing.assert_allclose(layer.colormap.map(5), _expected_rgba(default_categorical_colors(2)[0]))
 
 
-def test_all_unlabeled_user_class_coloring_force_syncs_after_full_repaint(sdata_blobs: SpatialData) -> None:
+def test_all_unlabeled_user_class_coloring_draws_labels_neutral(sdata_blobs: SpatialData) -> None:
     _set_user_classes(sdata_blobs, {}, categories=[])
     layer = _FakeLabelsLayer()
-    controller, adapter = _make_controller_with_adapter(sdata_blobs, layer)
+    controller = _make_controller(sdata_blobs, layer)
     feature_rows = _feature_rows({1: None, 5: None, 6: None})
 
     controller.refresh_layer_colors(feature_rows=feature_rows)
 
-    assert adapter.sync_display_layers == [layer]
     assert isinstance(layer.colormap, CompactLabelColormap)
     np.testing.assert_allclose(layer.colormap.map(0), np.zeros(4, dtype=np.float32))
     np.testing.assert_allclose(layer.colormap.map(1), _expected_rgba(DEFAULT_NEUTRAL_COLOR))
@@ -420,7 +406,7 @@ def test_pred_confidence_coloring_uses_compact_continuous_colormap_without_expli
 ) -> None:
     _set_user_classes(sdata_blobs, {}, categories=[])
     layer = _FakeLabelsLayer()
-    controller, adapter = _make_controller_with_adapter(sdata_blobs, layer)
+    controller = _make_controller(sdata_blobs, layer)
     controller.set_color_by(COLOR_BY_PRED_CONFIDENCE)
     feature_rows = _feature_rows(
         {1: None, 5: None, 6: None},
@@ -440,7 +426,6 @@ def test_pred_confidence_coloring_uses_compact_continuous_colormap_without_expli
     np.testing.assert_allclose(layer.colormap.map(0), np.zeros(4, dtype=np.float32))
     np.testing.assert_allclose(layer.colormap.map(99), np.zeros(4, dtype=np.float32))
     assert layer.refresh_count == 0
-    assert adapter.sync_display_layers == [layer]
 
 
 @pytest.mark.parametrize("color_by", [COLOR_BY_USER_CLASS, COLOR_BY_PRED_CLASS, COLOR_BY_PRED_CONFIDENCE])
@@ -464,12 +449,11 @@ def test_row_scoped_user_class_annotation_inserts_compact_label_and_refreshes_la
 ) -> None:
     _set_user_classes(sdata_blobs, {5: 4}, categories=[4])
     layer = _FakeLabelsLayer()
-    controller, adapter = _make_controller_with_adapter(sdata_blobs, layer)
+    controller = _make_controller(sdata_blobs, layer)
     feature_rows = _feature_rows({1: None, 5: 4, 6: None})
     controller.refresh_layer_colors(feature_rows=feature_rows)
     controller.refresh_layer_features(feature_rows=feature_rows)
     original_colormap = layer.colormap
-    adapter.sync_display_layers.clear()
 
     def fail_full_feature_rows() -> pd.DataFrame:
         raise AssertionError("compact sparse annotation refresh must not rebuild all feature rows")
@@ -485,7 +469,6 @@ def test_row_scoped_user_class_annotation_inserts_compact_label_and_refreshes_la
     assert layer.refresh_count == 1
     assert layer.refresh_kwargs == [{"extent": False}]
     assert layer.events.colormap.call_count == 0
-    assert adapter.sync_display_layers == []
     assert layer.features.set_index("index").loc[6, USER_CLASS_COLUMN] == 4
     assert isinstance(layer.colormap, CompactLabelColormap)
     np.testing.assert_allclose(layer.colormap.map(6), _expected_class_rgba(4))
@@ -584,6 +567,48 @@ def test_row_scoped_user_class_annotation_updates_existing_compact_label(
     np.testing.assert_allclose(layer.colormap.map(5), _expected_class_rgba(7))
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expected_colormap_events"),
+    [
+        (np.uint8, 1),
+        (np.int8, 1),
+        (np.uint16, 1),
+        (np.int16, 1),
+        (np.int32, 0),
+        (np.uint32, 0),
+        (np.int64, 0),
+    ],
+)
+@pytest.mark.parametrize("class_id", [7, None], ids=["existing_class", "clear"])
+def test_row_scoped_user_class_annotation_notifies_colormap_for_label_id_textures(
+    sdata_blobs: SpatialData,
+    dtype: type[np.integer],
+    expected_colormap_events: int,
+    class_id: int | None,
+) -> None:
+    # 8/16-bit labels are colored by label id in a vispy lookup texture that is
+    # only rebuilt on a colormap event, so even edits that reuse an existing
+    # texture row must emit one. Larger dtypes are recoded by the refresh.
+    colors = default_class_colors([4, 7])
+    _set_user_classes(sdata_blobs, {5: 4}, categories=[4, 7], colors=colors)
+    layer = _FakeLabelsLayer(dtype)
+    controller = _make_controller(sdata_blobs, layer)
+    feature_rows = _feature_rows({5: 4})
+    controller.refresh_layer_colors(feature_rows=feature_rows)
+    controller.refresh_layer_features(feature_rows=feature_rows)
+    assert isinstance(layer.colormap, CompactLabelColormap)
+    original_texture_count = len(layer.colormap._compact_mapping.texture_rgba)
+
+    handled = controller.refresh_user_class_colormap_and_feature(
+        _user_class_annotation_change(instance_id=5, class_id=class_id)
+    )
+
+    assert handled is True
+    assert len(layer.colormap._compact_mapping.texture_rgba) == original_texture_count
+    assert layer.events.colormap.call_count == expected_colormap_events
+    assert layer.refresh_kwargs == [{"extent": False}]
+
+
 def test_row_scoped_user_class_annotation_appends_new_class_texture(
     sdata_blobs: SpatialData,
 ) -> None:
@@ -633,9 +658,7 @@ def test_row_scoped_user_class_annotation_requires_compact_colormap(
     )
 
     with pytest.raises(RuntimeError, match="CompactLabelColormap"):
-        controller.refresh_user_class_colormap_and_feature(
-            _user_class_annotation_change(instance_id=5, class_id=4)
-        )
+        controller.refresh_user_class_colormap_and_feature(_user_class_annotation_change(instance_id=5, class_id=4))
 
     assert layer.refresh_count == 0
     assert layer.events.colormap.call_count == 0
@@ -665,9 +688,7 @@ def test_row_scoped_user_class_feature_only_refresh_keeps_prediction_colormap(
 
     monkeypatch.setattr(controller, "_get_region_feature_rows", fail_full_feature_rows)
 
-    handled = controller.refresh_user_class_feature_only(
-        _user_class_annotation_change(instance_id=6, class_id=4)
-    )
+    handled = controller.refresh_user_class_feature_only(_user_class_annotation_change(instance_id=6, class_id=4))
 
     assert handled is True
     assert layer.colormap is original_colormap

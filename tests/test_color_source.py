@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from spatiato.core._color_source import (
@@ -28,6 +30,28 @@ def test_table_color_source_spec_rejects_invalid_value_kind() -> None:
             value_key="cell_type",
             value_kind="ordinal",
         )
+
+
+def test_table_color_source_spec_reads_a_var_layer_only_for_a_var_source() -> None:
+    source = TableColorSourceSpec(
+        table_name="table", source_kind="var", value_key="GeneA", value_kind="continuous", var_layer="counts"
+    )
+
+    assert source.identity == ("table", "var", "GeneA")
+    assert replace(source, var_layer=None).identity == source.identity
+    assert source.source_label == "vars (counts): GeneA"
+    assert replace(source, var_layer=None).source_label == "vars (X): GeneA"
+    assert source != replace(source, var_layer=None)
+    with pytest.raises(ValueError, match="Only a `var` color source has a `var_layer`"):
+        TableColorSourceSpec(
+            table_name="table",
+            source_kind="obs_column",
+            value_key="cell_type",
+            value_kind="categorical",
+            var_layer="counts",
+        )
+    with pytest.raises(ValueError, match="`var_layer` must be a non-empty layer name"):
+        replace(source, var_layer="")
 
 
 def test_shape_color_source_spec_rejects_invalid_source_kind() -> None:

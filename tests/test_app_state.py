@@ -14,6 +14,8 @@ from spatiato._app_state import (
     CoordinateSystemChangeRequest,
     ShapesElementWrittenEvent,
     SpatiatoAppState,
+    TableBusyError,
+    TableBusyStateChangedEvent,
     TableDirtyStateChangedEvent,
     TableReloadRequest,
     TableStateChangedEvent,
@@ -317,6 +319,34 @@ def test_spatiato_app_state_does_not_clear_a_newer_same_path_token(sdata_blobs) 
     assert state.is_table_dirty(sdata_blobs, "table") is True
 
 
+def test_spatiato_app_state_publishes_persisted_change_without_snapshot(qtbot, sdata_blobs) -> None:
+    state = SpatiatoAppState()
+    dirty_event = TableStateChangedEvent(
+        sdata=sdata_blobs,
+        table_name="table",
+        paths=frozenset({TableComponentPath("obs", ("user_class",))}),
+        regions=("blobs_labels",),
+        change_kind="updated",
+        source="test",
+    )
+    state.record_table_mutation(dirty_event)
+    persisted_event = TableStateChangedEvent(
+        sdata=sdata_blobs,
+        table_name="table",
+        paths=frozenset({TableComponentPath("obsm", ("features",))}),
+        regions=("blobs_labels",),
+        change_kind="created",
+        source="test",
+    )
+
+    with qtbot.waitSignal(state.table_state_changed) as blocker:
+        state.record_persisted_table_change(persisted_event)
+
+    assert blocker.args == [persisted_event]
+    # Without a snapshot nothing is cleared, and the persisted paths are not marked dirty.
+    assert state.snapshot_table_dirty_state(sdata_blobs, "table").paths == {TableComponentPath("obs", ("user_class",))}
+
+
 def test_spatiato_app_state_reload_clears_only_covered_paths(sdata_blobs) -> None:
     state = SpatiatoAppState()
     obs_path = TableComponentPath("obs", ("user_class",))
@@ -362,13 +392,7 @@ def test_spatiato_app_state_prepares_registered_table_reload_participants_by_ide
 
     first = Participant("first")
     second = Participant("second")
-    request = TableReloadRequest(
-        sdata=sdata_blobs,
-        table_name="table",
-        paths=frozenset({TableComponentPath("obs", ("user_class",))}),
-        region_name="blobs_labels",
-        source="test",
-    )
+    request = _table_reload_request(sdata_blobs)
 
     state.register_table_reload_participant(first)
     state.register_table_reload_participant(first)
@@ -383,6 +407,73 @@ def test_spatiato_app_state_prepares_registered_table_reload_participants_by_ide
     state.prepare_for_table_reload(request)
 
     assert calls == [("second", request)]
+
+
+def test_spatiato_app_state_reload_prepares_participants_only_once_the_table_is_no_longer_busy(sdata_blobs) -> None:
+    state = SpatiatoAppState()
+    calls: list[str] = []
+
+    class Participant:
+        def prepare_for_table_reload(self, request: TableReloadRequest) -> None:
+            del request
+            calls.append("prepare")
+
+    state.register_table_reload_participant(Participant())
+    first = state.mark_table_busy(sdata_blobs, "table", reason="First is writing.")
+    second = state.mark_table_busy(sdata_blobs, "table", reason="Second is writing.")
+
+    with pytest.raises(TableBusyError) as error:
+        state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+
+    assert str(error.value) == 'Table "table" is busy: First is writing. Second is writing.'
+    assert calls == []
+
+    state.release_table_busy(first)
+    with pytest.raises(TableBusyError, match="Second is writing."):
+        state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+    assert calls == []
+
+    state.release_table_busy(second)
+    state.prepare_for_table_reload(_table_reload_request(sdata_blobs))
+    assert calls == ["prepare"]
+
+
+def test_spatiato_app_state_table_is_busy_until_every_mark_is_released(sdata_blobs, sdata_blobs_multi_region) -> None:
+    state = SpatiatoAppState()
+    events: list[TableBusyStateChangedEvent] = []
+    state.table_busy_state_changed.connect(events.append)
+
+    first = state.mark_table_busy(sdata_blobs, "table", reason="First is writing.")
+    second = state.mark_table_busy(sdata_blobs, "table", reason="Second is writing.")
+
+    assert state.is_table_busy(sdata_blobs, "table") is True
+    assert state.table_busy_reasons(sdata_blobs, "table") == ("First is writing.", "Second is writing.")
+    # Marks are per SpatialData object and table.
+    assert state.is_table_busy(sdata_blobs, "other_table") is False
+    assert state.is_table_busy(sdata_blobs_multi_region, "table") is False
+
+    state.release_table_busy(first)
+    assert state.is_table_busy(sdata_blobs, "table") is True
+
+    state.release_table_busy(second)
+    state.release_table_busy(second)  # Releasing again does nothing.
+    assert state.is_table_busy(sdata_blobs, "table") is False
+
+    # One event when the table became busy, one when it no longer was.
+    assert [(event.sdata, event.table_name, event.is_busy) for event in events] == [
+        (sdata_blobs, "table", True),
+        (sdata_blobs, "table", False),
+    ]
+
+
+def _table_reload_request(sdata) -> TableReloadRequest:
+    return TableReloadRequest(
+        sdata=sdata,
+        table_name="table",
+        paths=frozenset({TableComponentPath("obs", ("user_class",))}),
+        region_name="blobs_labels",
+        source="test",
+    )
 
 
 def test_spatiato_app_state_set_coordinate_system_emits_event_and_prunes_layers(

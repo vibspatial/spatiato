@@ -27,7 +27,7 @@ from spatiato.core._color_source import (
 )
 from spatiato.core.shapes_geometry import shapely_polygon_to_napari_polygon_vertices
 from spatiato.viewer.image_styling import DEFAULT_OVERLAY_COLORS, ImageDisplayMode, ImageLoadResult
-from spatiato.viewer.labels_async import sync_labels_display_after_colormap_change
+from spatiato.viewer.labels_contours import install_fast_labels_contours
 from spatiato.viewer.labels_styling import (
     LabelsLoadResult,
     apply_table_color_source_to_labels_layer,
@@ -373,7 +373,9 @@ class ShapesLayerBinding(BaseLayerBinding):
             raise ValueError("Styled shapes bindings require a style specification.")
 
 
-LayerBinding = LabelsLayerBinding | ImageLayerBinding | PointsLayerBinding | TiledPointsLayerBinding | ShapesLayerBinding
+LayerBinding = (
+    LabelsLayerBinding | ImageLayerBinding | PointsLayerBinding | TiledPointsLayerBinding | ShapesLayerBinding
+)
 
 
 @dataclass(frozen=True)
@@ -809,12 +811,6 @@ class ViewerAdapter(QObject):
         """Return the shared layer-binding registry."""
         return self._layer_bindings
 
-    def sync_labels_display_after_colormap_change(self, layer: Labels) -> None:
-        """Synchronize labels display after a table-driven colormap change."""
-        # Work around napari async labels colormap rendering race:
-        # https://github.com/napari/napari/issues/9188
-        sync_labels_display_after_colormap_change(layer)
-
     def register_labels_layer(
         self,
         layer: Labels,
@@ -1072,8 +1068,7 @@ class ViewerAdapter(QObject):
         ):
             self.primary_labels_layers_changed.emit()
         if any(
-            _is_usable_image_binding(self._layer_bindings.get_binding(layer))
-            for layer in self._iter_candidate_layers()
+            _is_usable_image_binding(self._layer_bindings.get_binding(layer)) for layer in self._iter_candidate_layers()
         ):
             self.image_layers_changed.emit()
 
@@ -1495,7 +1490,6 @@ class ViewerAdapter(QObject):
             labels_name=labels_name,
             style_spec=style_spec,
         )
-        self.sync_labels_display_after_colormap_change(layer)
         return LabelsLoadResult(
             layer=layer,
             created=created,
@@ -2811,11 +2805,13 @@ def _build_labels_layer(
         )
 
     labels_data = _flatten_multiscale_element(label_element) if isinstance(label_element, DataTree) else label_element
-    return Labels(
+    layer = Labels(
         labels_data,
         name=name,
         affine=_get_affine_transform(label_element, coordinate_system),
     )
+    install_fast_labels_contours(layer)
+    return layer
 
 
 def _get_affine_transform(element: DataArray | DataTree, coordinate_system: str) -> np.ndarray | None:

@@ -61,7 +61,6 @@ def _add_annotation_column(sdata) -> None:
 
 
 def test_unannotated_spatial_annotation_styling_uses_one_neutral_foreground_without_table_mutation(
-    monkeypatch: pytest.MonkeyPatch,
     sdata_blobs,
 ) -> None:
     table = sdata_blobs.tables["table"]
@@ -69,8 +68,6 @@ def test_unannotated_spatial_annotation_styling_uses_one_neutral_foreground_with
     uns_before = copy.deepcopy(table.uns)
     viewer = _Viewer()
     adapter = ViewerAdapter(viewer)
-    synchronized_layers: list[object] = []
-    monkeypatch.setattr(adapter, "sync_labels_display_after_colormap_change", synchronized_layers.append)
 
     first = load_and_style_unannotated_spatial_annotation_labels(
         adapter,
@@ -93,7 +90,6 @@ def test_unannotated_spatial_annotation_styling_uses_one_neutral_foreground_with
     assert second.coercion_applied is False
     assert viewer.layers == [first.layer]
     assert viewer.layers.selection.active is first.layer
-    assert synchronized_layers == [first.layer, first.layer]
     binding = adapter.layer_bindings.get_binding(first.layer)
     assert isinstance(binding, LabelsLayerBinding)
     assert binding.labels_role == "primary"
@@ -108,7 +104,6 @@ def test_unannotated_spatial_annotation_styling_uses_one_neutral_foreground_with
 
 
 def test_spatial_annotation_styling_loads_reuses_and_activates_primary_layer_without_table_mutation(
-    monkeypatch: pytest.MonkeyPatch,
     sdata_blobs,
 ) -> None:
     _add_annotation_column(sdata_blobs)
@@ -118,8 +113,6 @@ def test_spatial_annotation_styling_loads_reuses_and_activates_primary_layer_wit
     uns_before = copy.deepcopy(table.uns)
     viewer = _Viewer()
     adapter = ViewerAdapter(viewer)
-    synchronized_layers: list[object] = []
-    monkeypatch.setattr(adapter, "sync_labels_display_after_colormap_change", synchronized_layers.append)
 
     first = load_and_style_spatial_annotation_labels(
         adapter,
@@ -146,7 +139,6 @@ def test_spatial_annotation_styling_loads_reuses_and_activates_primary_layer_wit
     assert second.coercion_applied is False
     assert viewer.layers == [first.layer]
     assert viewer.layers.selection.active is first.layer
-    assert synchronized_layers == [first.layer, first.layer]
     binding = adapter.layer_bindings.get_binding(first.layer)
     assert isinstance(binding, LabelsLayerBinding)
     assert binding.labels_role == "primary"

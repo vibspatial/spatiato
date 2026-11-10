@@ -346,7 +346,7 @@ class _DeferredWorker(QObject):
     errored = Signal(object)
     finished = Signal()
 
-    def __init__(self, result: classifier_module.ClassifierJobResult) -> None:
+    def __init__(self, result: classifier_module.ClassifierWorkerResult) -> None:
         super().__init__()
         self._result = result
         self.started = False
@@ -548,7 +548,7 @@ def test_widget_populates_segmentation_dropdown_from_spatialdata(qtbot, sdata_bl
     assert [widget.color_by_combo.itemText(index) for index in range(widget.color_by_combo.count())] == [
         "user_class",
         "pred_class",
-        "pred_confidence",
+        "pred_class_confidence",
     ]
     assert widget.selected_segmentation_name is None
     assert widget.selected_spatialdata is sdata_blobs
@@ -1605,7 +1605,7 @@ def test_widget_refreshes_feature_matrix_selector_when_first_key_is_written(qtbo
     assert widget.feature_matrix_combo.count() == 1
     assert widget.selected_feature_key == "features_new"
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
-    assert mark_dirty_reasons == []
+    assert mark_dirty_reasons == ["the feature matrix changed"]
 
 
 def test_widget_invalidates_classifier_when_selected_feature_matrix_is_overwritten(
@@ -1627,36 +1627,14 @@ def test_widget_invalidates_classifier_when_selected_feature_matrix_is_overwritt
         categories=[1, 2],
     )
     _set_feature_metadata(sdata_blobs)
-    training_scope = classifier_module.ResolvedClassifierScope(
-        mode="selected_segmentation_only",
-        regions=("blobs_labels",),
-        raw_table_row_positions=np.array([0, 1], dtype=np.int64),
-        table_row_positions=np.array([0, 1], dtype=np.int64),
-    )
-    prediction_scope = classifier_module.ResolvedClassifierScope(
-        mode="selected_segmentation_only",
-        regions=("blobs_labels",),
-        raw_table_row_positions=np.array([0, 1], dtype=np.int64),
-        table_row_positions=np.array([0, 1], dtype=np.int64),
-    )
     worker = _DeferredWorker(
-        classifier_module.ClassifierJobResult(
-            job_id=1,
-            feature_key="features_1",
-            labels_name="blobs_labels",
-            table_name="table",
+        classifier_module.ClassifierTrainingResult(
+            training_timestamp="2026-04-23T09:00:00+00:00",
+            predicted_row_positions=np.array([0, 1], dtype=np.int64),
             pred_classes=np.array([1, 2], dtype=np.int64),
             pred_confidences=np.array([0.9, 0.8], dtype=np.float64),
-            trained_at="2026-04-23T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=classifier_module.ClassifierPreparationSummary(
-                training_scope=training_scope,
-                prediction_scope=prediction_scope,
-                reason="Ready to train.",
-                labeled_count=2,
-                class_labels=(1, 2),
-                n_features=2,
-            ),
+            n_training_labels=2,
+            class_labels_seen=(1, 2),
         )
     )
 
@@ -2113,7 +2091,43 @@ def test_widget_auto_selects_new_feature_matrix_table_when_no_table_was_availabl
     assert widget.selected_table_name == "new_table"
     assert widget.selected_feature_key == "features_new"
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
-    assert mark_dirty_reasons == []
+    assert mark_dirty_reasons == ["the annotation table changed"]
+
+
+def test_widget_does_not_report_a_model_for_a_table_created_by_feature_extraction(
+    qtbot,
+    sdata_blobs: SpatialData,
+) -> None:
+    """A table that Feature Extraction creates has no model yet, so the classifier is stale, not up to date."""
+    layer = make_blobs_labels_layer(sdata_blobs)
+    viewer = DummyViewer(layers=[layer])
+    app_state = get_or_create_app_state(viewer)
+    widget = ObjectClassificationWidget(viewer)
+    qtbot.addWidget(widget)
+    widget.segmentation_combo.setCurrentIndex(1)
+
+    assert widget.selected_segmentation_name == "blobs_multiscale_labels"
+    assert widget.selected_table_name is None
+
+    _add_feature_table_for_labels(
+        sdata_blobs,
+        table_name="new_table",
+        labels_name="blobs_multiscale_labels",
+        feature_key="features_new",
+    )
+    app_state.record_table_mutation(
+        _feature_table_event(
+            sdata_blobs,
+            table_name="new_table",
+            feature_key="features_new",
+        )
+    )
+
+    assert widget.selected_table_name == "new_table"
+    assert widget._classifier_controller.is_dirty is True
+    assert widget._classifier_controller.status_message == (
+        "Classifier: model is stale because the annotation table changed"
+    )
 
 
 def test_widget_updates_color_by_mode_when_selection_changes(qtbot, sdata_blobs: SpatialData) -> None:
@@ -2695,7 +2709,7 @@ def test_widget_user_class_annotation_updates_feature_only_in_prediction_color_m
         assert full_refresh_calls == []
 
     run_annotation_in_color_mode("pred_class")
-    run_annotation_in_color_mode("pred_confidence")
+    run_annotation_in_color_mode("pred_class_confidence")
 
 
 def test_widget_user_class_annotation_falls_back_to_full_refresh_when_prediction_feature_refresh_fails(
@@ -2908,8 +2922,12 @@ def test_widget_disables_sync_for_clean_backed_spatialdata(qtbot, backed_sdata_b
     qtbot.addWidget(widget)
     select_segmentation(widget)
     expected_table_path = Path(backed_sdata_blobs.path) / "tables" / "table"
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert not widget.persistence_controls.write_button.isEnabled()
     assert widget.persistence_controls.reload_button.isEnabled()
@@ -2933,8 +2951,12 @@ def test_widget_marks_persistence_dirty_on_annotation_change_and_clears_it_on_sy
     layer.selected_label = 5
     widget.class_spinbox.setValue(3)
     widget.apply_class_button.click()
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
     assert widget.persistence_controls.write_button.isEnabled()
@@ -2942,8 +2964,12 @@ def test_widget_marks_persistence_dirty_on_annotation_change_and_clears_it_on_sy
     assert "Unsynced local in-memory table changes would be discarded." in reload_tooltip
 
     widget.persistence_controls.write_button.click()
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert widget.persistence_controls.controller.has_unsynced_table_changes is False
     assert not widget.persistence_controls.write_button.isEnabled()
@@ -3010,12 +3036,17 @@ def test_widget_marks_persistence_dirty_after_classifier_writes_results(qtbot, b
     widget.retrain_button.click()
     qtbot.waitUntil(
         lambda: (
-            widget.persistence_controls.controller.has_unsynced_table_changes and table.obs[PRED_CLASS_COLUMN].notna().any()
+            widget.persistence_controls.controller.has_unsynced_table_changes
+            and table.obs[PRED_CLASS_COLUMN].notna().any()
         ),
         timeout=5000,
     )
-    sync_tooltip = unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
-    reload_tooltip = unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    sync_tooltip = (
+        unescape(widget.persistence_controls.write_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
+    reload_tooltip = (
+        unescape(widget.persistence_controls.reload_button.toolTip()).replace("&#8203;", "").replace("\u200b", "")
+    )
 
     assert widget.persistence_controls.controller.has_unsynced_table_changes is True
     assert widget.persistence_controls.write_button.isEnabled()
@@ -3272,16 +3303,13 @@ def test_widget_reload_freezes_classifier_worker_and_ignores_late_results(
     workers: list[_DeferredWorker] = []
 
     def fake_create_training_worker(job):
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
+        result = classifier_module.ClassifierTrainingResult(
+            training_timestamp="2026-04-13T09:00:00+00:00",
+            predicted_row_positions=job.prediction_scope.table_row_positions,
             pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
             pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
+            n_training_labels=job.summary.labeled_count,
+            class_labels_seen=job.summary.class_labels,
         )
         worker = _DeferredWorker(result)
         workers.append(worker)
@@ -3302,24 +3330,28 @@ def test_widget_reload_freezes_classifier_worker_and_ignores_late_results(
     obsm = dict(table.obsm)
     uns = dict(table.uns)
     uns[CLASSIFIER_CONFIG_KEY] = {
-        "model_type": "RandomForestClassifier",
-        "feature_key": "features_1",
-        "table_name": "table",
-        "roi_mode": "none",
-        "trained": True,
-        "eligible": True,
-        "reason": "Ready to train.",
-        "training_timestamp": "2026-04-13T09:00:00+00:00",
-        "n_labeled_objects": 4,
-        "n_features": 2,
-        "class_labels_seen": [1, 2],
-        "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
-        "training_scope": "all",
-        "training_regions": ["blobs_labels"],
-        "n_training_rows": int(table.n_obs),
-        "prediction_scope": "selected_segmentation_only",
-        "prediction_regions": ["blobs_labels"],
-        "n_predicted_rows": int(table.n_obs),
+        PRED_CLASS_COLUMN: {
+            "source": "widget",
+            "pred_class_column": PRED_CLASS_COLUMN,
+            "pred_confidence_column": PRED_CONFIDENCE_COLUMN,
+            "feature_key": "features_1",
+            "prediction_regions": ["blobs_labels"],
+            "prediction_timestamp": "2026-04-13T09:00:00+00:00",
+            "prediction_scope": "selected_segmentation_only",
+            "classifier_path": None,
+            "reason": None,
+            "model_provenance": {
+                "feature_key": "features_1",
+                "model_type": "RandomForestClassifier",
+                "rf_params": dict(classifier_module.RANDOM_FOREST_PARAMS),
+                "training_scope": "all",
+                "training_regions": ["blobs_labels"],
+                "n_features": 2,
+                "training_timestamp": "2026-04-13T09:00:00+00:00",
+                "n_training_labels": 4,
+                "class_labels_seen": [1, 2],
+            },
+        }
     }
     _write_disk_table_state(backed_sdata_blobs, obs=obs, obsm=obsm, uns=uns)
 
@@ -3368,16 +3400,13 @@ def test_widget_retrain_button_recovers_after_worker_finishes(qtbot, monkeypatch
     refresh_calls: list[str] = []
 
     def fake_create_training_worker(job):
-        result = classifier_module.ClassifierJobResult(
-            job_id=job.job_id,
-            feature_key=job.feature_key,
-            labels_name=job.labels_name,
-            table_name=job.table_name,
+        result = classifier_module.ClassifierTrainingResult(
+            training_timestamp="2026-04-13T09:00:00+00:00",
+            predicted_row_positions=job.prediction_scope.table_row_positions,
             pred_classes=np.full(job.prediction_scope.table_row_positions.shape, 1, dtype=np.int64),
             pred_confidences=np.full(job.prediction_scope.table_row_positions.shape, 0.91, dtype=np.float64),
-            trained_at="2026-04-13T09:00:00+00:00",
-            model_params=dict(classifier_module.RANDOM_FOREST_PARAMS),
-            summary=job.summary,
+            n_training_labels=job.summary.labeled_count,
+            class_labels_seen=job.summary.class_labels,
         )
         worker = _DeferredWorker(result)
         workers.append(worker)
@@ -3510,7 +3539,7 @@ def test_widget_retrains_classifier_after_annotation_changes(qtbot, sdata_blobs:
     assert pred_class.loc[24] == 2
     assert "adata" not in layer.metadata
     assert "model is up to date" in widget.classifier_feedback.text()
-    assert table.uns[CLASSIFIER_CONFIG_KEY]["trained"] is True
+    assert table.uns[CLASSIFIER_CONFIG_KEY][PRED_CLASS_COLUMN]["model_provenance"] is not None
     assert any(
         isinstance(event, TableStateChangedEvent)
         and event.source == "object_classification_inference"
@@ -3583,7 +3612,7 @@ def test_widget_colors_confidence_continuously_in_pred_confidence_mode(qtbot, sd
     qtbot.addWidget(widget)
     select_segmentation(widget)
 
-    widget.color_by_combo.setCurrentIndex(widget.color_by_combo.findData("pred_confidence"))
+    widget.color_by_combo.setCurrentIndex(widget.color_by_combo.findData("pred_class_confidence"))
 
     assert isinstance(layer.colormap, DirectLabelColormap)
     assert not np.allclose(layer.colormap.color_dict[1], layer.colormap.color_dict[24])
@@ -3611,7 +3640,7 @@ def test_widget_exposes_label_metadata_in_napari_status_bar(qtbot, sdata_blobs: 
     assert "instance_id: 5" in status["value"]
     assert "user_class: 4" in status["value"]
     assert "pred_class: 2" in status["value"]
-    assert "pred_confidence: 0.95" in status["value"]
+    assert "pred_class_confidence: 0.95" in status["value"]
 
 
 def test_widget_retrain_button_triggers_manual_retraining(qtbot, monkeypatch, sdata_blobs: SpatialData) -> None:
@@ -3691,3 +3720,48 @@ def test_widget_exports_classifier_with_mocked_save_dialog(
     assert loaded.n_features == int(table.obsm["features_1"].shape[1])
     assert "Classifier Exported" in widget.classifier_feedback.text()
     assert str(export_path) in widget.classifier_feedback.text()
+
+
+@pytest.mark.parametrize("error_type", [ValueError, OSError])
+def test_widget_reports_a_failed_classifier_export(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+    sdata_blobs: SpatialData,
+    error_type: type[Exception],
+) -> None:
+    """Every export failure is shown in the widget, also a failed file write."""
+    table = sdata_blobs["table"]
+    instance_ids = table.obs["instance_id"].to_numpy(dtype=np.int64)
+    table.obs[USER_CLASS_COLUMN] = pd.Categorical(
+        [
+            1 if int(instance_id) in {1, 2} else 2 if int(instance_id) in {24, 25} else pd.NA
+            for instance_id in instance_ids
+        ],
+        categories=[1, 2],
+    )
+    _set_feature_metadata(sdata_blobs)
+
+    layer = make_blobs_labels_layer(sdata_blobs)
+    viewer = DummyViewer(layers=[layer])
+    widget = ObjectClassificationWidget(viewer)
+    qtbot.addWidget(widget)
+    select_segmentation(widget)
+    widget.retrain_button.click()
+    qtbot.waitUntil(lambda: widget.export_classifier_button.isEnabled(), timeout=5000)
+
+    def fail_to_write(path: object, bundle: object) -> None:
+        del path, bundle
+        raise error_type("the disk is full")
+
+    monkeypatch.setattr(classifier_module, "write_classifier_export_bundle", fail_to_write)
+    monkeypatch.setattr(
+        widget_module.QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(tmp_path / "widget-export"), ""),
+    )
+
+    widget.export_classifier_button.click()
+
+    assert "Classifier Export Error" in widget.classifier_feedback.text()
+    assert "the disk is full" in widget.classifier_feedback.text()

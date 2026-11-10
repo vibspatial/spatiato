@@ -20,19 +20,13 @@ from spatiato.core.object_classification.classifier import (
     PRED_CLASS_COLUMN,
     PRED_CONFIDENCE_COLUMN,
 )
-from spatiato.core.spatial_query.canonical import (
-    CANONICAL_ALGORITHM_VERSION,
-    CANONICAL_OBSM_KEY,
-    build_canonical_region_binding,
-    inspect_canonical_cache,
-)
-from spatiato.core.spatial_query.canonical_models import (
-    CanonicalCacheState,
-    CanonicalRegionBinding,
-    _readonly_array,
+from spatiato.core.spatial_query.canonical_centers import (
+    CanonicalCentersRegion,
+    canonical_centers_status,
+    read_canonical_centers_region,
 )
 from spatiato.core.spatial_query.query_models import CanonicalCenterQueryResult
-from spatiato.core.spatialdata import get_table_metadata
+from spatiato.core.spatialdata import get_table, get_table_metadata
 from spatiato.core.validation import normalize_spatialdata_dataframe_column_name
 
 if TYPE_CHECKING:
@@ -52,18 +46,38 @@ class SpatialAnnotationColumnChangedError(ValueError):
 
 
 class SpatialAnnotationQueryOutdatedError(ValueError):
-    """The binding or canonical-center query provenance is no longer current."""
+    """The table rows or canonical centers the query used are no longer current."""
 
 
 @dataclass(frozen=True)
 class SpatialAnnotationPreparation:
-    """Immutable table-row and target-column snapshot prepared for Apply."""
+    """Immutable table-row and target-column snapshot prepared for Apply.
+
+    Parameters
+    ----------
+    query_result
+        The accepted query: the rows, instance IDs and canonical centers it
+        evaluated, and the instance IDs it matched.
+    column_name
+        The ``obs`` column the annotation is written to.
+    column_mode
+        ``"existing"`` to annotate an existing column, ``"new"`` to create it
+        at Apply.
+    row_positions
+        Table row positions (for ``iloc``) of the matched instances, in the
+        order of ``query_result.matched_instance_ids``.
+    prepared_values
+        A copy of the column's values at ``row_positions``, taken when the
+        annotation was prepared; all missing for a new column. Used for the
+        summary counts, the value kind, and, at Apply, the check that the
+        column has not changed since.
+    """
 
     query_result: CanonicalCenterQueryResult
     column_name: str
     column_mode: SpatialAnnotationColumnMode
     row_positions: NDArray[np.intp] = field(repr=False, compare=False)
-    current_values: pd.Series = field(repr=False, compare=False)
+    prepared_values: pd.Series = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.query_result, CanonicalCenterQueryResult):
@@ -72,33 +86,33 @@ class SpatialAnnotationPreparation:
             raise ValueError("Spatial annotation column mode must be `existing` or `new`.")
         if not isinstance(self.column_name, str) or not self.column_name:
             raise ValueError("Spatial annotation column name must not be empty.")
-        row_positions = _readonly_array(self.row_positions, dtype=np.intp)
-        if row_positions.ndim != 1 or np.any(row_positions < 0):
-            raise ValueError("Spatial annotation row positions must be a one-dimensional non-negative array.")
-        if len(np.unique(row_positions)) != len(row_positions):
-            raise ValueError("Spatial annotation row positions must be unique.")
-        if len(row_positions) != self.query_result.matched_instance_count:
-            raise ValueError("Spatial annotation row positions must match the queried instance count.")
-        if not isinstance(self.current_values, pd.Series):
-            raise TypeError("Spatial annotation current values must be a pandas Series.")
-        if len(self.current_values) != len(row_positions):
-            raise ValueError("Spatial annotation current values must match the queried instance count.")
+        row_positions = np.array(self.row_positions, dtype=np.intp, copy=True)
+        row_positions.flags.writeable = False
+        # The query result determines the rows: each matched instance ID's row
+        # in the queried region. This also makes them unique and non-negative.
+        expected_row_positions = _resolve_query_row_positions(self.query_result, self.query_result.canonical_centers)
+        if not np.array_equal(row_positions, expected_row_positions):
+            raise ValueError("Spatial annotation row positions must be the table rows of the matched instance IDs.")
+        if not isinstance(self.prepared_values, pd.Series):
+            raise TypeError("Spatial annotation prepared values must be a pandas Series.")
+        if len(self.prepared_values) != len(row_positions):
+            raise ValueError("Spatial annotation prepared values must match the queried instance count.")
         object.__setattr__(self, "row_positions", row_positions)
-        object.__setattr__(self, "current_values", self.current_values.copy(deep=True))
+        object.__setattr__(self, "prepared_values", self.prepared_values.copy(deep=True))
         _ = self.value_kind
 
     @property
     def value_kind(self) -> SpatialAnnotationValueKind:
         """Return the annotation kind represented by the captured column."""
         return validate_and_resolve_spatial_annotation_value_kind(
-            self.current_values,
+            self.prepared_values,
             column_name=self.column_name,
         )
 
     @property
-    def binding(self) -> CanonicalRegionBinding:
-        """Return the selected-region binding used by the query."""
-        return self.query_result.binding
+    def canonical_centers(self) -> CanonicalCentersRegion:
+        """Return the rows, instance IDs and centers the query used."""
+        return self.query_result.canonical_centers
 
 
 @dataclass(frozen=True)
@@ -217,18 +231,21 @@ def prepare_spatial_annotation(
         raise ValueError("Spatial annotation column mode must be `existing` or `new`.")
     normalized_column_name = normalize_spatialdata_dataframe_column_name(column_name, "Annotation column name")
 
-    table, live_binding = _resolve_live_binding(sdata, query_result.binding)
-    if not _bindings_match(live_binding, query_result.binding):
+    queried = query_result.canonical_centers
+    current = _read_current_canonical_centers_region(sdata, queried)
+    if not _canonical_centers_region_rows_match(current, queried):
         raise SpatialAnnotationQueryOutdatedError(
-            "The selected table-region binding changed after the canonical-center query."
+            "The table rows of the selected labels element changed after the canonical-center query."
         )
-    if normalized_column_name in (live_binding.region_key, live_binding.instance_key):
+    table = get_table(sdata, queried.table_name)
+    table_metadata = get_table_metadata(sdata, queried.table_name)
+    if normalized_column_name in (table_metadata.region_key, table_metadata.instance_key):
         raise ValueError(f"Annotation column `{normalized_column_name}` cannot be a table linkage column.")
-    row_positions = _resolve_query_row_positions(query_result, live_binding)
+    row_positions = _resolve_query_row_positions(query_result, current)
 
     if column_mode == "existing":
         current_column = require_compatible_spatial_annotation_column(table, normalized_column_name)
-        current_values = current_column.iloc[row_positions].copy(deep=True)
+        prepared_values = current_column.iloc[row_positions].copy(deep=True)
     else:
         if normalized_column_name in _OBJECT_CLASSIFICATION_COLUMNS:
             raise ValueError(
@@ -237,7 +254,7 @@ def prepare_spatial_annotation(
             )
         if normalized_column_name in table.obs.columns:
             raise ValueError(f"New annotation column `{normalized_column_name}` already exists.")
-        current_values = pd.Series(
+        prepared_values = pd.Series(
             pd.Categorical([pd.NA] * len(row_positions), categories=[]),
             index=table.obs.index[row_positions],
             name=normalized_column_name,
@@ -248,7 +265,7 @@ def prepare_spatial_annotation(
         column_name=normalized_column_name,
         column_mode=column_mode,
         row_positions=row_positions,
-        current_values=current_values,
+        prepared_values=prepared_values,
     )
 
 
@@ -278,11 +295,11 @@ def summarize_spatial_annotation(
         else:  # pragma: no cover - guarded by SpatialAnnotationPreparation
             raise ValueError(f"Unsupported spatial annotation value kind: {preparation.value_kind!r}.")
 
-    missing = preparation.current_values.isna().to_numpy(dtype=bool)
+    missing = preparation.prepared_values.isna().to_numpy(dtype=bool)
     if normalized_value is None:
         equal = np.zeros(len(missing), dtype=bool)
     else:
-        equal = np.asarray(preparation.current_values == normalized_value, dtype=bool) & ~missing
+        equal = np.asarray(preparation.prepared_values == normalized_value, dtype=bool) & ~missing
     other = ~missing & ~equal
 
     return SpatialAnnotationSummary(
@@ -304,8 +321,8 @@ def apply_spatial_annotation(
     Parameters
     ----------
     sdata
-        SpatialData object containing the current table and canonical-center
-        cache.
+        SpatialData object containing the current table and its canonical
+        centers.
     preparation
         Immutable row and target-column snapshot created before the annotation
         was applied.
@@ -313,8 +330,8 @@ def apply_spatial_annotation(
         Exact Set or Remove summary calculated from ``preparation``. The
         annotation value lives on this summary so its value and counts cannot
         disagree.
-        Apply first verifies that the live binding, cache, centers, and selected
-        column values still match ``preparation``. It then recalculates the
+        Apply first verifies that the table rows, canonical centers, and
+        selected column values still match ``preparation``. It then recalculates the
         summary from those accepted values and requires it to equal
         ``expected_summary`` before mutating the table. This final comparison
         protects the prepared consistency contract; live table changes are
@@ -332,7 +349,8 @@ def apply_spatial_annotation(
     if expected_summary.is_removal and preparation.column_mode == "new":
         raise ValueError("Remove annotation is not available for a new column.")
 
-    table = _require_current_query_provenance(sdata, preparation)
+    _raise_if_query_outdated(sdata, preparation)
+    table = get_table(sdata, preparation.canonical_centers.table_name)
     current_column: pd.Series | None = None
     if preparation.column_mode == "existing":
         current_column = require_compatible_spatial_annotation_column(table, preparation.column_name)
@@ -379,27 +397,29 @@ def apply_spatial_annotation(
     return SpatialAnnotationApplyResult(annotation_changed=True, palette_changed=palette_changed)
 
 
-def _resolve_live_binding(
+def _read_current_canonical_centers_region(
     sdata: SpatialData,
-    expected_binding: CanonicalRegionBinding,
-) -> tuple[AnnData, CanonicalRegionBinding]:
+    queried: CanonicalCentersRegion,
+) -> CanonicalCentersRegion:
+    """Read the queried labels element's rows, instance IDs and centers as they are now."""
     try:
-        table = sdata.tables[expected_binding.table_name]
-        table_metadata = get_table_metadata(sdata, expected_binding.table_name)
-        binding = build_canonical_region_binding(table, table_metadata, expected_binding.labels_name)
+        return read_canonical_centers_region(
+            sdata,
+            table_name=queried.table_name,
+            labels_name=queried.labels_name,
+        )
     except (KeyError, TypeError, ValueError) as exc:
-        raise SpatialAnnotationQueryOutdatedError("The selected table-region binding is no longer available.") from exc
-    return table, binding
+        raise SpatialAnnotationQueryOutdatedError(
+            "The table rows or canonical centers of the selected labels element are no longer available."
+        ) from exc
 
 
-def _bindings_match(current: CanonicalRegionBinding, expected: CanonicalRegionBinding) -> bool:
+def _canonical_centers_region_rows_match(current: CanonicalCentersRegion, queried: CanonicalCentersRegion) -> bool:
     return (
-        current.table_name == expected.table_name
-        and current.labels_name == expected.labels_name
-        and current.region_key == expected.region_key
-        and current.instance_key == expected.instance_key
-        and np.array_equal(current.row_positions, expected.row_positions)
-        and np.array_equal(current.instance_ids, expected.instance_ids)
+        current.table_name == queried.table_name
+        and current.labels_name == queried.labels_name
+        and np.array_equal(current.row_positions, queried.row_positions)
+        and np.array_equal(current.instance_ids, queried.instance_ids)
     )
 
 
@@ -484,92 +504,73 @@ def _is_positive_integer_category(value: object) -> bool:
 
 def _resolve_query_row_positions(
     query_result: CanonicalCenterQueryResult,
-    binding: CanonicalRegionBinding,
+    region: CanonicalCentersRegion,
 ) -> NDArray[np.intp]:
-    sort_order = np.argsort(binding.instance_ids)
-    sorted_instance_ids = binding.instance_ids[sort_order]
+    sort_order = np.argsort(region.instance_ids)
+    sorted_instance_ids = region.instance_ids[sort_order]
     selected_positions = np.searchsorted(sorted_instance_ids, query_result.matched_instance_ids)
     if np.any(selected_positions >= len(sorted_instance_ids)) or not np.array_equal(
         sorted_instance_ids[selected_positions], query_result.matched_instance_ids
-    ):  # pragma: no cover - guarded by the result and binding checks
+    ):  # pragma: no cover - guarded by the result and the region row checks
         raise SpatialAnnotationQueryOutdatedError(
             "A queried instance is no longer present in the selected table region."
         )
-    return np.asarray(binding.row_positions[sort_order[selected_positions]], dtype=np.intp)
+    return np.asarray(region.row_positions[sort_order[selected_positions]], dtype=np.intp)
 
 
-def _require_current_query_provenance(
+def _raise_if_query_outdated(
     sdata: SpatialData,
     preparation: SpatialAnnotationPreparation,
-) -> AnnData:
-    """Return the current table after accepting the query provenance.
+) -> None:
+    """Raise ``SpatialAnnotationQueryOutdatedError`` if the table rows or canonical centers changed since the query.
 
-    Re-inspect the selected canonical cache immediately before annotation
-    mutation. The live table-region binding, resolved queried rows, labels
-    source signature, selected-region metadata, and row-aligned canonical
-    centers must still equal the snapshots retained by ``preparation``.
+    Check again, immediately before the annotation is applied, that:
+
+    - the table's canonical centers are still valid
+      (``canonical_centers_status(...)``);
+    - the queried labels element's rows and instance IDs are unchanged, read
+      from the table annotation, so the matched instances still resolve to the
+      prepared rows;
+    - its canonical centers are unchanged.
+
     Otherwise, raise ``SpatialAnnotationQueryOutdatedError`` and require a new
     query.
 
     This is necessary because the query result is calculated asynchronously
     before annotation Apply. While that result is pending, another operation
-    can reload or replace the table, change its row-to-instance binding, or
-    rebuild its canonical-center cache. Applying the old matching instance IDs
-    after such a change could annotate rows using a geometric decision made
-    from different centers. Requiring the complete provenance to remain current
-    prevents that stale-result mutation.
+    can reload or replace the table, change its rows, or recalculate its
+    canonical centers. Applying the old matching instance IDs after such a
+    change could annotate rows using a geometric decision made from different
+    centers.
 
-    This validation reads only table state and the in-memory canonical-center
-    cache. It does not read labels pixels or recalculate centers. Shapes and
+    This validation reads only table state: the status check reads the whole
+    canonical matrix, and the comparison only the rows of the queried labels
+    element. It does not read labels pixels or recalculate centers. Shapes and
     transformation freshness remain controller responsibilities.
     """
-    canonical_centers = preparation.query_result.canonical_centers
-    try:
-        report = inspect_canonical_cache(
-            sdata,
-            table_name=preparation.binding.table_name,
-            labels_name=preparation.binding.labels_name,
-        )
-        table = sdata.tables[preparation.binding.table_name]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SpatialAnnotationQueryOutdatedError("The canonical-center query inputs are no longer available.") from exc
-
-    if report.state is not CanonicalCacheState.VALID:
-        raise SpatialAnnotationQueryOutdatedError("The canonical-center cache is no longer valid.")
-    if not _bindings_match(report.binding, preparation.binding):
+    queried = preparation.query_result.canonical_centers
+    status = canonical_centers_status(sdata, table_name=queried.table_name)
+    if status.state != "valid":
+        raise SpatialAnnotationQueryOutdatedError("The canonical centers of the table are no longer valid.")
+    current = _read_current_canonical_centers_region(sdata, queried)
+    # Unchanged rows and instance IDs also mean the matched instances still
+    # resolve to the prepared rows: `SpatialAnnotationPreparation` requires
+    # them to be the rows of the matched IDs in the queried region.
+    if not _canonical_centers_region_rows_match(current, queried):
         raise SpatialAnnotationQueryOutdatedError(
-            "The selected table-region binding changed after annotation preparation."
+            "The table rows of the selected labels element changed after annotation preparation."
         )
-    current_row_positions = _resolve_query_row_positions(preparation.query_result, report.binding)
-    if not np.array_equal(current_row_positions, preparation.row_positions):
-        raise SpatialAnnotationQueryOutdatedError("The queried instances no longer resolve to the prepared table rows.")
-    if report.source_signature != canonical_centers.source_signature:
-        raise SpatialAnnotationQueryOutdatedError("The labels source changed after the canonical-center query.")
-
-    stored_metadata = report.stored_metadata
-    region_metadata = None if stored_metadata is None else stored_metadata.regions.get(preparation.binding.labels_name)
-    if (
-        region_metadata is None
-        or region_metadata.source_signature != canonical_centers.source_signature
-        or region_metadata.n_obs != preparation.binding.n_obs
-        or region_metadata.instance_set_digest != preparation.binding.instance_set_digest
-        or region_metadata.algorithm_version != CANONICAL_ALGORITHM_VERSION
-    ):
+    if not np.array_equal(current.centers, queried.centers):
         raise SpatialAnnotationQueryOutdatedError(
-            "The selected region's canonical-center metadata changed after the query."
+            "The canonical centers of the selected labels element changed after the query."
         )
-
-    current_centers = np.asarray(table.obsm[CANONICAL_OBSM_KEY])[report.binding.row_positions]
-    if not np.array_equal(current_centers, canonical_centers.centers):
-        raise SpatialAnnotationQueryOutdatedError("The selected region's canonical centers changed after the query.")
-    return table
 
 
 def _require_unchanged_existing_column(
     preparation: SpatialAnnotationPreparation,
     current_column: pd.Series,
 ) -> None:
-    prepared_values = preparation.current_values
+    prepared_values = preparation.prepared_values
     current_categories = tuple(current_column.cat.categories)
     prepared_categories = tuple(prepared_values.cat.categories)
     if current_categories != prepared_categories or current_column.cat.ordered != prepared_values.cat.ordered:

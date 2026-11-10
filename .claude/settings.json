@@ -32,7 +32,10 @@
       "Bash(grep:*)",
       "Bash(rg:*)",
       "Bash(find:*)",
-      "Bash(shasum *)"
+      "Bash(shasum *)",
+      "Bash(git grep *)",
+      "Bash(git check-ignore *)",
+      "Bash(pbcopy)"
     ],
     "deny": [
       "Read(./.env)",
