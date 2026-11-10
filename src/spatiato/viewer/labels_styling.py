@@ -6,11 +6,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 from napari.layers import Labels
-from napari.utils.colormaps import DirectLabelColormap, label_colormap
+from napari.utils.colormaps import label_colormap
 
 from spatiato.core._color_source import (
     TableColorSourceSpec,
     TableColorValueKind,
+    format_var_matrix,
     validate_table_color_value_kind,
 )
 from spatiato.core.class_palette import (
@@ -19,7 +20,8 @@ from spatiato.core.class_palette import (
     resolve_table_categorical_palette,
     validate_categorical_palette_source,
 )
-from spatiato.core.spatialdata import get_table, validate_table_binding
+from spatiato.core.color_source_options import has_exact_binary_zero_one_values
+from spatiato.core.spatialdata import get_table, get_table_var_matrix, validate_table_binding
 from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
     build_string_categorical_values,
@@ -31,6 +33,7 @@ from spatiato.viewer.labels_colormap import (
     CompactLabelColormap,
     compact_categorical_label_colormap_from_values,
     compact_continuous_label_colormap_from_values,
+    neutral_label_colormap,
 )
 
 if TYPE_CHECKING:
@@ -65,14 +68,9 @@ def apply_neutral_labels_style(layer: Labels) -> None:
     """Style every foreground label neutrally without table-backed values."""
     # A compact colormap is unnecessary: `None` is the fallback for every
     # unmapped foreground label, so this remains a two-entry mapping even for
-    # hundreds of thousands of instances.
-    layer.colormap = DirectLabelColormap(
-        color_dict={
-            None: DEFAULT_NEUTRAL_COLOR,
-            0: "transparent",
-        },
-        background_value=0,
-    )
+    # hundreds of thousands of instances. `NeutralLabelColormap` recodes each
+    # slice with one background comparison instead of a per-pixel lookup.
+    layer.colormap = neutral_label_colormap(DEFAULT_NEUTRAL_COLOR, background_value=0)
 
 
 def apply_table_color_source_to_labels_layer(
@@ -104,11 +102,12 @@ def apply_table_color_source_to_labels_layer(
         )
         layer.colormap = colormap
     else:
-        style_result, colormap, features = _build_x_var_colormap(
+        style_result, colormap, features = _build_var_colormap(
             table=table,
             region_rows=region_rows,
             obs_index=obs_index,
             var_name=style_spec.value_key,
+            var_layer=style_spec.var_layer,
         )
         layer.colormap = colormap
 
@@ -118,9 +117,7 @@ def apply_table_color_source_to_labels_layer(
 
 def build_styled_labels_layer_name(labels_name: str, style_spec: TableColorSourceSpec) -> str:
     """Return the user-facing layer name for one styled labels variant."""
-    if style_spec.source_kind == "obs_column":
-        return f"{labels_name}[obs:{style_spec.value_key}]"
-    return f"{labels_name}[X:{style_spec.value_key}]"
+    return f"{labels_name}[{style_spec.source_label}]"
 
 
 def _build_obs_column_colormap(
@@ -173,12 +170,8 @@ def _build_obs_column_colormap(
         )
         return style_result, colormap, pd.DataFrame({column_name: region_series}, index=region_rows.index)
 
-    if pd.api.types.is_integer_dtype(full_series) and _has_exact_binary_zero_one_values(full_series.dropna().tolist()):
-        categories = [
-            value
-            for value in (0, 1)
-            if value in set(pd.to_numeric(full_series.dropna(), errors="coerce").astype("int64").tolist())
-        ]
+    if pd.api.types.is_integer_dtype(full_series) and has_exact_binary_zero_one_values(full_series.dropna().tolist()):
+        categories = [0, 1]
         numeric_region_series = pd.to_numeric(region_series, errors="coerce").astype("Int64")
         palette_source, palette = resolve_table_categorical_palette(
             table=table,
@@ -247,12 +240,13 @@ def _build_instance_key_colormap(
     return style_result, pd.DataFrame({instance_key: instance_values}, index=region_rows.index)
 
 
-def _build_x_var_colormap(
+def _build_var_colormap(
     *,
     table: AnnData,
     region_rows: pd.DataFrame,
     obs_index: pd.Index,
     var_name: str,
+    var_layer: str | None,
 ) -> tuple[LabelsStyleResult, CompactLabelColormap, pd.DataFrame]:
     if var_name not in table.var_names:
         raise ValueError(f"Var `{var_name}` is not available in the selected table.")
@@ -261,11 +255,15 @@ def _build_x_var_colormap(
     if not isinstance(var_index, (int, np.integer)):
         raise ValueError(f"Var `{var_name}` does not resolve to one unique column in `table.var_names`.")
 
+    matrix = get_table_var_matrix(table, var_layer)
     obs_positions = table.obs.index.get_indexer(obs_index)
     if np.any(obs_positions < 0):
-        raise ValueError(f"Could not align linked table rows back to `X[:, {var_name!r}]` for viewer coloring.")
+        raise ValueError(
+            f"Could not align linked table rows back to `{format_var_matrix(var_layer)}[:, {var_name!r}]` "
+            "for viewer coloring."
+        )
 
-    numeric_values = read_matrix_column(table.X, int(var_index), rows=obs_positions)
+    numeric_values = read_matrix_column(matrix, int(var_index), rows=obs_positions)
     numeric_region_series = pd.Series(
         pd.to_numeric(numeric_values, errors="coerce").astype("float64"),
         index=region_rows.index,
@@ -326,10 +324,3 @@ def _format_instance_preview(instance_ids: list[Any]) -> str:
 
 def _is_categorical_dtype(values: pd.Series) -> bool:
     return isinstance(values.dtype, pd.CategoricalDtype)
-
-
-def _has_exact_binary_zero_one_values(values: list[object]) -> bool:
-    if not values:
-        return False
-    normalized_values = {int(value) for value in pd.to_numeric(pd.Series(values), errors="coerce").dropna().tolist()}
-    return normalized_values == {0, 1} or normalized_values == {0} or normalized_values == {1}

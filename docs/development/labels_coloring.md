@@ -110,10 +110,17 @@ A new slice is computed when the displayed z or time step changes, on a
 refresh, and, for multiscale data, on every pan or zoom that changes the
 visible region or resolution level. With async slicing, napari reads the slice
 data in a worker thread, but turns it into the data texture on the Qt main
-thread, so everything below the dtype branch runs on the main thread, for
-every new slice of every visible labels layer (and its thumbnail). The viewer
-cannot respond while it runs, so the speed of the recoding decides how smooth
-panning and zooming feel.
+thread: the contour step and the recoding in the diagram below run on the main
+thread, for every new slice of every visible labels layer. The viewer cannot
+respond while they run, so their speed decides how smooth panning and zooming
+feel.
+
+For multiscale data, napari also loads the whole coarsest pyramid level with
+every new slice, and runs the same contour step and recoding on it, although
+nothing uses the result: the layer thumbnail only reads its raw label ids. The
+cost follows the size of that level. It adds little with a deep pyramid, but
+can be large with contours on
+([#136](https://github.com/vibspatial/spatiato/issues/136#issuecomment-6761744238)).
 
 ```mermaid
 flowchart TD
@@ -171,9 +178,9 @@ of objects:
 bin is one color, so the texture codes come straight from the table column,
 computed with numpy. napari's model is built with a three-entry color dict.
 The color count and the `label id -> texture code` view that napari reads are
-derived from the arrays, and the typed dict, where it is still needed, is
-filled from them in one numba function. The same 500,000 labels take about
-20 ms and under 1 MB.
+derived from the arrays. napari's typed dict, needed only where the dense
+table below cannot be used, is filled from them in one numba function. The
+same 500,000 labels take about 20 ms and under 1 MB.
 
 One RGBA row per color also makes annotation cheap: changing an object's
 class changes one texture code (see "Getting a color change onto the
@@ -199,6 +206,13 @@ on all CPU cores. Label ids beyond the end of the table, and negative ids, get
 code 0, as with the dict. A 5.2 Mpx slice takes about 1 ms, on par with the
 primary layer.
 
+napari also colors the layer's thumbnail on every refresh, through the
+colormap's `map`. It first downsamples the raw label ids to at most 32 × 32
+pixels, and for high-bit labels `map` recodes those with the same cached dense
+table, so the thumbnail adds well under a millisecond. A refresh therefore
+recodes the slice and the thumbnail, plus, for multiscale data, the coarsest
+level (see "When it runs"); the dense table itself is built only once.
+
 The dense table's size follows the largest label id in the table, not the
 number of objects: 75 KB in the example, with uint8 codes, but 100 MB for
 label ids up to 100 million. napari's own path is used where the dense table
@@ -211,9 +225,9 @@ does not apply:
 - a dense table that cannot be allocated.
 
 The last three are logged once per colormap (the negative background only at
-debug level), so a slower layer can be explained. Colors are the same on both
-paths. The typed dict is also used for `map` (thumbnails and single-label
-colors).
+debug level), so a slower layer can be explained. In those three cases, slices
+and thumbnails go through napari's typed dict. Colors are the same on both
+paths.
 
 ## Other decisions
 
@@ -233,9 +247,14 @@ needs a colormap event on high-bit labels.
 
 `NeutralLabelColormap` holds only the default color and the background, and
 recodes a high-bit slice with one comparison against the background value
-instead of napari's per-pixel lookup. It is not a `CompactLabelColormap`,
-because that type marks table-styled layers: the row-scoped annotation update
-requires it.
+instead of napari's per-pixel lookup. It is not a `CompactLabelColormap`, on
+purpose. The one-click annotation update in Object Classification checks for
+a `CompactLabelColormap` to know that it may edit one label's color in place;
+a neutral layer has no table values to edit, so it must fail that check.
+`CompactLabelColormap`'s constructor and hooks also expect a compact mapping,
+and napari sometimes rebuilds a colormap through its own constructor
+(`self.__class__(**self.model_dump())`), so the neutral colormap keeps
+napari's.
 
 ### napari's numba colormap backend
 
@@ -294,16 +313,16 @@ classifier writes new predictions.
 the colormap:
 
 - the dense table;
-- one numba typed dict per labels dtype, for napari's per-pixel path:
-  thumbnails and single-label colors (`map`), and the slices where the dense
-  table does not apply;
+- one numba typed dict per labels dtype, for napari's per-pixel path, built
+  only where the dense table cannot be used;
 - napari's low-bit `label id -> RGBA` arrays, which become the color lookup
   texture for low-bit labels.
 
 The compact mapping itself is never changed in place. An annotation builds a
 new compact mapping and installs it, and installing clears all three caches,
 so nothing derived from the old colors survives. This keeps one coherent
-state, and costs about a millisecond per click even for a million table rows.
+state. Installing the new mapping and rebuilding the dense table cost about a
+millisecond per click for a million table rows.
 The "fallback already logged" flag is kept outside these caches, so it
 survives an annotation and the fallback is not logged again after every
 click.

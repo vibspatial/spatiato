@@ -38,6 +38,7 @@ from spatiato.widgets.object_classification.controller import (
 
 if TYPE_CHECKING:
     from anndata import AnnData
+    from napari.layers import Labels
     from spatialdata import SpatialData
 
     from spatiato.widgets.object_classification.annotation_controller import UserClassAnnotationChange
@@ -244,13 +245,16 @@ class ViewerStylingController:
             result = colormap.set_label_value(instance_id, class_id, value_color=class_color)
 
         self._labels_layer.features = feature_rows
-        if result.texture_table_changed:
-            # Only brand-new classes append a new texture-code -> RGBA row.
-            # Notify vispy to upload the expanded lookup texture. Existing-
-            # class edits reuse an already uploaded texture row, so they only
-            # need the layer refresh below.
+        if result.texture_table_changed or _colors_labels_by_label_id_on_gpu(self._labels_layer):
+            # Vispy rebuilds and uploads its color lookup texture only on a
+            # colormap event:
+            # - a brand-new class appends a texture-code -> RGBA row;
+            # - for 8/16-bit labels the texture maps label ids to RGBA directly,
+            #   so every edit changes it.
+            # For larger dtypes, existing-class edits only change the texture
+            # codes of the edited label, which the refresh below recodes.
             self._labels_layer.events.colormap()
-        # The compact mapping was mutated in place; repaint the layer without
+        # The colormap object was updated in place; repaint the layer without
         # asking napari to recompute the layer extent.
         refresh(extent=False)
         return True
@@ -425,6 +429,17 @@ class ViewerStylingController:
             categories=categories,
         )
         return {class_id: _rgba_array(color) for class_id, color in zip(categories, colors, strict=True)}
+
+
+def _colors_labels_by_label_id_on_gpu(layer: Labels) -> bool:
+    """Return whether napari colors this labels layer by label id on the GPU.
+
+    For 8- and 16-bit labels, napari uploads the label ids unchanged and vispy
+    looks up each label's RGBA in a texture built from the colormap, which is
+    rebuilt only on `layer.events.colormap`. Larger dtypes are recoded to
+    texture codes on the CPU for every refreshed slice.
+    """
+    return np.dtype(layer.data.dtype).itemsize <= 2
 
 
 def _read_class_categories(
