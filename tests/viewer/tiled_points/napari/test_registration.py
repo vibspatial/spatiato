@@ -103,8 +103,8 @@ class _FailingControlsRegistry(dict[type[object], type[object]]):
 
 def _compatibility(
     *,
-    napari_version: str = "0.7.1",
-    vispy_version: str = "0.16.2",
+    napari_version: str = registration._MINIMUM_NAPARI_VERSION,
+    vispy_version: str = registration._MINIMUM_VISPY_VERSION,
     visual_registry: dict[type[object], type[object]] | None = None,
     controls_registry: dict[type[object], type[object]] | None = None,
 ) -> registration._NapariCompatibility:
@@ -149,18 +149,61 @@ def test_registration_rejects_conflict_before_mutation(monkeypatch: pytest.Monke
     assert controls_registry == {}
 
 
-def test_unsupported_versions_fail_before_registry_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("napari_version", "vispy_version"),
+    [
+        ("0.9.2", "0.17.0"),  # napari below the minimum
+        ("0.10.0", "0.16.2"),  # VisPy below the minimum
+        ("unknown", "0.17.0"),  # unrecognized version string
+    ],
+)
+def test_unsupported_versions_fail_before_registry_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    napari_version: str,
+    vispy_version: str,
+) -> None:
     visual_registry: dict[type[object], type[object]] = {}
     controls_registry: dict[type[object], type[object]] = {}
     compatibility = _compatibility(
-        napari_version="0.7.2",
+        napari_version=napari_version,
+        vispy_version=vispy_version,
         visual_registry=visual_registry,
         controls_registry=controls_registry,
     )
     monkeypatch.setattr(registration, "_load_napari_compatibility", lambda: compatibility)
 
-    with pytest.raises(TiledPointsLayerCompatibilityError, match="supports exactly"):
+    with pytest.raises(TiledPointsLayerCompatibilityError, match="requires napari >="):
         register_tiled_points_layer()
 
     assert visual_registry == {}
     assert controls_registry == {}
+
+
+@pytest.mark.parametrize(
+    ("napari_version", "vispy_version"),
+    [
+        ("0.10.0", "0.17.0"),
+        ("0.10.1rc1", "0.17.0"),  # a pre-release counts as its release
+        ("0.11", "0.18.2"),
+        ("1.0.0.dev3+g1234abc", "1.0.0"),
+    ],
+)
+def test_newer_versions_are_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+    napari_version: str,
+    vispy_version: str,
+) -> None:
+    visual_registry: dict[type[object], type[object]] = {}
+    controls_registry: dict[type[object], type[object]] = {}
+    compatibility = _compatibility(
+        napari_version=napari_version,
+        vispy_version=vispy_version,
+        visual_registry=visual_registry,
+        controls_registry=controls_registry,
+    )
+    monkeypatch.setattr(registration, "_load_napari_compatibility", lambda: compatibility)
+
+    register_tiled_points_layer()
+
+    assert visual_registry == {TiledPointsLayerModel: VispyTiledPointsLayer}
+    assert controls_registry == {TiledPointsLayerModel: QtTiledPointsLayerControls}
