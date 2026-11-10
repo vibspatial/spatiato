@@ -134,11 +134,27 @@ Loading keeps today's semantics: `ensure_labels_loaded(...)` / `ensure_shapes_lo
 
 3. **Matching key for a styled source.** See "Matching a loaded source" below. `get_loaded_styled_labels_layer(...)` and `get_loaded_styled_shapes_layer(...)` should match on that key instead of full spec equality.
 
-### Shared layer row (`src/spatiato/widgets/image_layer_row.py`)
+### Shared layer row
 
-Generalize `_ImageLayerRow` so its binding may be any `BaseLayerBinding`. The colormap button stays image-only through `show_colormap`. Renaming it to `_LayerRow` is optional; the Histogram widget is the other user.
+Split today's `_ImageLayerRow` into a neutral base class and an image subclass (see "Decisions").
 
-Shapes rows get a per-row **Fill** checkbox (see "Shapes Fill" below). This can be an optional extra control on the shared row or a small subclass.
+New module `src/spatiato/widgets/layer_row.py` with `_LayerRow`:
+
+- accepts any `BaseLayerBinding`;
+- has the eye toggle, label and remove button, syncs visibility from `layer.events.visible`, and has an idempotent `dispose()`;
+- emits identity-free intents (`remove_requested`, `visibility_change_requested`) and never mutates the layer. Its docstring states this contract generally; it is the contract `_ImageLayerRow` documents today;
+- has a warning state, used for "source no longer available";
+- lets an owner or subclass add extra controls between the label and the remove button, used for **Fill** on shapes rows.
+
+`src/spatiato/widgets/image_layer_row.py` keeps `_ImageLayerRow(_LayerRow)`. It adds the color button, the `layer.events.colormap` subscription and the colormap sync. The image-specific helpers stay in that module: `_binding_channel_index`, `_binding_channel_name`, `_colormap_presentation_from_layer`, `_solid_color_from_layer` and `_normalized_color_or_none`. The imports in `widgets/viewer/widget.py`, `widgets/viewer/image_widget.py` and `widgets/histogram/widget.py` do not change.
+
+Users of each row class:
+
+- image Stack and Overlay rows, and Histogram rows: `_ImageLayerRow`, unchanged;
+- primary labels and primary shapes rows, and styled labels rows: `_LayerRow`;
+- styled shapes rows: `_LayerRow` with a **Fill** checkbox (see "Shapes Fill" below), as an extra control or a small subclass.
+
+The color button must not move into `_LayerRow`. In the installed napari, `Shapes` and `Points` layers have no `colormap` event, so subscribing to it fails for shapes rows, and point-radius shapes are rendered as `Points`. `Labels` layers do have the event, but the colormap helpers detect solid colors in image colormaps and give no meaningful preview for a labels colormap.
 
 ### Labels card (`src/spatiato/widgets/viewer/labels_widget.py`)
 
@@ -191,13 +207,13 @@ Mirror the image handlers:
 
 ### Refresh after table changes
 
-Today a user restyles a loaded layer after a table change by clicking **Add / Update** again. Once a loaded source is no longer offered in the completer, that route is gone, so the Viewer restyles loaded layers itself.
+Today a user restyles a loaded layer after a table change by clicking **Add / Update** again. Once a loaded source is no longer offered in the completer, that route is gone, so the Viewer restyles loaded layers itself. This is decided (see "Decisions"): the restyle is automatic and scoped, and rows get no refresh button.
 
-Proposed rule, in `ViewerWidget._on_table_state_changed(...)`:
+The rule, in `ViewerWidget._on_table_state_changed(...)`:
 
 - `change_kind` `"updated"` or `"created"`: restyle each loaded styled layer whose spec is an `obs_column` source of `event.table_name` whose column has a matching `TableComponentPath("obs", (column,))` in `event.paths`. Var sources are not restyled for these events: `TableComponentPath` only covers `obs`, `obsm` and `uns`, so the app never reports `X` or `layers` changes this way.
 - `change_kind` `"rebuilt"` or `"reloaded"`: restyle every loaded styled layer that reads `event.table_name`.
-- `change_kind` `"removed"`, or a restyle that raises `ValueError` because the table or column is gone: keep the layer as it is and show a warning on its row ("source no longer available"). The user removes it explicitly.
+- `change_kind` `"removed"`, or a restyle that raises `ValueError` because the table or column is gone: keep the layer as it is and show a warning on its row ("source no longer available"). The Viewer never removes the layer automatically; the user removes it with the row's remove button or "Remove all".
 
 Restyling calls `ensure_styled_*_loaded(...)` with the loaded spec. For shapes it passes the row's current Fill state.
 
@@ -236,18 +252,21 @@ Each accepted selection runs one synchronous load. That is the same work a singl
 
 If shapes loading feels too slow with immediate loading, a busy indicator on the card is the first mitigation. Background loading is out of scope here.
 
+## Decisions
+
+- **Refresh after table changes**: the Viewer restyles affected loaded layers automatically, scoped to the table changes that touch them, as described in "Refresh after table changes". Rows get no refresh button.
+- **Missing source**: when the table or column of a loaded layer disappears, the layer stays in the viewer as it is and its row shows a warning. The Viewer never removes it automatically.
+- **Row labels with several linked tables**: when an element has more than one linked table, table-backed rows are prefixed with the table name. Rows stay in one flat list in napari layer order; they are not grouped under table headings.
+- **Shared row**: the generic part of `_ImageLayerRow` moves to `_LayerRow` in a new neutral module, `src/spatiato/widgets/layer_row.py`. `_ImageLayerRow` stays in `image_layer_row.py` as a subclass that adds the color button and colormap sync, together with the image channel and colormap helpers. It is not generalized in place, because labels and shapes rows would then sit in an image-named class with a color option that has to be off for them. It is not moved and renamed as a whole either, because the neutral module would then hold image colormap and channel code. See "Shared layer row".
+
 ## Open Questions
 
-1. **Refresh after table changes**: automatic scoped restyle (proposed above), or a refresh button on each row?
-2. **Missing source**: keep the layer and warn (proposed), or remove the layer automatically when its table or column disappears?
-3. **Row labels with several linked tables**: prefix the table name (proposed), or group rows under a table heading?
-4. **Shared row**: generalize `_ImageLayerRow` in place, or rename it to `_LayerRow` and move it to a neutral module?
-5. **Primary row placement**: above the color-source controls (proposed), or as the first row of the loaded list?
+1. **Primary row placement**: above the color-source controls (proposed), or as the first row of the loaded list?
 
 ## Implementation Phases
 
 1. **Adapter**: the `labels_layers_changed` / `shapes_layers_changed` signals, `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`, and the styled-source matching key.
-2. **Shared row**: generalize `_ImageLayerRow` to any binding.
+2. **Shared row**: add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it.
 3. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh.
 4. **Table refresh**: scoped restyle on `table_state_changed`, and stale-source warnings.
 5. **Shapes card**: same as labels, plus shapes-column sources and per-row Fill.
@@ -260,6 +279,11 @@ Adapter (`tests/test_viewer_adapter.py`):
 - `remove_styled_*_layer(...)` removes only the matching variant and leaves siblings and the primary layer alone;
 - a spec that differs only in `value_kind` resolves to the existing styled layer;
 - `X` and a layer for the same var stay separate layers.
+
+Layer rows:
+
+- new `tests/test_layer_row.py` for `_LayerRow`: intents are emitted without mutating the layer, visibility follows native events, `dispose()` is idempotent, the warning state renders, and rows can be built for `Labels`, `Shapes` and `Points` layers;
+- the existing `tests/test_image_layer_row.py` keeps passing unchanged.
 
 Viewer widget (`tests/test_viewer_widget.py`):
 
