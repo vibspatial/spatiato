@@ -113,6 +113,29 @@ def test_compact_continuous_labels_mapping_matches_current_rgba_for_representati
     np.testing.assert_allclose(_mapped_rgba(mapping, values.index), continuous_rgba_for_values(values), atol=1e-6)
 
 
+def test_compact_continuous_labels_mapping_gives_zeros_their_own_color() -> None:
+    values = pd.Series(
+        [0.0, 2.0, np.nan, 4.0, 0.0],
+        index=pd.Index([10, 20, 30, 40, 50], name="index"),
+    )
+
+    mapping = compact_continuous_labels_mapping_from_values(values, zero_color="none")
+    code_by_label = dict(zip(mapping.label_ids.tolist(), mapping.texture_codes.tolist(), strict=True))
+
+    # Default, background, 251 bins, missing and zero: still uint8 texture codes.
+    assert len(mapping.texture_rgba) == 255
+    assert CompactLabelColormap(mapping)._data_to_texture(np.asarray([[10, 40]], dtype=np.int32)).dtype == np.uint8
+    zero_texture_code = 254
+    assert code_by_label[10] == zero_texture_code
+    assert code_by_label[50] == zero_texture_code
+    np.testing.assert_allclose(mapping.texture_rgba[zero_texture_code], np.zeros(4))
+    assert mapping.missing_texture_code == 253
+    assert code_by_label[30] == mapping.missing_texture_code
+    # Zeros still set the bottom of the range: 2.0 is halfway, 4.0 the top bin.
+    assert code_by_label[20] == 2 + 125
+    assert code_by_label[40] == 2 + 250
+
+
 def test_compact_continuous_labels_mapping_reuses_bins_for_repeated_values() -> None:
     values = pd.Series([0.25, 0.25, 1.0], index=pd.Index([5, 6, 7], name="index"))
 

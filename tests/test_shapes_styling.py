@@ -894,6 +894,65 @@ def test_apply_table_color_source_to_shapes_layer_colors_sparse_var_continuously
     assert pd.isna(layer.features["GeneB"].iloc[2])
 
 
+@pytest.mark.parametrize(("other_value", "zero_is_transparent"), [(20.0, True), (-20.0, False)])
+@pytest.mark.parametrize("layer_kind", ["shapes", "points"])
+def test_apply_table_color_source_to_shapes_layer_draws_not_detected_var_zeros_transparent(
+    layer_kind: str,
+    other_value: float,
+    zero_is_transparent: bool,
+) -> None:
+    # Non-negative data: 0 means "not detected" and must not hide the image
+    # underneath. A negative value marks scaled data, where 0 is an ordinary value.
+    geodataframe = gpd.GeoDataFrame(
+        {},
+        geometry=[_polygon(0), _polygon(2), _polygon(4)],
+        index=pd.Index(["cell_1", "cell_2", "cell_3"], name="instance_id"),
+    )
+    table = ad.AnnData(
+        X=np.asarray([[0.0], [other_value], [5.0]]),
+        obs=pd.DataFrame(
+            {
+                "region": ["cells", "cells", "cells"],
+                "instance_id": ["cell_1", "cell_2", "cell_3"],
+            },
+            index=["obs_1", "obs_2", "obs_3"],
+        ),
+        var=pd.DataFrame(index=["GeneA"]),
+    )
+    source_indices = ("cell_1", "cell_2", "cell_3")
+    if layer_kind == "shapes":
+        layer = _make_shapes_layer(source_indices, source_shapes_index_feature_name="instance_id")
+    else:
+        layer = _make_points_layer(source_indices, source_shapes_index_feature_name="instance_id")
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="var",
+        value_key="GeneA",
+        value_kind="continuous",
+    )
+
+    apply_table_color_source_to_shapes_layer(
+        layer,
+        sdata=_make_shapes_sdata(geodataframe, table),
+        shapes_name="cells",
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=(0, 1, 2),
+        source_shapes_index_feature_name="instance_id",
+        fill=True,
+    )
+
+    colors = layer.edge_color if layer_kind == "shapes" else layer.face_color
+    expected_zero_alpha = 0.0 if zero_is_transparent else SHAPES_EDGE_ALPHA
+    np.testing.assert_allclose(colors[:, 3], [expected_zero_alpha, SHAPES_EDGE_ALPHA, SHAPES_EDGE_ALPHA])
+    if layer_kind == "shapes":
+        expected_zero_face_alpha = 0.0 if zero_is_transparent else SHAPES_FACE_ALPHA
+        np.testing.assert_allclose(
+            layer.face_color[:, 3],
+            [expected_zero_face_alpha, SHAPES_FACE_ALPHA, SHAPES_FACE_ALPHA],
+        )
+    assert layer.features["GeneA"].to_list() == [0.0, other_value, 5.0]
+
+
 def test_apply_table_color_source_to_shapes_layer_coerces_string_obs_to_temporary_categorical() -> None:
     geodataframe = gpd.GeoDataFrame(
         {},

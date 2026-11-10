@@ -232,5 +232,18 @@ def continuous_rgba_for_values(
     return rgba
 
 
+def zeros_mean_not_detected(values: pd.Series) -> bool:
+    """Return whether exact zeros in an expression (`var`) column mean "not detected".
+
+    True when every finite value is non-negative, as in counts, normalized or
+    log1p data. Table styling then draws those zeros transparent: in the
+    colormap's lowest color (near black for magma) they would hide the image
+    underneath. Scaled data with negative values keeps 0 as an ordinary value.
+    """
+    numeric_values = pd.to_numeric(values, errors="coerce").to_numpy(dtype="float64", copy=False)
+    finite_values = numeric_values[np.isfinite(numeric_values)]
+    return finite_values.size > 0 and bool(np.all(finite_values >= 0))
+
+
 def _is_string_scalar(value: object) -> bool:
     return isinstance(value, (str, bytes, np.str_, np.bytes_))

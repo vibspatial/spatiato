@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 from matplotlib.colors import to_rgba
 
 from spatiato.viewer._styling import (
@@ -9,6 +10,7 @@ from spatiato.viewer._styling import (
     categorical_rgba_for_values,
     continuous_colors_for_values,
     continuous_rgba_for_values,
+    zeros_mean_not_detected,
 )
 from spatiato.viewer.labels_colormap import (
     CompactLabelColormap,
@@ -50,14 +52,27 @@ def test_continuous_rgba_for_values_matches_existing_colors_for_all_missing_valu
     np.testing.assert_allclose(actual, expected)
 
 
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (pd.Series([0.0, 3.0, np.nan]), True),  # counts with a missing value
+        (pd.Series([0.0, 0.0]), True),
+        (pd.Series([0.0, 1.5, 2.0]), True),  # normalized or log1p data
+        (pd.Series([-0.5, 0.0, 1.2]), False),  # scaled data: 0 is an ordinary value
+        (pd.Series([np.nan, np.nan]), False),
+        (pd.Series([], dtype="float64"), False),
+    ],
+)
+def test_zeros_mean_not_detected_only_for_non_negative_values(values: pd.Series, expected: bool) -> None:
+    assert zeros_mean_not_detected(values) is expected
+
+
 def test_categorical_rgba_for_values_matches_existing_colors_with_missing_values() -> None:
     categories = ["T", "B", "NK"]
     palette = ["#ff0000", "#00ff00", "#0000ff"]
     values = pd.Series(pd.Categorical(["T", "B", None, "NK"], categories=categories))
 
-    expected = _colors_series_to_rgba(
-        categorical_colors_for_values(values, categories=categories, palette=palette)
-    )
+    expected = _colors_series_to_rgba(categorical_colors_for_values(values, categories=categories, palette=palette))
     actual = categorical_rgba_for_values(values, categories=categories, palette=palette)
 
     assert actual.dtype == np.dtype("float64")
@@ -70,9 +85,7 @@ def test_categorical_rgba_for_values_matches_existing_colors_for_unknown_values(
     palette = ["#ff0000", "#00ff00"]
     values = pd.Series(["T", "unknown", None, "B"], dtype="object")
 
-    expected = _colors_series_to_rgba(
-        categorical_colors_for_values(values, categories=categories, palette=palette)
-    )
+    expected = _colors_series_to_rgba(categorical_colors_for_values(values, categories=categories, palette=palette))
     actual = categorical_rgba_for_values(values, categories=categories, palette=palette)
 
     np.testing.assert_allclose(actual, expected)
@@ -83,9 +96,7 @@ def test_categorical_rgba_for_values_matches_existing_numpy_scalar_normalization
     palette = ["#ff0000", "#00ff00"]
     values = pd.Series([1, np.int64(2), 3, None], dtype="object")
 
-    expected = _colors_series_to_rgba(
-        categorical_colors_for_values(values, categories=categories, palette=palette)
-    )
+    expected = _colors_series_to_rgba(categorical_colors_for_values(values, categories=categories, palette=palette))
     actual = categorical_rgba_for_values(values, categories=categories, palette=palette)
 
     np.testing.assert_allclose(actual, expected)

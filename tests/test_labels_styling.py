@@ -46,6 +46,40 @@ def _style_blobs_labels(sdata: SpatialData, style_spec: TableColorSourceSpec) ->
     return layer, result
 
 
+@pytest.mark.parametrize(("other_value", "zero_is_transparent"), [(5.0, True), (-1.0, False)])
+def test_apply_table_color_source_to_labels_layer_draws_not_detected_var_zeros_transparent(
+    sdata_blobs: SpatialData,
+    other_value: float,
+    zero_is_transparent: bool,
+) -> None:
+    # Non-negative data: 0 means "not detected" and must not hide the image
+    # underneath. A negative value marks scaled data, where 0 is an ordinary value.
+    table = sdata_blobs["table"]
+    x = table.X.toarray() if sparse.issparse(table.X) else np.asarray(table.X)
+    x = x.astype(np.float64)
+    column = table.var_names.get_loc("channel_1_sum")
+    region_rows = np.flatnonzero(table.obs["region"].astype(str).to_numpy() == "blobs_labels")
+    zero_row, other_row, positive_row = region_rows[:3]
+    x[region_rows, column] = 5.0
+    x[zero_row, column] = 0.0
+    x[other_row, column] = other_value
+    table.X = x
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="var",
+        value_key="channel_1_sum",
+        value_kind="continuous",
+    )
+
+    layer, _ = _style_blobs_labels(sdata_blobs, style_spec)
+
+    zero_label = int(table.obs["instance_id"].iloc[zero_row])
+    positive_label = int(table.obs["instance_id"].iloc[positive_row])
+    assert bool(layer.colormap.map(zero_label)[3] == 0.0) is zero_is_transparent
+    assert layer.colormap.map(positive_label)[3] > 0.0
+    assert layer.features.set_index("index").loc[zero_label, "channel_1_sum"] == 0.0
+
+
 @pytest.mark.parametrize("var_layer", [None, "counts"])
 @pytest.mark.parametrize(("x_format", "mode"), FORMATS_AND_MODES)
 def test_apply_table_color_source_to_labels_layer_colors_var_continuously(

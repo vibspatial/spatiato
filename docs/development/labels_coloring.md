@@ -50,7 +50,8 @@ annotations are written to the table ([`classifier.md`](classifier.md),
 | Primary layer as loaded, without styling | napari's default random colormap |
 | Styled layer colored by instance id | napari's random colormap (`label_colormap`) |
 | Styled layer colored by a categorical, boolean, 0/1 integer or string column; the primary layer in Spatial Query with an annotation column | `CompactLabelColormap`, categorical |
-| Styled layer colored by another numeric column or a `var` | `CompactLabelColormap`, continuous (252 bins) |
+| Styled layer colored by another numeric column | `CompactLabelColormap`, continuous (252 bins) |
+| Styled layer colored by a `var` | `CompactLabelColormap`, continuous (252 bins; 251 plus a transparent zero row for non-negative values) |
 | Primary layer in Object Classification, Color by `user_class` or `pred_class` | `CompactLabelColormap`, categorical, from the class palette in `uns` |
 | Primary layer in Object Classification, Color by confidence | `CompactLabelColormap`, continuous, range 0 to 1 |
 | Primary layer in Spatial Query without an annotation column; in Object Classification when the table is rejected | `NeutralLabelColormap`: every object in one neutral color |
@@ -59,6 +60,14 @@ In a table-styled layer, an object whose table row has no value (missing, or
 not in the palette) gets the missing color, and an object without a table row
 is transparent. Object Classification draws objects without a row in the
 neutral color instead when no table is bound, so they do not disappear.
+
+When a layer is colored by a `var` whose values are all non-negative (counts,
+normalized or log1p data), an object with a value of exactly 0 is transparent
+too: 0 means "not detected", and the colormap's lowest color (near black for
+magma) would hide the image underneath. Zeros still count as the bottom of the
+value range, so the other colors do not shift. Scaled data with negative values
+keeps 0 as an ordinary value. Styled shapes and point-radius shapes follow the
+same rule (`zeros_mean_not_detected`).
 
 ## How napari draws a slice
 
@@ -234,8 +243,9 @@ paths.
 ### 252 continuous bins
 
 `_CONTINUOUS_LABEL_BINS`. A continuous mapping has the bins plus three rows
-(default, background, missing). 252 bins is the most that keeps texture codes,
-and so the data texture, in uint8.
+(default, background, missing), and a fourth for transparent zeros when a
+`var` is non-negative. 252 bins, or 251 with the zero row, is the most that
+keeps texture codes, and so the data texture, in uint8.
 
 ### A reserved missing row
 
