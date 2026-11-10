@@ -7,12 +7,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 from matplotlib import colormaps
 from matplotlib.colors import to_rgba
 from napari.utils.colormap_backend import ColormapBackend, set_backend
 from napari.utils.colormaps import DirectLabelColormap
 from napari.utils.colormaps import _accelerated_cmap as _accel_cmap
-from numba import njit, typed, types
+from numba import njit, prange, typed, types
 
 from spatiato.viewer._styling import (
     MISSING_CATEGORICAL_COLOR,
@@ -22,6 +23,19 @@ from spatiato.viewer._styling import (
 )
 
 _TRANSPARENT_RGBA = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+# A continuous mapping has `bins + 3` texture rows: default, background, the
+# bins and missing. Napari stores texture codes as uint8 only up to 255 colors
+# (`minimum_dtype_for_labels`), so 252 bins is the largest count that keeps the
+# per-slice labels texture uint8 instead of uint16.
+_CONTINUOUS_LABEL_BINS = 252
+
+# Upper bound for one colormap's dense table (the `label_id -> texture_code`
+# array of `CompactLabelColormap._get_dense_texture_lut`). Its size follows the
+# largest table label id, so typical tables stay small; very large or hashed
+# label ids fall back to napari's per-pixel typed-dict lookup.
+_DENSE_LUT_MAX_BYTES = 128 * 1024**2
+_DENSE_LUT_CACHE_KEY = "_compact_dense_texture_lut"
 
 
 @njit(cache=True)
@@ -38,6 +52,28 @@ def _fill_typed_label_texture_mapping(
     return typed_mapping
 
 
+@njit(parallel=True, cache=True)
+def _gather_signed_label_texture_codes(flat_values, lut, out):
+    """Write `lut[value]` for every in-table value; leave other entries untouched."""
+    n = lut.shape[0]
+    for i in prange(flat_values.size):
+        value = flat_values[i]
+        if value >= 0 and value < n:
+            out[i] = lut[value]
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _gather_unsigned_label_texture_codes(flat_values, lut, out):
+    """Unsigned variant, so numba never compares int64 with uint64."""
+    n = np.uint64(lut.shape[0])
+    for i in prange(flat_values.size):
+        value = np.uint64(flat_values[i])
+        if value < n:
+            out[i] = lut[value]
+    return out
+
+
 @dataclass(frozen=True)
 class CompactLabelsMapping:
     """Compact labels color state.
@@ -45,8 +81,9 @@ class CompactLabelsMapping:
     `label_ids -> texture_codes` is the logical per-object mapping. RGBA values
     live once in `texture_rgba`, where each row index is the texture code. The
     color for `label_ids[i]` is therefore `texture_rgba[texture_codes[i]]`. The
-    state is intentionally independent of napari colormap internals; numba
-    typed mappings and bounded small-label lookup arrays are derived from these
+    state is intentionally independent of napari colormap internals; the dense
+    table (`CompactLabelColormap._get_dense_texture_lut`), napari's numba typed
+    dicts and napari's low-bit `label_id -> RGBA` lookups are derived from these
     arrays when napari asks for them.
 
     Parameters
@@ -140,8 +177,7 @@ class CompactLabelsMapping:
         if len(self.texture_codes) and int(np.max(self.texture_codes)) >= len(self.texture_rgba):
             raise ValueError("Compact labels mapping contains a texture code without an RGBA row.")
         if self.value_texture_codes is not None and any(
-            not 0 <= int(texture_code) < len(self.texture_rgba)
-            for texture_code in self.value_texture_codes.values()
+            not 0 <= int(texture_code) < len(self.texture_rgba) for texture_code in self.value_texture_codes.values()
         ):
             raise ValueError("Compact labels mapping contains a value texture code without an RGBA row.")
         if np.any(self.label_ids == self.background_value):
@@ -170,8 +206,10 @@ class _CompactLabelToTextureMapping(Mapping[int | None, int]):
     ```
 
     This view supports that without building a large Python dict. Full
-    high-bit label arrays use `_get_typed_dict_mapping(...)` instead, so this
-    scalar lookup path is not the hot per-pixel rendering path.
+    high-bit label arrays use the dense table from
+    `CompactLabelColormap._get_dense_texture_lut()`, or
+    `_get_typed_dict_mapping(...)` when that table is not used, so this scalar
+    lookup path is not the hot per-pixel rendering path.
     """
 
     def __init__(self, compact_mapping: CompactLabelsMapping) -> None:
@@ -205,12 +243,23 @@ class CompactLabelColormap(DirectLabelColormap):
     private hooks. Methods prefixed with `_compact_` are Spatiato-only helpers for
     looking up RGBA values from `CompactLabelsMapping`.
 
-    Napari and vispy still expect direct-label internals shaped like
+    Building: napari and vispy still expect direct-label internals shaped like
     `label_id -> texture_code` and `texture_code -> RGBA`. This subclass
     satisfies that contract with `_label_to_texture_mapping`
     (`label_id -> texture_code`) and `_texture_color_dict`
     (`texture_code -> RGBA`), avoiding the huge `label_id -> RGBA` dictionary
     used by ordinary `DirectLabelColormap` construction.
+
+    Drawing: each new slice is recoded to texture codes on the Qt main thread.
+    For high-bit labels this uses the dense table and a parallel gather instead
+    of napari's per-pixel typed-dict lookup, see `_data_to_texture`.
+
+    Dense table: a 1-D array indexed by label id that holds each label's
+    texture code, for every id from 0 to the largest table label id, including
+    ids without a table row (code 0). Built and cached by
+    `_get_dense_texture_lut`; used only to recode high-bit arrays.
+
+    See `docs/development/labels_coloring.md` ("The compact colormap").
     """
 
     def __init__(self, compact_mapping: CompactLabelsMapping) -> None:
@@ -227,9 +276,7 @@ class CompactLabelColormap(DirectLabelColormap):
             # while one real label still makes napari detect direct mode
             # instead of treating the colormap as default/background only.
             first_label_id = int(compact_mapping.label_ids[0])
-            small_color_dict[first_label_id] = compact_mapping.texture_rgba[
-                int(compact_mapping.texture_codes[0])
-            ]
+            small_color_dict[first_label_id] = compact_mapping.texture_rgba[int(compact_mapping.texture_codes[0])]
 
         super().__init__(
             color_dict=small_color_dict,
@@ -242,6 +289,10 @@ class CompactLabelColormap(DirectLabelColormap):
             "_texture_color_dict",
             dict(enumerate(compact_mapping.texture_rgba)),
         )
+        # True once the dense-table fallback has been logged. Kept outside
+        # `_cache_other`, which `_install_compact_mapping` clears after every
+        # sparse annotation edit; otherwise each edit would log the fallback again.
+        object.__setattr__(self, "_dense_lut_fallback_logged", False)
 
     def set_label_value(
         self,
@@ -392,8 +443,134 @@ class CompactLabelColormap(DirectLabelColormap):
         # plus the small texture-code-to-RGBA table.
         return self._label_mapping_and_color_dict
 
+    def _data_to_texture(self, values: np.ndarray | np.integer) -> np.ndarray | np.integer:
+        """Napari hook: recode a slice of label ids for the GPU data texture.
+
+        This is the drawing step. Napari calls it on the Qt main thread for
+        every new slice, so its speed decides how smooth panning and zooming
+        are. With the same cached dense table, it also runs for:
+
+        - the layer thumbnail, through `map`: napari first downsamples it to at
+          most 32 x 32 pixels, so this takes well under a millisecond;
+        - for multiscale data, the coarsest pyramid level, which napari
+          converts with every new slice although its thumbnail only reads the
+          raw label ids (https://github.com/vibspatial/spatiato/issues/136);
+        - painted pixels, and an empty array to choose the view dtype.
+
+        High-bit labels ((u)int32/64 arrays): each label id is recoded to its
+        texture code with the dense table (`_get_dense_texture_lut`) and a
+        parallel gather, instead of napari's per-pixel typed-dict lookup. Where
+        the dense table does not apply (a negative background value, a table
+        above `_DENSE_LUT_MAX_BYTES`, or a failed allocation), napari's
+        typed-dict path gives the same result, more slowly.
+
+        Low-bit labels ((u)int8/16 arrays): nothing is recoded. Napari passes
+        the label ids on unchanged (a zero-copy unsigned view), and the GPU
+        looks up each label's color by its label id.
+
+        Scalars and selected-label mode also use napari's `DirectLabelColormap`
+        path. See `docs/development/labels_coloring.md` ("The compact
+        colormap").
+        """
+        if (
+            not isinstance(values, np.ndarray)
+            or values.dtype.kind not in "iu"
+            or values.dtype.itemsize <= 2
+            or self.use_selection
+        ):
+            return super()._data_to_texture(values)
+        lut = self._get_dense_texture_lut()
+        if lut is None:
+            return super()._data_to_texture(values)
+
+        flat_values = values.reshape(-1)  # copies only when not contiguous
+        # `CompactLabelsMapping` enforces `default_texture_code == 0`, so zeros
+        # already hold the code for labels outside the table.
+        out = np.zeros(flat_values.shape, dtype=lut.dtype)
+        if values.dtype.kind == "u":
+            _gather_unsigned_label_texture_codes(flat_values, lut, out)
+        else:
+            _gather_signed_label_texture_codes(flat_values, lut, out)
+        return out.reshape(values.shape)
+
+    def _get_dense_texture_lut(self) -> np.ndarray | None:
+        """Spatiato helper: return the dense table, built on first use.
+
+        The dense table is a `label_id -> texture_code` array with one entry per
+        label id from 0 to the largest table label id (or the background value),
+        in the texture dtype napari expects for this colormap. Labels without a
+        table row keep the default code.
+
+        Returns `None` when napari's typed-dict path must be used instead: a
+        negative background value, a table above `_DENSE_LUT_MAX_BYTES`, or a
+        failed allocation. Both outcomes are cached in `_cache_other`, which
+        `_install_compact_mapping(...)` clears after sparse edits, through
+        napari's `_clear_cache()`.
+        """
+        if _DENSE_LUT_CACHE_KEY in self._cache_other:
+            return self._cache_other[_DENSE_LUT_CACHE_KEY]
+
+        compact = self._compact_mapping
+        lut = None
+        if compact.background_value < 0:
+            self._log_dense_lut_fallback(
+                "DEBUG",
+                f"Labels colormap: negative background value {compact.background_value} is not supported "
+                "by the dense table; using the slower per-pixel lookup.",
+            )
+        else:
+            target_dtype = _accel_cmap.minimum_dtype_for_labels(len(compact.texture_rgba))
+            max_label_id = int(compact.label_ids[-1]) if len(compact.label_ids) else 0
+            size = max(max_label_id, compact.background_value) + 1
+            table_bytes = size * target_dtype.itemsize
+            if table_bytes > _DENSE_LUT_MAX_BYTES:
+                self._log_dense_lut_fallback(
+                    "INFO",
+                    f"Labels colormap: largest label id {max_label_id:,} needs a "
+                    f"{table_bytes / 1024**2:,.0f} MB lookup table, above the "
+                    f"{_DENSE_LUT_MAX_BYTES / 1024**2:,.0f} MB cap; using the slower per-pixel lookup. "
+                    "Colors are unaffected.",
+                )
+            else:
+                try:
+                    lut = _dense_texture_lut(compact, size=size, dtype=target_dtype)
+                except MemoryError:
+                    self._log_dense_lut_fallback(
+                        "WARNING",
+                        f"Labels colormap: could not allocate a {table_bytes / 1024**2:,.0f} MB lookup table "
+                        f"for label ids up to {max_label_id:,}; using the slower per-pixel lookup. "
+                        "Colors are unaffected.",
+                    )
+
+        self._cache_other[_DENSE_LUT_CACHE_KEY] = lut
+        return lut
+
+    def _log_dense_lut_fallback(self, level: str, message: str) -> None:
+        """Spatiato helper: log the dense-table fallback once per colormap."""
+        if self._dense_lut_fallback_logged:
+            return
+        object.__setattr__(self, "_dense_lut_fallback_logged", True)
+        logger.log(level, message)
+
     def _get_typed_dict_mapping(self, data_dtype: np.dtype) -> typed.Dict:
-        """Napari hook: build the high-bit label-id-to-texture-code dict."""
+        """Napari hook: return the `label_id -> texture_code` typed dict for one data dtype.
+
+        Napari's numba backend looks up every pixel of a high-bit array in this
+        dict; a label id that is not in it gets the default texture code 0. Here
+        it is only used when `_data_to_texture(...)` cannot use the dense table
+        (`_get_dense_texture_lut`), for slices and, through `map(...)`, for
+        thumbnails: a negative background value, a table above
+        `_DENSE_LUT_MAX_BYTES`, or a failed allocation. Low-bit data never uses
+        it: napari passes those label ids on unchanged, and their colors come
+        from napari's low-bit `label_id -> RGBA` lookup (`_map_without_cache`).
+
+        Napari's `DirectLabelColormap` builds this dict from its per-label colors
+        in a Python loop. This override fills it from the compact arrays in one
+        numba call (`_fill_typed_label_texture_mapping`): the background first,
+        then one entry per table label id that `data_dtype` can represent.
+        Labels without a table row are left out, so they get the default code.
+        The dict is cached per data dtype in `_cache_other`.
+        """
         data_dtype = np.dtype(data_dtype)
         cache_key = f"_compact_{data_dtype.name}_typed_dict"
         if cache_key in self._cache_other:
@@ -424,17 +601,19 @@ class CompactLabelColormap(DirectLabelColormap):
     def map(self, values: np.ndarray | np.integer | int) -> np.ndarray:
         """Napari hook: map scalar or array label ids to RGBA colors.
 
-        For high-bit label arrays, the call chain intentionally moves through
-        napari internals while calling back into this subclass:
+        Napari uses this for thumbnails and single-label colors, not for
+        rendering slices (see `_data_to_texture`). The thumbnail is colored on
+        every layer refresh, including the refresh after each annotation edit.
+        Napari downsamples it to at most 32 x 32 pixels first, so recoding it is
+        cheap; the dense table is shared with the slices.
 
-        ```text
-        napari _accel_cmap.labels_raw_to_texture_direct(values, self)
-          -> our _get_typed_dict_mapping(...)
-             -> label_id -> texture_code
-        inherited _map_precast(texture_codes)
-          -> our _values_mapping_to_minimum_values_set(...)[1]
-             -> texture_code -> RGBA
-        ```
+        - Scalars resolve through the compact arrays.
+        - Low-bit arrays use napari's low-bit `label_id -> RGBA` lookup.
+        - High-bit arrays are recoded by `_data_to_texture`, the same recoding
+          as for slices, so they reuse the dense table (`_get_dense_texture_lut`);
+          napari's typed dict is only built where the dense table cannot be
+          used. The inherited `_map_precast` then turns the texture codes into
+          RGBA through `_values_mapping_to_minimum_values_set(...)[1]`.
         """
         if isinstance(values, np.integer):
             values = int(values)
@@ -446,12 +625,12 @@ class CompactLabelColormap(DirectLabelColormap):
             raise TypeError("DirectLabelColormap can only be used with int")
 
         if values.dtype.itemsize <= 2:
-            # Low-bit labels use napari's bounded dense lookup path.
+            # Low-bit labels use napari's low-bit `label_id -> RGBA` lookup.
             mapper = self._get_mapping_from_cache(values.dtype)
             mapped = mapper[values]
         else:
-            values_cast = _accel_cmap.labels_raw_to_texture_direct(values, self)
-            mapped = self._map_precast(values_cast, apply_selection=True)
+            texture_codes = self._data_to_texture(values)
+            mapped = self._map_precast(texture_codes, apply_selection=True)
 
         if self.use_selection:
             mapped[(values != self.selection)] = 0
@@ -467,7 +646,11 @@ class CompactLabelColormap(DirectLabelColormap):
         raise RuntimeError("Compact label colormaps require napari's numba colormap backend.")
 
     def _clear_cache(self) -> None:
-        """Napari hook: clear derived lookup caches."""
+        """Napari hook: clear derived lookup caches.
+
+        Napari's base class resets `_cache_other` (dense table, typed dicts)
+        and `_cache_mapping` (low-bit RGBA lookups).
+        """
         super()._clear_cache()
 
     def _compact_rgba_for_label(self, label_id: int, *, apply_selection: bool) -> np.ndarray:
@@ -505,6 +688,16 @@ class CompactLabelColormap(DirectLabelColormap):
             mapped = mapped.copy()
             mapped[values != self.selection] = _TRANSPARENT_RGBA
         return mapped
+
+
+def _dense_texture_lut(compact: CompactLabelsMapping, *, size: int, dtype: np.dtype) -> np.ndarray:
+    """Build the dense table for compact state: the texture code of every label id below `size`."""
+    # `CompactLabelsMapping` enforces `default_texture_code == 0`, so a zeroed
+    # table already maps every label without a table row to the default code.
+    lut = np.zeros(size, dtype=dtype)
+    lut[compact.label_ids] = compact.texture_codes
+    lut[compact.background_value] = compact.background_texture_code
+    return lut
 
 
 def _compact_mapping_with_label_texture_code(
@@ -674,7 +867,7 @@ def compact_categorical_label_colormap_from_values(
 def compact_continuous_labels_mapping_from_values(
     values: pd.Series,
     *,
-    bins: int = 256,
+    bins: int = _CONTINUOUS_LABEL_BINS,
     colormap_name: str = OVERLAY_CONTINUOUS_COLORMAP,
     missing_color: Any = MISSING_CONTINUOUS_COLOR,
     default_color: Any = _TRANSPARENT_RGBA,
@@ -693,7 +886,9 @@ def compact_continuous_labels_mapping_from_values(
     bins
         Number of color bins sampled from `colormap_name`. Finite source values
         map to these bins, while missing/non-finite values map to
-        `missing_color`.
+        `missing_color`. The default of 252 keeps the texture codes, and so
+        the per-slice labels texture, in uint8; more bins still work with
+        uint16 textures.
     colormap_name
         Matplotlib colormap used for finite values.
     missing_color
@@ -731,7 +926,7 @@ def compact_continuous_labels_mapping_from_values(
     finite_values = np.isfinite(value_array)
 
     # Cached as a small allocation polish; the hot path is label-id validation
-    # and per-label texture-code construction, not this 256-bin RGBA table.
+    # and per-label texture-code construction, not this small binned RGBA table.
     texture_rgba = _continuous_texture_rgba(
         bins=bins,
         colormap_name=colormap_name,
@@ -779,7 +974,7 @@ def compact_continuous_labels_mapping_from_values(
 def compact_continuous_label_colormap_from_values(
     values: pd.Series,
     *,
-    bins: int = 256,
+    bins: int = _CONTINUOUS_LABEL_BINS,
     colormap_name: str = OVERLAY_CONTINUOUS_COLORMAP,
     missing_color: Any = MISSING_CONTINUOUS_COLOR,
     default_color: Any = _TRANSPARENT_RGBA,
@@ -797,6 +992,81 @@ def compact_continuous_label_colormap_from_values(
         value_range=value_range,
     )
     return CompactLabelColormap(mapping)
+
+
+class NeutralLabelColormap(DirectLabelColormap):
+    """Direct labels colormap that draws every foreground label in one color.
+
+    Its color dict holds only the default (`None`) color and the transparent
+    background. Napari maps labels without an explicit color to texture code 0
+    and the background to texture code 1, so recoding a slice is one
+    comparison with the background value instead of napari's per-pixel
+    typed-dict lookup.
+
+    Build it with `neutral_label_colormap(...)`. It keeps napari's constructor,
+    because napari can rebuild a colormap with
+    `self.__class__(**self.model_dump())` (`_cmap_without_selection`).
+
+    It intentionally does not subclass `CompactLabelColormap`.
+    `isinstance(colormap, CompactLabelColormap)` is how Object Classification
+    recognizes a table-styled layer whose colors it may edit one label at a
+    time (`set_label_value`); a neutral layer has no table values to edit, so
+    it must fail that check. `CompactLabelColormap`'s constructor and hooks also
+    expect a `CompactLabelsMapping`, which a neutral colormap does not have.
+    """
+
+    def _data_to_texture(self, values: np.ndarray | np.integer) -> np.ndarray | np.integer:
+        """Napari hook: recode a slice of label ids for the GPU data texture.
+
+        This is the drawing step, called for every new slice (see
+        `CompactLabelColormap._data_to_texture`). For a high-bit array it
+        returns `values == background_value` as uint8: the background gets
+        code 1 and every other label code 0, the default code that draws the
+        neutral color. That is correct only when napari codes this colormap
+        exactly as `{None: 0, background: 1}`.
+
+        Everything else uses napari's `DirectLabelColormap` path:
+
+        - scalars and non-integer input, which the array shortcut does not
+          cover;
+        - low-bit labels ((u)int8/16), which are not recoded at all: napari
+          passes the label ids on unchanged and the GPU looks up each label's
+          color by its label id;
+        - selected-label mode, where napari codes the selected label as 1 and
+          every other label as 0, so the shortcut would draw the background in
+          the selected color;
+        - a color dict with explicit label colors, for example added by other
+          code, which gives those labels their own codes
+          (`_has_neutral_texture_codes`).
+        """
+        if (
+            not isinstance(values, np.ndarray)
+            or values.dtype.kind not in "iu"
+            or values.dtype.itemsize <= 2
+            or self.use_selection
+            or not self._has_neutral_texture_codes()
+        ):
+            return super()._data_to_texture(values)
+        # Background -> 1, every other label -> 0 (the default code).
+        return (values == self.background_value).view(np.uint8)
+
+    def _has_neutral_texture_codes(self) -> bool:
+        """Spatiato helper: check napari's `None -> 0`, background `-> 1` coding."""
+        label_mapping = self._label_mapping_and_color_dict[0]
+        return (
+            len(label_mapping) == 2 and label_mapping.get(None) == 0 and label_mapping.get(self.background_value) == 1
+        )
+
+
+def neutral_label_colormap(color: Any, *, background_value: int = 0) -> NeutralLabelColormap:
+    """Return a labels colormap that draws every foreground label in `color`.
+
+    The background label stays transparent.
+    """
+    return NeutralLabelColormap(
+        color_dict={None: color, background_value: "transparent"},
+        background_value=background_value,
+    )
 
 
 def direct_label_colormap_from_rgba(
