@@ -48,7 +48,7 @@ dependencies = [
     "joblib",
     "lazy-loader>=0.4",
     "loguru",
-    "napari[all]>=0.7.1",
+    "napari[all]>=0.10.0",
     "pandas<3.0",
     "pyarrow",
     "pyqtgraph>=0.13.7",
