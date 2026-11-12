@@ -10,15 +10,14 @@ import numpy as np
 import zarr
 from harpy.image._image import _get_spatial_element
 from harpy.table._add_feature_matrix import _resolve_channels
+from harpy.table._metadata import _FEATURE_MATRICES_KEY, _FEATURE_MATRIX_SCHEMA_VERSION
 from harpy.table.io._components import _check_in_memory_versus_storage_axes, _component_update_destination
 from harpy.table.io._write_validation import _validated_observation_pairs
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
 from loguru import logger
 from spatialdata.models import TableModel
 
 from spatiato.core.feature_matrix_metadata import (
     CUSTOM_OBSM_SOURCE_KIND,
-    FEATURE_MATRIX_METADATA_SCHEMA_VERSION,
     HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
     validate_feature_key_not_reserved,
 )
@@ -538,8 +537,10 @@ def _incompatibility_reason(
         if isinstance(metadata, Mapping) and metadata.get("source_kind") == CUSTOM_OBSM_SOURCE_KIND:
             return "it is registered as a custom matrix"
         return "its metadata does not come from harpy feature extraction"
-    if metadata.get("schema_version") != FEATURE_MATRIX_METADATA_SCHEMA_VERSION:
+    if metadata.get("schema_version") != _FEATURE_MATRIX_SCHEMA_VERSION:
         return "its metadata has an unsupported schema version"
+    if not isinstance(metadata.get("regions"), Mapping):
+        return "its metadata does not describe its regions"
 
     feature_columns, source_channels = _expected_feature_columns(sdata, triplets, feature_names)
     if not np.array_equal(metadata.get("feature_columns"), feature_columns):

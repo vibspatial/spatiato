@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 import zarr
 from anndata.abc import CSRDataset
+from harpy.table._metadata import _FEATURE_MATRIX_SCHEMA_VERSION
 from scipy import sparse
 from spatialdata import SpatialData
 from spatialdata.models import TableModel
@@ -67,11 +68,20 @@ def test_register_feature_matrix_metadata_registers_one_dimensional_matrix() -> 
     assert metadata["feature_columns"] == ["scores_0"]
     assert metadata["features"] == [CUSTOM_OBSM_FEATURE_NAME]
     assert metadata["source_kind"] == CUSTOM_OBSM_SOURCE_KIND
-    assert metadata["schema_version"] == 1
-    assert metadata["backend"] == "numpy"
-    assert metadata["dtype"] == "float32"
+    assert metadata["schema_version"] == _FEATURE_MATRIX_SCHEMA_VERSION
+    assert set(metadata) == {"feature_columns", "schema_version", "features", "source_kind"}
     assert table.uns[_FEATURE_MATRICES_KEY]["scores"] == metadata
     assert normalize_feature_columns(metadata) == ("scores_0",)
+
+
+def test_registered_custom_matrix_passes_harpy_table_validation(sdata_blobs: SpatialData) -> None:
+    table = sdata_blobs["table"]
+    table.obsm["custom"] = np.zeros((table.n_obs, 2))
+    register_feature_matrix_metadata(table, "custom")
+
+    # `hp.tb.add_canonical_centers` runs this validation first, so a record
+    # harpy rejects would also block canonical centers for the table.
+    hp.tb.validate_table(sdata_blobs, "table")
 
 
 def test_register_feature_matrix_metadata_registers_dense_matrix_with_default_columns() -> None:
@@ -86,7 +96,7 @@ def test_register_feature_matrix_metadata_registers_dense_matrix_with_default_co
     assert set(metadata).isdisjoint({"source_image", "source_channels", "source_label", "coordinate_system"})
 
 
-def test_register_feature_matrix_metadata_registers_sparse_matrix_backend_and_dtype() -> None:
+def test_register_feature_matrix_metadata_registers_sparse_matrix() -> None:
     table = _make_table()
     table.obsm["sparse_features"] = sparse.csr_matrix(
         np.arange(6, dtype=np.float32).reshape(3, 2),
@@ -95,8 +105,6 @@ def test_register_feature_matrix_metadata_registers_sparse_matrix_backend_and_dt
     metadata = register_feature_matrix_metadata(table, "sparse_features")
 
     assert metadata["feature_columns"] == ["sparse_features_0", "sparse_features_1"]
-    assert metadata["backend"] == "sparse"
-    assert metadata["dtype"] == "float32"
 
 
 def test_register_feature_matrix_metadata_preserves_supplied_columns_and_features() -> None:
@@ -262,12 +270,8 @@ def _unreadable_dask_matrix(shape: tuple[int, int], meta: object) -> da.Array:
     return da.map_blocks(fail_to_read, chunks=((shape[0],), (shape[1],)), dtype=np.float64, meta=meta)
 
 
-@pytest.mark.parametrize(
-    ("meta", "backend"),
-    [(np.empty((0, 0)), "numpy"), (sparse.csr_matrix((0, 0)), "sparse")],
-    ids=["dense", "sparse"],
-)
-def test_feature_matrix_metadata_reads_only_shape_and_dtype_of_a_lazy_matrix(meta: object, backend: str) -> None:
+@pytest.mark.parametrize("meta", [np.empty((0, 0)), sparse.csr_matrix((0, 0))], ids=["dense", "sparse"])
+def test_feature_matrix_metadata_reads_only_shape_and_dtype_of_a_lazy_matrix(meta: object) -> None:
     matrix = _unreadable_dask_matrix((3, 4), meta)
     # Test setup: reading the values fails.
     with pytest.raises(AssertionError, match="values were read"):
@@ -280,8 +284,7 @@ def test_feature_matrix_metadata_reads_only_shape_and_dtype_of_a_lazy_matrix(met
 
     assert unregistered.status == "unregistered"
     assert unregistered.n_features == 4
-    assert metadata["backend"] == backend
-    assert metadata["dtype"] == "float64"
+    assert metadata["feature_columns"] == ["lazy_0", "lazy_1", "lazy_2", "lazy_3"]
     assert registered.status == "registered_valid"
     assert registered.n_features == 4
 

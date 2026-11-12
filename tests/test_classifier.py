@@ -185,14 +185,10 @@ def _set_feature_metadata(
     table = sdata[table_name]
     table.uns.setdefault(_FEATURE_MATRICES_KEY, {})[feature_key] = {
         "feature_columns": list(feature_columns),
-        "schema_version": 1,
-        "backend": "numpy",
-        "dtype": str(np.asarray(table.obsm[feature_key]).dtype),
-        "source_label": "blobs_labels",
-        "source_image": None,
-        "coordinate_system": "global",
+        "schema_version": 2,
         "features": list(features),
         "source_kind": HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
+        "regions": {"blobs_labels": {"image_element": None, "coordinate_system": "global"}},
     }
 
 

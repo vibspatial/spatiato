@@ -87,7 +87,7 @@ def test_canonical_centers_status_reports_a_matrix_without_metadata_as_invalid(s
 
     assert status.state == "invalid"
     assert status.reason is not None
-    assert "metadata" in status.reason
+    assert "canonical centers need both" in status.reason
 
 
 def test_compute_canonical_centers_rebuilds_a_record_without_its_matrix(sdata_blobs: SpatialData) -> None:

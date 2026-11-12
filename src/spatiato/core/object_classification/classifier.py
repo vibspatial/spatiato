@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import dask.array as da
 import numpy as np
 import pandas as pd
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
+from harpy.table._metadata import _FEATURE_MATRICES_KEY
 from numpy.typing import NDArray
 
 from spatiato.core.class_palette import (

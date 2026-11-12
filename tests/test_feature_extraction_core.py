@@ -8,8 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from harpy.table._add_feature_matrix import _SOURCE_KIND
-from harpy.table._metadata import _FEATURE_MATRIX_SCHEMA_VERSION
+from harpy.table._metadata import _ADD_FEATURE_MATRIX_SOURCE_KIND
 from loguru import logger
 from spatialdata import SpatialData
 
@@ -22,7 +21,6 @@ from spatiato.core.feature_extraction import (
     check_existing_feature_matrix,
 )
 from spatiato.core.feature_matrix_metadata import (
-    FEATURE_MATRIX_METADATA_SCHEMA_VERSION,
     HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
     register_feature_matrix_metadata,
 )
@@ -88,9 +86,8 @@ def _rows(sdata: SpatialData, region: str) -> np.ndarray:
     return np.asarray(table.obsm[_KEY])[mask]
 
 
-def test_metadata_constants_match_harpy() -> None:
-    assert HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND == _SOURCE_KIND
-    assert FEATURE_MATRIX_METADATA_SCHEMA_VERSION == _FEATURE_MATRIX_SCHEMA_VERSION
+def test_source_kind_matches_harpy() -> None:
+    assert HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND == _ADD_FEATURE_MATRIX_SOURCE_KIND
 
 
 @pytest.mark.parametrize(
@@ -185,6 +182,37 @@ def test_check_existing_feature_matrix_compares_features_and_channels(sdata_blob
     changed_channels = _check(sdata_blobs_multi_region, "blobs_labels", feature_names=("area", "mean"), channels=(1,))
     assert changed_channels.kind == "incompatible"
     assert changed_channels.reason == "it was calculated with different features or channels"
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"schema_version": 1}, "its metadata has an unsupported schema version"),
+        ({"regions": None}, "its metadata does not describe its regions"),
+    ],
+    ids=["schema_version", "regions"],
+)
+def test_check_existing_feature_matrix_rejects_metadata_harpy_rejects(
+    sdata_blobs_multi_region: SpatialData, changes: dict[str, object], reason: str
+) -> None:
+    _calculate(sdata_blobs_multi_region, "blobs_labels_2")
+    sdata_blobs_multi_region[_TABLE].uns["feature_matrices"][_KEY].update(changes)
+
+    existing = _check(sdata_blobs_multi_region, "blobs_labels")
+
+    assert existing.kind == "incompatible"
+    assert existing.reason == reason
+    with pytest.raises(ValueError, match="must have a compatible schema"):
+        hp.tb.add_feature_matrix(
+            sdata_blobs_multi_region,
+            labels_name="blobs_labels",
+            image_name=None,
+            table_name=_TABLE,
+            feature_key=_KEY,
+            features=["area"],
+            overwrite_feature_key=True,
+            to_coordinate_system="global",
+        )
 
 
 def test_check_existing_feature_matrix_treats_metadata_without_matrix_as_none(
