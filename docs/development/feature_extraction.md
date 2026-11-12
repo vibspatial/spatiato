@@ -136,7 +136,8 @@ Reasons for an incompatible entry, in the order they are checked:
 | it has no harpy feature metadata                         | no metadata record for the key                                          |
 | it is registered as a custom matrix                      | `source_kind` is Spatiato's custom `obsm` kind                          |
 | its metadata does not come from harpy feature extraction | any other `source_kind`                                                 |
-| its metadata has an unsupported schema version           | `schema_version` differs                                                |
+| its metadata has an unsupported schema version           | `schema_version` differs from harpy's                                   |
+| its metadata does not describe its regions               | `regions` is missing or not a mapping                                   |
 | it was calculated with different features or channels    | `feature_columns` differ from the request                               |
 | it was calculated from different channels                | `source_channels` differ from the request                               |
 | it is not a dense matrix                                 | sparse, DataFrame or another type                                       |
