@@ -43,7 +43,7 @@ classifiers = [
 dependencies = [
     "dask[dataframe]",
     "filelock>=3.20.1",
-    "harpy-analysis>=0.5.3",
+    "harpy-analysis>=0.5.4",
     "spatialdata>=0.8.0",
     "joblib",
     "lazy-loader>=0.4",
@@ -97,6 +97,14 @@ Paper = "https://doi.org/10.1093/bioinformatics/btag122"
 SaeysLab = "https://saeyslab.sites.vib.be/en"
 VIBSpatialCatalyst = "https://vib.be/en/technologies/technology-portfolio/spatial-catalyst"
 
+
+[tool.uv]
+# harpy-analysis>=0.5.4 requires numba>=0.64.0, and numba ships no macOS x86_64
+# wheels from 0.63.0 on, so Intel Macs cannot be resolved.
+environments = [
+    "sys_platform != 'darwin'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 
 [tool.coverage.run]
 source = ["spatiato"]
