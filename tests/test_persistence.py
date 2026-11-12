@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
+from harpy.table._metadata import _FEATURE_MATRICES_KEY
 from spatialdata import SpatialData, read_zarr
 from spatialdata.models import TableModel
 

@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
+from harpy.table._metadata import _FEATURE_MATRICES_KEY
 from matplotlib.colors import to_rgba
 from napari.layers import Image, Labels
 from napari.utils.colormaps import DirectLabelColormap
@@ -250,14 +250,10 @@ def _set_feature_metadata(
     n_features = int(table.obsm[feature_key].shape[1])
     table.uns.setdefault("feature_matrices", {})[feature_key] = {
         "feature_columns": [f"feature_{index}" for index in range(n_features)],
-        "schema_version": 1,
-        "backend": "numpy",
-        "dtype": str(np.asarray(table.obsm[feature_key]).dtype),
-        "source_label": "blobs_labels",
-        "source_image": None,
-        "coordinate_system": "global",
+        "schema_version": 2,
         "features": [f"feature_{index}" for index in range(n_features)],
         "source_kind": HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
+        "regions": {"blobs_labels": {"image_element": None, "coordinate_system": "global"}},
     }
 
 

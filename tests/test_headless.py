@@ -58,14 +58,10 @@ def _set_feature_metadata(
     table = sdata[table_name]
     metadata = {
         "feature_columns": list(feature_columns),
-        "schema_version": 1,
-        "backend": "numpy",
-        "dtype": str(np.asarray(table.obsm[feature_key]).dtype),
-        "source_label": "blobs_labels",
-        "source_image": source_image,
-        "coordinate_system": "global",
+        "schema_version": 2,
         "features": list(features),
         "source_kind": HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
+        "regions": {"blobs_labels": {"image_element": source_image, "coordinate_system": "global"}},
     }
     if source_channels is not _MISSING:
         metadata["source_channels"] = source_channels
@@ -137,15 +133,11 @@ def _make_area_classifier_bundle() -> ClassifierExportBundle:
         },
         source_feature_metadata={
             "feature_columns": ["area"],
-            "schema_version": 1,
-            "backend": "numpy",
-            "dtype": "float64",
-            "source_label": "source_labels",
-            "source_image": None,
+            "schema_version": 2,
             "source_channels": None,
-            "coordinate_system": "global",
             "features": ["area"],
             "source_kind": HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
+            "regions": {"source_labels": {"image_element": None, "coordinate_system": "global"}},
         },
     )
 
@@ -325,8 +317,7 @@ def test_compute_features_for_classifier_uses_target_mapping(sdata_blobs: Spatia
     assert "computed_area" in sdata_blobs["table"].obsm
     metadata = sdata_blobs["table"].uns[_FEATURE_MATRICES_KEY]["computed_area"]
     assert list(metadata["feature_columns"]) == ["area"]
-    assert list(metadata["source_label"]) == ["blobs_labels"]
-    assert list(metadata["source_image"]) == [None]
+    assert metadata["regions"] == {"blobs_labels": {"image_element": None, "coordinate_system": "global"}}
     assert metadata["source_channels"] is None
 
 
