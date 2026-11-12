@@ -5,10 +5,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import pandas as pd
+from harpy.table._metadata import _FEATURE_MATRICES_KEY, _FEATURE_MATRIX_SCHEMA_VERSION
 from harpy.table.canonical_centers import CANONICAL_OBSM_KEY
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
-
-from spatiato.core.table_matrix import is_sparse_matrix
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -17,7 +15,6 @@ if TYPE_CHECKING:
 CUSTOM_OBSM_FEATURE_NAME = "custom_obsm"
 CUSTOM_OBSM_SOURCE_KIND = "custom_obsm"
 HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND = "harpy_add_feature_matrix"
-FEATURE_MATRIX_METADATA_SCHEMA_VERSION = 1
 FeatureMatrixSourceKind = Literal["harpy_add_feature_matrix", "custom_obsm"]
 FEATURE_MATRIX_SOURCE_KINDS: tuple[FeatureMatrixSourceKind, ...] = (
     HARPY_ADD_FEATURE_MATRIX_SOURCE_KIND,
@@ -282,15 +279,12 @@ def register_feature_matrix_metadata(
             f"`.uns[{_FEATURE_MATRICES_KEY!r}][{resolved_feature_key!r}]`. Pass `overwrite=True` to replace it."
         )
 
+    # `hp.tb.validate_table` requires harpy's schema version in every record of
+    # the registry, whatever wrote it. The record has no `regions`: Spatiato
+    # does not know which elements a custom matrix was calculated from.
     metadata: dict[str, object] = {
         "feature_columns": list(resolved_feature_columns),
-        "schema_version": FEATURE_MATRIX_METADATA_SCHEMA_VERSION,
-        # The layout, not where the values live: any dense matrix, also a lazy
-        # or backed one, is "numpy", as harpy records its dense feature
-        # matrices. Nothing in Spatiato reads this field.
-        "backend": "sparse" if is_sparse_matrix(raw_feature_matrix) else "numpy",
-        # `feature_matrix_n_features(...)` above guarantees a dtype.
-        "dtype": str(raw_feature_matrix.dtype),
+        "schema_version": _FEATURE_MATRIX_SCHEMA_VERSION,
         "features": list(resolved_features),
         "source_kind": CUSTOM_OBSM_SOURCE_KIND,
     }

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
-from harpy.utils._keys import _FEATURE_MATRICES_KEY
+from harpy.table._metadata import _FEATURE_MATRICES_KEY
 
 from spatiato._app_state import TableBusyMark, TableBusyMarker, TableDirtySnapshot, format_table_busy_message
 from spatiato.core.feature_extraction import (
