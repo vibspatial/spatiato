@@ -118,7 +118,19 @@ Loading keeps today's semantics: `ensure_labels_loaded(...)` / `ensure_shapes_lo
    shapes_layers_changed = Signal()
    ```
 
-   Emit them at the same points as `image_layers_changed`: `_handle_registered_binding(...)`, `_on_viewer_layer_removed(...)`, `_on_viewer_layers_reordered(...)` and `_remove_layer_from_viewer_and_registry(...)`. Like `image_layers_changed`, they carry no payload; consumers re-query the registry. The existing `primary_labels_layers_changed` and `primary_shapes_layer_registered` stay as they are for their current consumers.
+   Emit them at the same five points as `image_layers_changed`:
+
+   - `_handle_registered_binding(...)`, after a binding is registered for a layer already in the viewer;
+   - `_on_viewer_layer_inserted(...)`, for a layer registered before it is added to the viewer;
+   - `_on_viewer_layer_removed(...)`, decided before the binding is unregistered, as `had_usable_image_semantics` is today;
+   - `_on_viewer_layers_reordered(...)`, when any labels or shapes binding is live;
+   - `_remove_layer_from_viewer_and_registry(...)`, in its fallback for viewers that do not emit napari's removal event.
+
+   Every `LabelsLayerBinding` counts for `labels_layers_changed`, and every `ShapesLayerBinding` counts for `shapes_layers_changed`, whatever their role. Unlike `_is_usable_image_binding(...)`, no SpatialData object or coordinate system is required: consumers filter on both when they re-query, so an extra emission costs nothing. The existing `_is_labels_binding(...)` and `_is_shapes_binding(...)` helpers express this.
+
+   `sync_primary_shapes_layer_binding(...)` also emits `shapes_layers_changed`. It replaces the binding object of a live primary shapes layer, and the Annotation widget calls it after writes. Card rows hold binding objects and are kept only while the binding object is unchanged, so they must be told to re-read. It still does not emit `primary_shapes_layer_registered`: that is the registration event the Annotation widget reacts to, and avoiding it is why the method exists. `shapes_layers_changed` only asks consumers to re-query.
+
+   Like `image_layers_changed`, the new signals carry no payload; consumers re-query the registry. The existing `primary_labels_layers_changed` and `primary_shapes_layer_registered` stay as they are for their current consumers.
 
 2. **Remove one styled layer.**
 
@@ -134,7 +146,10 @@ Loading keeps today's semantics: `ensure_labels_loaded(...)` / `ensure_shapes_lo
 
    They follow `remove_image_overlay_channel(...)`: return `None` when nothing matches, raise `ValueError` when more than one live layer matches.
 
-3. **Matching key for a styled source.** See "Matching a loaded source" below. `get_loaded_styled_labels_layer(...)` and `get_loaded_styled_shapes_layer(...)` should match on that key instead of full spec equality.
+3. **Matching key for a styled source.** See "Matching a loaded source" below. Every lookup by spec compares `style_spec.layer_key` instead of full spec equality:
+
+   - `get_loaded_styled_labels_layer(...)` and `get_loaded_styled_shapes_layer(...)`, through `_matches_labels_binding(...)` and `_matches_shapes_binding(...)`;
+   - `LayerBindingRegistry.find_bindings(style_spec=...)`. No caller passes `style_spec` today (the Histogram widget filters image bindings only), so this keeps one rule at no cost.
 
 ### Shared layer row
 
@@ -230,12 +245,14 @@ The card (to filter the completer and find rows) and the adapter (to find an exi
 - `TableColorSourceSpec.identity` leaves out `var_layer`, but `vars (X): CD3` and `vars (counts): CD3` are separate layers that can both be loaded.
 - Full dataclass equality includes `value_kind`. If a table update changes how a column is classified, for example from continuous to categorical, the new spec no longer equals the loaded one, and loading it creates a second layer for the same column.
 
-Proposed key:
+The key is a new `layer_key` property on both spec classes in `src/spatiato/core/_color_source.py`:
 
-- `TableColorSourceSpec`: `(table_name, source_kind, value_key, var_layer)`;
-- `ShapeColumnColorSourceSpec`: `(source_kind, value_key)`.
+- `TableColorSourceSpec.layer_key`: `(table_name, source_kind, value_key, var_layer)`;
+- `ShapeColumnColorSourceSpec.layer_key`: `(source_kind, value_key)`.
 
-A source whose `value_kind` changed then restyles the existing layer. The binding's `style_spec` is replaced with the new spec when that happens.
+It lives on the spec classes, not in the adapter, because the card needs the same key in phase 3. It is a new property, not a change to `identity`: `identity` leaves out `var_layer` on purpose, so that a selected var stays selected when the user switches matrix, and it keeps that role. The two keys cannot collide, because a shapes-column key has a different `source_kind` and length.
+
+A source whose `value_kind` changed then restyles the existing layer, and the binding's `style_spec` is replaced with the new spec. Build the new binding with `dataclasses.replace(binding, style_spec=new_spec)`, which keeps every other field. For shapes these include `source_row_id_by_rendered_row`, `source_shapes_index_feature_name` and `skipped_geometry_count`, which registering again through `register_shapes_layer(...)` would otherwise need passed again. Store it through a path that also calls `_handle_registered_binding(...)`, so the replacement emits `labels_layers_changed` / `shapes_layers_changed`. The registry stores one binding per layer object, so the new binding replaces the old one.
 
 ### Shapes Fill
 
@@ -269,20 +286,22 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
   - the image card keeps its Stack row in a container separate from the overlay list in the same way;
   - other widgets restyle (Object Classification, Spatial Query) or edit (Annotation) the primary layer, so it is a different kind of layer from the colored ones;
   - the list's scroll area could scroll it out of view.
+- **Primary shapes binding sync**: `sync_primary_shapes_layer_binding(...)` emits `shapes_layers_changed`, so cards re-read the replaced binding object. It still does not emit `primary_shapes_layer_registered`. See "Adapter changes".
+- **Matching key**: styled layers are matched on a new `layer_key` property of the spec classes in `src/spatiato/core/_color_source.py`, shared by the adapter and the cards. `identity` keeps its role of preserving a selection across matrix switches. See "Matching a loaded source".
 
 ## Implementation Phases
 
 Labels go before shapes:
 
 - labels have one source type (`TableColorSourceSpec`), no Fill and no shapes-column sources;
-- the primary labels layer has a simpler lifecycle. The Annotation widget also removes and re-adds the primary shapes layer (`normalize_native_shapes_layer_for_annotation(...)`), swaps it (`replace_primary_shapes_layer(...)`) and replaces its binding object without a signal (`sync_primary_shapes_layer_binding(...)`). Those reconcile edge cases are easier to handle once the pattern works for labels;
+- the primary labels layer has a simpler lifecycle. The Annotation widget also removes and re-adds the primary shapes layer (`normalize_native_shapes_layer_for_annotation(...)`), swaps it (`replace_primary_shapes_layer(...)`) and replaces its binding object (`sync_primary_shapes_layer_binding(...)`, which today emits no signal and after phase 1 emits only `shapes_layers_changed`). Those reconcile edge cases are easier to handle once the pattern works for labels;
 - styled labels layers load cheaply, so the flow is quick to try by hand; polygon shapes can take seconds per layer;
 - the main table-refresh case, Object Classification annotating `user_class`, is a labels case;
 - labels have fewer existing Add / Update tests to rewrite (about 10, against about 16 for shapes).
 
 Phases 1 and 2 still cover the parts shapes need, so the shared design is tested before the labels card depends on it.
 
-1. **Adapter, for labels and shapes together**: the `labels_layers_changed` / `shapes_layers_changed` signals, `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`, and the styled-source matching key for both `TableColorSourceSpec` and `ShapeColumnColorSourceSpec`. Both element types are handled in the same adapter functions (`_handle_registered_binding(...)`, `_on_viewer_layer_removed(...)`, `_on_viewer_layers_reordered(...)`, `_remove_layer_from_viewer_and_registry(...)`), so splitting the work would edit them twice.
+1. **Adapter, for labels and shapes together**: the `layer_key` property on both spec classes in `src/spatiato/core/_color_source.py`; the `labels_layers_changed` / `shapes_layers_changed` signals, including the emission from `sync_primary_shapes_layer_binding(...)`; `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`; key-based matching in the styled-layer lookups and `find_bindings(...)`; and the binding replacement when `value_kind` changes. Both element types are handled in the same adapter functions (`_handle_registered_binding(...)`, `_on_viewer_layer_inserted(...)`, `_on_viewer_layer_removed(...)`, `_on_viewer_layers_reordered(...)`, `_remove_layer_from_viewer_and_registry(...)`), so splitting the work would edit them twice.
 2. **Shared row**: add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it. Build and test the extra-control slot here, with a placeholder widget, although only shapes rows use it, so the row API does not change in phase 5.
 3. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh. Build the loaded list as a reusable widget so the shapes card can use it in phase 5.
 4. **Table refresh**: scoped restyle on `table_state_changed`, and stale-source warnings.
@@ -292,11 +311,20 @@ Release phases 3 to 5 together. Between them, the labels card loads immediately 
 
 ## Tests
 
+Color source specs (`tests/test_color_source.py`):
+
+- `layer_key` includes `var_layer` and leaves out `value_kind`, for `TableColorSourceSpec`;
+- `layer_key` of `ShapeColumnColorSourceSpec` is `(source_kind, value_key)`;
+- `identity` is unchanged.
+
 Adapter (`tests/test_viewer_adapter.py`):
 
-- `labels_layers_changed` / `shapes_layers_changed` fire on register, on napari removal, on reorder and on `_remove_layer_from_viewer_and_registry(...)`, for primary and styled layers;
+- `labels_layers_changed` / `shapes_layers_changed` fire on register, on insertion of an already registered layer, on napari removal, on reorder and on `_remove_layer_from_viewer_and_registry(...)`, for primary and styled layers;
+- they fire for bindings registered without a coordinate system;
+- `sync_primary_shapes_layer_binding(...)` emits `shapes_layers_changed` but not `primary_shapes_layer_registered`;
 - `remove_styled_*_layer(...)` removes only the matching variant and leaves siblings and the primary layer alone;
-- a spec that differs only in `value_kind` resolves to the existing styled layer;
+- a spec that differs only in `value_kind` resolves to the existing styled layer, the binding then carries the new spec, keeps its other fields (for shapes, the rendered-row mapping), and the replacement emits the membership signal;
+- `find_bindings(style_spec=...)` matches on `layer_key`;
 - `X` and a layer for the same var stay separate layers.
 
 Layer rows:
