@@ -141,7 +141,8 @@ class ColorValueClassification:
 def classify_color_values(values: pd.Series) -> ColorValueClassification | None: ...
 ```
 
-- **Rules.** Its rules are today's discovery rules, which already look at the values of `object` columns. It returns `None` where discovery does: for a column with no non-missing values, or with mixed value types.
+- **Rules.** Its rules are today's discovery rules, which already look at the values of `object` columns. It returns `None` where discovery does: for a column that is not pandas categorical and has no non-missing values, and for a column with mixed value types. A pandas categorical column is `"pandas_categorical"` even when all its values are missing, because discovery checks for it before it checks for missing values.
+- **Input: always the full column.** Callers pass the whole column, never only the rows being drawn: `table.obs[column]` for discovery and for both table coloring paths, and `shapes_element[column]` for discovery and for the shapes-column path. Every path does this today; labels coloring, for example, classifies `full_series`, not `region_series`. A subset can classify differently: the rows of one region may hold only the 0s of a 0/1 column, and only 0s classify as continuous.
 - **Discovery** uses `.value_kind`, and `None` still means the column is not offered.
 - **The three coloring paths** branch on `.encoding` instead of their own checks:
   - `"string"` keeps the default palette and `coercion_applied=True`;
@@ -158,7 +159,12 @@ What stays outside the classifier, because it is not about the values:
 - palette lookup: the table's stored palette for `obs` columns, a companion `_colors` column for shapes columns;
 - building colors: labels build a colormap and shapes build per-row RGBA colors; each keeps its own builder.
 
-**Behavior change.** Labels coloring of `object`-dtype boolean and 0/1 columns moves from continuous to categorical, matching discovery and shapes. The fallback in `_build_categorical_shape_style(...)` that treats other values as categories becomes unreachable and is removed. Start with tests that pin down today's results per column type, so this is the only difference.
+**Behavior changes.** Start with tests that pin down today's results per column type, so that these two are the only differences:
+
+- Labels coloring of `object`-dtype boolean and 0/1 columns moves from continuous to categorical, matching discovery and shapes.
+- A column that discovery would not offer now raises `ValueError` when it is colored, instead of being colored anyway. Today labels coloring falls through to continuous, which typically draws every object as missing, and the shapes-column path colors by the column's unique values through a fallback in `_build_categorical_shape_style(...)`. That fallback is removed. This happens when a layer loaded earlier is colored again after its column changed. The Viewer already catches the `ValueError` and shows an error card, and in the new flow the row warning.
+
+Spatial Query also colors the primary labels layer through `apply_table_color_source_to_labels_layer(...)`, but it only accepts pandas categorical columns, which classify the same before and after.
 
 ### Adapter changes (`src/spatiato/viewer/adapter.py`)
 
@@ -461,12 +467,14 @@ Release phases 4 to 7 together. Between them, the labels card loads immediately 
 Value classification (new `tests/test_color_value_classification.py`):
 
 - one case per encoding: a pandas categorical column, a boolean column, an `object` column of booleans with missing values, 0/1 integers with and without missing values, other integers, floats, and strings;
-- `None` for an all-missing column and for a column with mixed value types;
+- `None` for an all-missing non-categorical column and for a column with mixed value types, and `"pandas_categorical"` for an all-missing categorical column;
 - discovery (`tests/test_color_source_options.py`) offers the same sources with the same `value_kind` as before.
 
 Labels styling (`tests/test_labels_styling.py`):
 
 - an `object`-dtype boolean column with missing values, and an `object`-dtype 0/1 column, are colored as categorical (today: continuous);
+- a 0/1 column is colored as categorical on a labels element whose own rows hold only 0s, because the full column is classified;
+- a column that discovery would not offer, for example one holding only missing values, raises `ValueError` (today: colored as continuous);
 - every other column type is colored as before.
 
 Color source specs (`tests/test_color_source.py`):
