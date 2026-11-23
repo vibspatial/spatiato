@@ -83,13 +83,6 @@ def has_high_cardinality_string_values(values: Sequence[Any], *, row_count: int)
     return len({str(value) for value in values}) > string_categorical_warning_threshold(row_count)
 
 
-def is_string_like_series(values: pd.Series) -> bool:
-    non_null = values.dropna()
-    if non_null.empty:
-        return False
-    return all(_is_string_scalar(value) for value in non_null.tolist())
-
-
 def normalize_string_value(value: object) -> object:
     if pd.isna(value):
         return pd.NA
@@ -243,7 +236,3 @@ def zeros_mean_not_detected(values: pd.Series) -> bool:
     numeric_values = pd.to_numeric(values, errors="coerce").to_numpy(dtype="float64", copy=False)
     finite_values = numeric_values[np.isfinite(numeric_values)]
     return finite_values.size > 0 and bool(np.all(finite_values >= 0))
-
-
-def _is_string_scalar(value: object) -> bool:
-    return isinstance(value, (str, bytes, np.str_, np.bytes_))
