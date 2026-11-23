@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from spatiato.core._color_source import (
-    ShapeColumnColorSourceSpec,
-    TableColorSourceSpec,
-    TableColorValueKind,
-)
+from spatiato.core._color_source import ShapeColumnColorSourceSpec, TableColorSourceSpec
 from spatiato.core.color_value_classification import classify_color_values
 from spatiato.core.spatialdata import get_table, get_table_metadata
 
@@ -17,7 +13,12 @@ if TYPE_CHECKING:
 
 
 def get_table_obs_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
-    """Return colorable `obs` columns for one linked table."""
+    """Return colorable `obs` columns for one linked table.
+
+    The instance key column is always offered: it colors each instance with
+    its own color, whatever its values. Every other column is offered when
+    `classify_color_values(...)` can classify it.
+    """
     table = get_table(sdata, table_name)
     table_metadata = get_table_metadata(sdata, table_name)
     excluded_columns = {table_metadata.region_key}
@@ -26,22 +27,14 @@ def get_table_obs_color_source_options(sdata: SpatialData, table_name: str) -> l
     for column_name in table.obs.columns:
         if column_name in excluded_columns:
             continue
-
-        value_kind: TableColorValueKind
-        if column_name == table_metadata.instance_key:
-            value_kind = "instance"
-        else:
-            classification = classify_color_values(table.obs[column_name])
-            if classification is None:
-                continue
-            value_kind = classification.value_kind
+        if column_name != table_metadata.instance_key and classify_color_values(table.obs[column_name]) is None:
+            continue
 
         options.append(
             TableColorSourceSpec(
                 table_name=table_name,
                 source_kind="obs_column",
                 value_key=str(column_name),
-                value_kind=value_kind,
             )
         )
 
@@ -77,15 +70,13 @@ def get_shape_column_color_source_options(sdata: SpatialData, shapes_name: str) 
         if column_name == geometry_column_name or _is_shape_color_helper_column(column_key):
             continue
 
-        classification = classify_color_values(shapes[column_name])
-        if classification is None:
+        if classify_color_values(shapes[column_name]) is None:
             continue
 
         options.append(
             ShapeColumnColorSourceSpec(
                 source_kind="shape_column",
                 value_key=column_key,
-                value_kind=classification.value_kind,
             )
         )
 

@@ -59,6 +59,12 @@ def format_var_matrix_label(layer: str | None) -> str:
 class TableColorSourceSpec:
     """Semantic description of one table-backed source used for viewer coloring.
 
+    A spec names the data the user picked, nothing more. Plain equality
+    therefore identifies a styled layer: two specs are equal exactly when
+    they name the same table, source kind, key and matrix. How the values are
+    colored is decided from the data each time a layer is colored, and is
+    reported in the style result.
+
     Parameters
     ----------
     table_name
@@ -69,10 +75,6 @@ class TableColorSourceSpec:
         `var_layer` names.
     value_key
         Name of the `obs` column, or of the var.
-    value_kind
-        How the values are colored: `"categorical"`, `"continuous"`, or
-        `"instance"` for the table's instance key column, where each instance
-        gets its own color.
     var_layer
         Matrix of a `"var"` source: `None` for `X`, as in anndata's
         `layers[None]`, otherwise a key of `layers`. Every matrix of a table
@@ -84,12 +86,10 @@ class TableColorSourceSpec:
     table_name: str
     source_kind: TableColorSourceKind
     value_key: str
-    value_kind: TableColorValueKind
     var_layer: str | None = None
 
     def __post_init__(self) -> None:
         validate_table_color_source_kind(self.source_kind)
-        validate_table_color_value_kind(self.value_kind)
         if self.var_layer is None:
             return
         if self.source_kind != "var":
@@ -128,6 +128,10 @@ class TableColorSourceSpec:
 class ShapeColumnColorSourceSpec:
     """Semantic description of one shapes column used for viewer coloring.
 
+    Like `TableColorSourceSpec`, the spec names the column and nothing more,
+    so plain equality identifies a styled layer. How the column is colored is
+    decided from its values each time a layer is colored.
+
     The spec does not name the shapes element; callers pass its name next to
     the spec.
 
@@ -138,17 +142,13 @@ class ShapeColumnColorSourceSpec:
         shapes GeoDataFrame itself rather than of a linked table.
     value_key
         Name of the column.
-    value_kind
-        How the values are colored: `"categorical"` or `"continuous"`.
     """
 
     source_kind: ShapeColorSourceKind
     value_key: str
-    value_kind: ShapeColorValueKind
 
     def __post_init__(self) -> None:
         validate_shape_color_source_kind(self.source_kind)
-        validate_shape_color_value_kind(self.value_kind)
 
     @property
     def identity(self) -> tuple[ShapeColorSourceKind, str]:
