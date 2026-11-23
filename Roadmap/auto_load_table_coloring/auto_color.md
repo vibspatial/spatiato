@@ -115,7 +115,7 @@ Loading keeps today's semantics: `ensure_labels_loaded(...)` / `ensure_shapes_lo
 
 ### Shared value classification (`src/spatiato/core/color_value_classification.py`)
 
-Today four places decide how a column's values are colored, each with its own rules:
+Phase 1 implemented this section. Before it, four places decided how a column's values were colored, each with its own rules:
 
 | Path | Function | Rule |
 |---|---|---|
@@ -124,9 +124,9 @@ Today four places decide how a column's values are colored, each with its own ru
 | Shapes colored from a table | `_build_table_obs_shape_style(...)` in `src/spatiato/viewer/shapes_styling.py` | the dtype or the values, through `_is_bool_series(...)` and `_is_exact_binary_integer_series(...)` |
 | Shapes colored from a shapes column | `apply_shape_column_color_source_to_shapes_layer(...)`, then `_build_categorical_shape_style(...)` | `value_kind` from the spec, then its own dtype checks, with a fallback that treats any other values as categories |
 
-They already disagree. A boolean column with missing values, or a 0/1 column with missing values, has `object` dtype in pandas. Discovery and both shapes paths classify it as categorical, but labels coloring falls through to continuous. The same `obs` column is therefore colored categorical on a shapes element and continuous on a labels element. The shapes-column path also colors with the kind stored on the spec, which can be stale (see "Shapes card").
+They disagreed. A boolean column with missing values, or a 0/1 column with missing values, has `object` dtype in pandas. Discovery and both shapes paths classified it as categorical, but labels coloring fell through to continuous. The same `obs` column was therefore colored categorical on a shapes element and continuous on a labels element. The shapes-column path also colored with the kind stored on the spec, which was out of date when the column changed after discovery.
 
-One classifier replaces the four. Coloring needs more than categorical or continuous: it needs to know which kind of categorical column it has, because that decides where the categories come from and whether a stored palette may be used. So the classifier returns an encoding:
+One classifier replaced the four. Coloring needs more than categorical or continuous: it needs to know which kind of categorical column it has, because that decides where the categories come from and whether a stored palette may be used. So the classifier returns an encoding:
 
 ```python
 ColorValueEncoding = Literal["pandas_categorical", "boolean", "binary_integer", "string", "continuous"]
@@ -141,16 +141,16 @@ class ColorValueClassification:
 def classify_color_values(values: pd.Series) -> ColorValueClassification | None: ...
 ```
 
-- **Rules.** Its rules are today's discovery rules, which already look at the values of `object` columns. It returns `None` where discovery does: for a column that is not pandas categorical and has no non-missing values, and for a column with mixed value types. A pandas categorical column is `"pandas_categorical"` even when all its values are missing, because discovery checks for it before it checks for missing values.
-- **Input: always the full column.** Callers pass the whole column, never only the rows being drawn: `table.obs[column]` for discovery and for both table coloring paths, and `shapes_element[column]` for discovery and for the shapes-column path. Every path does this today; labels coloring, for example, classifies `full_series`, not `region_series`. A subset can classify differently: the rows of one region may hold only the 0s of a 0/1 column, and only 0s classify as continuous.
-- **Discovery** uses `.value_kind`, and `None` still means the column is not offered.
+- **Rules.** Its rules are the discovery rules from before phase 1, which already looked at the values of `object` columns. It returns `None` where discovery does: for a column that is not pandas categorical and has no non-missing values, and for a column with mixed value types. A pandas categorical column is `"pandas_categorical"` even when all its values are missing, because discovery checks for it before it checks for missing values.
+- **Input: always the full column.** Callers pass the whole column, never only the rows being drawn: `table.obs[column]` for discovery and for both table coloring paths, and `shapes_element[column]` for discovery and for the shapes-column path. The paths already did this before phase 1; labels coloring, for example, classified `full_series`, not `region_series`. A subset can classify differently: the rows of one region may hold only the 0s of a 0/1 column, and only 0s classify as continuous.
+- **Discovery** uses the result to decide whether a column is offered: `None` means it is not. After phase 2 it no longer stores the kind on the spec (see "Matching a loaded source").
 - **The three coloring paths** branch on `.encoding` instead of their own checks:
   - `"string"` keeps the default palette and `coercion_applied=True`;
   - `"pandas_categorical"`, `"boolean"` and `"binary_integer"` may use a stored palette.
 
   When the result is `None`, the coloring path raises `ValueError`, which the Viewer turns into the "source no longer available" row warning.
-- **The shapes-column path stops reading `value_kind` from the spec.** For every source type, `value_kind` on a spec then records what discovery saw, and coloring always reads the data again.
-- **Helpers move to `core`.** `is_string_like_series(...)` lives in `src/spatiato/viewer/_styling.py` today, and `core` must not import from `viewer`. The viewer modules import the classifier from `core`, and `_is_bool_series(...)`, `_is_exact_binary_integer_series(...)` and the separate labels dtype checks are deleted.
+- **The shapes-column path no longer reads `value_kind` from the spec.** No coloring path reads a spec's `value_kind` to decide how to color, and coloring always reads the data again. Phase 2 removes the field from the specs (see "Matching a loaded source").
+- **The classifier lives in `core`.** `core` must not import from `viewer`, so the classifier has its own value checks, and `is_string_like_series(...)` in `src/spatiato/viewer/_styling.py` was deleted. The viewer modules import the classifier from `core`. `_is_bool_series(...)`, `_is_exact_binary_integer_series(...)`, the separate labels dtype checks and the discovery helpers in `src/spatiato/core/color_source_options.py` were deleted.
 
 What stays outside the classifier, because it is not about the values:
 
@@ -159,10 +159,10 @@ What stays outside the classifier, because it is not about the values:
 - palette lookup: the table's stored palette for `obs` columns, a companion `_colors` column for shapes columns;
 - building colors: labels build a colormap and shapes build per-row RGBA colors; each keeps its own builder.
 
-**Behavior changes.** Start with tests that pin down today's results per column type, so that these two are the only differences:
+**Behavior changes.** Tests pinned down the earlier results per column type before the change, so that these two are the only differences:
 
-- Labels coloring of `object`-dtype boolean and 0/1 columns moves from continuous to categorical, matching discovery and shapes.
-- A column that discovery would not offer now raises `ValueError` when it is colored, instead of being colored anyway. Today labels coloring falls through to continuous, which typically draws every object as missing, and the shapes-column path colors by the column's unique values through a fallback in `_build_categorical_shape_style(...)`. That fallback is removed. This happens when a layer loaded earlier is colored again after its column changed. The Viewer already catches the `ValueError` and shows an error card, and in the new flow the row warning.
+- Labels coloring of `object`-dtype boolean and 0/1 columns moved from continuous to categorical, matching discovery and shapes.
+- A column that discovery would not offer now raises `ValueError` when it is colored, instead of being colored anyway. Before, labels coloring fell through to continuous, which typically drew every object as missing, and the shapes-column path colored by the column's unique values through a fallback in `_build_categorical_shape_style(...)`. That fallback was removed. This happens when a layer loaded earlier is colored again after its column changed. The Viewer already catches the `ValueError` and shows an error card, and in the new flow the row warning.
 
 Spatial Query also colors the primary labels layer through `apply_table_color_source_to_labels_layer(...)`, but it only accepts pandas categorical columns, which classify the same before and after.
 
@@ -205,17 +205,29 @@ Spatial Query also colors the primary labels layer through `apply_table_color_so
 
    They follow `remove_image_overlay_channel(...)`: return `None` when nothing matches, raise `ValueError` when more than one live layer matches.
 
-3. **Matching key for a styled source.** See "Matching a loaded source" below. Every lookup by spec compares `style_spec.layer_key` instead of full spec equality:
-
-   - `get_loaded_styled_labels_layer(...)` and `get_loaded_styled_shapes_layer(...)`, through `_matches_labels_binding(...)` and `_matches_shapes_binding(...)`;
-   - `LayerBindingRegistry.find_bindings(style_spec=...)`. No caller passes `style_spec` today (the Histogram widget filters image bindings only), so this keeps one rule at no cost.
+3. **Specs without `value_kind`.** See "Matching a loaded source" below. Remove `value_kind` from `TableColorSourceSpec` and `ShapeColumnColorSourceSpec`, from the specs that discovery, the var sources and Spatial Query build, and from the `"instance"` checks in the coloring code. The lookups by spec then need no change: `_matches_labels_binding(...)`, `_matches_shapes_binding(...)` and `LayerBindingRegistry.find_bindings(style_spec=...)` keep comparing whole specs, which now compares exactly the fields that name the data.
 
 4. **Fill on the shapes binding.** Add `fill: bool = False` to `ShapesLayerBinding`, so the Fill state of a styled shapes layer is read from live state rather than kept by the card (see "Shapes Fill"):
 
    - `ShapesLayerBinding.__post_init__(...)` rejects `fill=True` unless the binding is styled and rendered as `Shapes` (`shapes_rendering_mode == "shapes"`);
    - `LayerBindingRegistry.register_shapes_layer(...)` and `ViewerAdapter.register_shapes_layer(...)` accept `fill`;
    - `ensure_styled_shapes_loaded(..., fill=...)` records `fill` on the binding of a layer rendered as `Shapes`. For a point-radius layer rendered as `Points` it records `False`, since fill has no effect there. Today's card passes its Fill checkbox for point-radius shapes too, so normalizing instead of raising keeps today's flow working;
-   - when an existing styled layer is restyled with a different `fill` or a different `style_spec`, its binding is replaced through the same path as a `value_kind` change (see "Matching a loaded source"). When neither differs, the binding is left as it is, so a plain restyle emits no membership signal and the card keeps its rows.
+   - when an existing styled layer is restyled with a different `fill`, its binding is replaced. Build the new binding with `dataclasses.replace(binding, fill=fill)`, which keeps every other field, including `source_row_id_by_rendered_row`, `source_shapes_index_feature_name` and `skipped_geometry_count`, which registering again through `register_shapes_layer(...)` would otherwise need passed again. Store it through a path that also calls `_handle_registered_binding(...)`, so the replacement emits `shapes_layers_changed`. The registry stores one binding per layer object, so the new binding replaces the old one. When `fill` is unchanged, the binding is left as it is, so a plain restyle emits no membership signal and the card keeps its rows.
+
+5. **A failed first load leaves no layer.** Today `ensure_styled_labels_loaded(...)` and `ensure_styled_shapes_loaded(...)` add a new layer to the viewer and register it before they color it. Coloring can raise `ValueError`: when the table, column or var is gone, and since phase 1 when a column can no longer color a layer. The new layer then stays in the viewer, registered as a styled layer but never colored, and the Viewer only shows an error card. In the new flow, registering would give that layer a row in the loaded list, for a source that never loaded.
+
+   The rule:
+
+   - a layer the call creates is colored before it is added to the viewer and registered: build, color, add, register. A coloring failure then leaves nothing behind. Coloring uses only the layer and the SpatialData object, never the viewer or the binding registry:
+     - labels coloring reads the table and sets the layer's colormap and features;
+     - shapes coloring also needs `source_row_id_by_rendered_row` and `source_shapes_index_feature_name`. Today it reads them from the binding, which does not exist before registration. They are the same values that `_build_shapes_layer(...)` returns in `_BuiltShapesLayer` and that registration copies into the binding, so a newly built layer takes them from `_BuiltShapesLayer`. A restyle of an existing layer still reads them from its binding.
+
+     This relies on napari keeping a layer's colormap, colors and features when the layer is added to the viewer; an adapter test checks it (see "Tests");
+   - when registering fails, the new layer is removed with `_remove_layer_after_failed_registration(...)` and the error is raised again. The shapes path already does this, because the Annotation widget would otherwise adopt the unregistered `Shapes` layer as a new annotation layer. The labels path gets it too: nothing reacts to an unregistered `Labels` layer today, but the two paths stay the same;
+   - neither failure emits `labels_layers_changed` or `shapes_layers_changed`: the layer is never registered, and removing an unregistered layer emits nothing. The card never shows a row for it;
+   - an existing layer whose restyle fails stays as it is, registered and with its last colors, and its row gets the warning (see "Refresh after table changes" and "Decisions"). Only a layer the call created is removed.
+
+   `rebuild_styled_shapes_layer(...)` in phase 7 follows the same order (see "Shapes geometry writes").
 
 ### Shared layer row
 
@@ -268,10 +280,12 @@ It follows `set_loaded_image_bindings(...)`: validate the whole snapshot first, 
 
 The loaded list (count label, "Remove all", scroll area capped at 10 rows, empty state, and the reconcile of styled rows) is built as a widget of its own, so the shapes card reuses it. The two cards already duplicate their color-source control logic; the loaded list should not be duplicated as well.
 
-The loaded list also holds the "source no longer available" warnings, as a mapping from `layer_key` to message, and applies them every time it reconciles its styled rows. They are not stored on the rows: a row is rebuilt whenever its binding object changes, for example on a `value_kind` or Fill replacement, and a flag on the row would be lost. `ViewerWidget` sets and clears a warning through the card:
+The loaded list also holds the "source no longer available" warnings, as a mapping from spec to message, and applies them every time it reconciles its styled rows. They are not stored on the rows: a row is rebuilt whenever its binding object changes, for example on a Fill replacement or a geometry rebuild, and a flag on the row would be lost. `ViewerWidget` sets and clears a warning through the card:
 
 ```python
-def set_styled_source_warning(self, layer_key: tuple[object, ...], message: str | None) -> None: ...
+def set_styled_source_warning(
+    self, style_spec: TableColorSourceSpec | ShapeColumnColorSourceSpec, message: str | None
+) -> None: ...
 ```
 
 A warning is cleared after a successful restyle of its source, and dropped when its layer is no longer live at reconcile time or when the card is rebuilt, for example on a coordinate-system change.
@@ -292,7 +306,7 @@ Same structure as the labels card, and it reuses the labels card's loaded-list w
 - sources can also be `ShapeColumnColorSourceSpec`;
 - a styled row has a **Fill** checkbox only when its layer is rendered as `Shapes` (see "Shapes Fill").
 
-**Shapes-column sources are classified from the current column when they are colored**, through the shared classifier (see "Shared value classification"), not from `value_kind` on the spec. This matters for the shapes card: a shapes-column layer is restyled with its stored spec when its Fill is toggled or its geometry is rebuilt (see "Shapes geometry writes"), and the stored kind can be stale after the shapes element was saved or reloaded. A column that became strings but is stored as continuous would otherwise be colored entirely as missing values.
+**Shapes-column sources are classified from the current column when they are colored**, through the shared classifier (see "Shared value classification"). This matters for the shapes card: a shapes-column layer is restyled with its stored spec when its Fill is toggled or its geometry is rebuilt (see "Shapes geometry writes"), and the column's values may have changed since the source was listed, for example after the shapes element was saved or reloaded.
 
 The card no longer emits `ShapesLoadRequest`, and the type is deleted. As for labels, the builders take the shapes name and the spec directly: `build_primary_shapes_loaded_card_spec(shapes_name, result)` and `build_styled_shapes_card_spec(shapes_name, style_spec, result)`, where `style_spec` is a `ShapeColumnColorSourceSpec | TableColorSourceSpec`.
 
@@ -303,7 +317,7 @@ Mirror the image handlers:
 - `_get_live_labels_bindings(...)` / `_get_live_shapes_bindings(...)`: partition the live bindings of one element in the active `sdata` and coordinate system into the primary binding and the styled bindings, in viewer order. Raise `ValueError` for duplicates.
 - `_refresh_labels_card_membership(card)` / `_refresh_shapes_card_membership(card)`: call the reconcile method, or report a card-scoped membership error.
 - Connect `labels_layers_changed` / `shapes_layers_changed` to refresh every labels / shapes card. Refresh each card once when it is built in `_rebuild_labels_cards(...)` / `_rebuild_shapes_cards(...)`.
-- Add handlers: when the source is already live, reconcile and activate its layer. Otherwise call `ensure_styled_labels_loaded(...)` / `ensure_styled_shapes_loaded(...)`, activate the new layer and show the existing status card (`build_styled_labels_card_spec(...)` / `build_styled_shapes_card_spec(...)`).
+- Add handlers: when the source is already live, reconcile and activate its layer. Otherwise call `ensure_styled_labels_loaded(...)` / `ensure_styled_shapes_loaded(...)`, activate the new layer and show the existing status card (`build_styled_labels_card_spec(...)` / `build_styled_shapes_card_spec(...)`). When the load raises `ValueError`, show the error card as today. The adapter leaves no layer behind (see "Adapter changes", item 5), so no row appears and the source stays in the completer.
 - Add remove, remove-all and visibility handlers. They resolve the live binding before mutating, as `_remove_image_overlay_channel(...)` and `_change_image_overlay_channel_visibility(...)` do.
 - Add primary load, remove and visibility handlers, reusing `_add_or_update_primary_labels_layer(...)` / `_add_or_update_primary_shapes_layer(...)` for loading.
 
@@ -315,50 +329,51 @@ The rule, in `ViewerWidget._on_table_state_changed(...)`:
 
 - `change_kind` `"updated"` or `"created"`: restyle each loaded styled layer whose spec is an `obs_column` source of `event.table_name` whose column has a matching `TableComponentPath("obs", (column,))` in `event.paths`. Var sources are not restyled for these events: `TableComponentPath` only covers `obs`, `obsm` and `uns`, so the app never reports `X` or `layers` changes this way.
 - `change_kind` `"rebuilt"` or `"reloaded"`: restyle every loaded styled layer that reads `event.table_name`.
-- `change_kind` `"removed"`, a restyle that raises `ValueError` because the table or column is gone, or a source with no fresh counterpart (see below): keep the layer as it is and show a warning on its row ("source no longer available") through `set_styled_source_warning(...)`. The Viewer never removes the layer automatically; the user removes it with the row's remove button or "Remove all".
+- `change_kind` `"removed"`, or a restyle that raises `ValueError` because the table or column is gone, or because the column can no longer color a layer: keep the layer as it is and show a warning on its row ("source no longer available") through `set_styled_source_warning(...)`. The Viewer never removes the layer automatically; the user removes it with the row's remove button or "Remove all".
 
-Restyling uses the source as it is classified now, not the spec stored on the binding:
+Restyling calls `ensure_styled_*_loaded(...)` with the spec stored on the binding. For shapes it passes the binding's `fill`. No freshly built source has to be looked up:
 
-1. `_on_table_state_changed(...)` first refreshes the linked-table sources of the cards (`set_linked_tables(...)`), as it does today.
-2. For each loaded styled layer to restyle, it finds the freshly built source with the same `layer_key` in the refreshed `LinkedTableColorSources`.
-3. It calls `ensure_styled_*_loaded(...)` with that fresh spec. For shapes it passes the binding's `fill`.
+- **Colors follow the current data.** The coloring code reads the data every time it runs: `obs` columns and shapes columns are classified from their current values by `classify_color_values(...)` (see "Shared value classification"), vars are always colored as continuous, and instance coloring is decided by the table's instance-key column name. A column whose kind changed is therefore colored correctly.
+- **A source that is gone or no longer colorable raises.** A removed table, column or var raises `ValueError` in the coloring code, and since phase 1 so does a column that can no longer color a layer, for example one that holds only missing values. The restyle fails, and the row gets the warning.
+- **The stored spec cannot be out of date.** After phase 2 a spec holds only the fields that name the data (see "Matching a loaded source"), and those do not change when the data changes.
 
-The fresh spec is not needed for correct colors, because the coloring code reads the data every time it runs:
-
-- `obs` columns and shapes columns are classified from their current values by `classify_color_values(...)` (see "Shared value classification");
-- vars are always colored as continuous;
-- `value_kind` is read from the spec only for `"instance"`, which is tied to the table's instance-key column and also matched by column name.
-
-A restyle with the stored spec would therefore also color a column whose kind changed correctly. Shapes-column sources are not table sources, so table events never restyle them; saves and reloads of the shapes element do (see "Shapes geometry writes").
-
-The fresh lookup exists for two other reasons:
-
-- **It catches a column that still exists but is no longer colorable.** `_classify_scalar_column_color_source(...)` drops such a column, for example one that holds only missing values, so the completer no longer offers it. A restyle with the stored spec would not fail; it would color the layer from what is left, typically as missing values, without telling the user. With the fresh lookup there is no matching source, and the row gets the warning.
-- **It keeps the binding's spec equal to what the completer offers.** When the fresh spec has a different `value_kind`, the adapter replaces the binding (see "Matching a loaded source"). Table refresh is the only route by which this happens, because a loaded source is left out of the completer and cannot be picked again.
-
-The lookup costs only a search in the sources that step 1 already rebuilt.
-
-When no fresh source has the same `layer_key`, the column or var is gone or no longer colorable, and the row gets the warning instead of a restyle.
-
-The stored spec is used only where the sources are not rebuilt: the Object Classification `"updated"` early return described below. Annotation columns keep their categorical kind there, so the stored spec is still correct.
+`_on_table_state_changed(...)` still refreshes the linked-table sources of the cards (`set_linked_tables(...)`) as it does today, so the completer offers the current sources. Shapes-column sources are not table sources, so table events never restyle them; saves and reloads of the shapes element do (see "Shapes geometry writes").
 
 The early return for `object_classification_annotation` / `"updated"` events in `_on_table_state_changed(...)` exists so that rebuilding the linked-table controls does not slow down annotation. It should keep skipping that rebuild, but the scoped restyle above still has to run, so that a loaded layer colored by `user_class` follows the annotations. Because the restyle is scoped to matching paths, it costs nothing unless such a layer is loaded.
 
 ### Matching a loaded source
 
-The card (to filter the completer and find rows) and the adapter (to find an existing layer) must agree on when two specs mean the same styled layer. Neither existing comparison fits:
+The card (to filter the completer and find rows) and the adapter (to find an existing layer) must agree on when two specs mean the same styled layer. Neither comparison that exists today fits:
 
 - `TableColorSourceSpec.identity` leaves out `var_layer`, but `vars (X): CD3` and `vars (counts): CD3` are separate layers that can both be loaded.
 - Full dataclass equality includes `value_kind`. If a table update changes how a column is classified, for example from continuous to categorical, the new spec no longer equals the loaded one, and loading it creates a second layer for the same column.
 
-The key is a new `layer_key` property on both spec classes in `src/spatiato/core/_color_source.py`:
+**`value_kind` is removed from both spec classes** in `src/spatiato/core/_color_source.py`. After phase 1 no coloring path reads it to decide how to color. It is still read in two places, and neither needs it:
 
-- `TableColorSourceSpec.layer_key`: `(table_name, source_kind, value_key, var_layer)`;
-- `ShapeColumnColorSourceSpec.layer_key`: `(source_kind, value_key)`.
+- the `"instance"` checks in `apply_table_color_source_to_labels_layer(...)`, `apply_table_color_source_to_shapes_layer(...)` and `_get_table_color_values_by_instance(...)`. Each check also matches when the column is the table's instance-key column; the `value_kind` part only raises for a spec that claims `"instance"` for another column, which discovery never produces. The checks keep only the column-name test;
+- the adapter's whole-spec comparison, which this section is about.
 
-It lives on the spec classes, not in the adapter, because the card needs the same key in phase 4. It is a new property, not a change to `identity`: `identity` leaves out `var_layer` on purpose, so that a selected var stays selected when the user switches matrix, and it keeps that role. The two keys cannot collide, because a shapes-column key has a different `source_kind` and length.
+A spec then holds only the fields that name the data, and plain equality of the frozen dataclasses identifies the layer:
 
-A source whose `value_kind` changed then restyles the existing layer, and the binding's `style_spec` is replaced with the new spec. The same replacement is used when a shapes binding's `fill` changes. Build the new binding with `dataclasses.replace(binding, style_spec=new_spec)`, which keeps every other field. For shapes these include `source_row_id_by_rendered_row`, `source_shapes_index_feature_name` and `skipped_geometry_count`, which registering again through `register_shapes_layer(...)` would otherwise need passed again. Store it through a path that also calls `_handle_registered_binding(...)`, so the replacement emits `labels_layers_changed` / `shapes_layers_changed`. The registry stores one binding per layer object, so the new binding replaces the old one.
+- `TableColorSourceSpec`: `table_name`, `source_kind`, `value_key`, `var_layer`;
+- `ShapeColumnColorSourceSpec`: `source_kind`, `value_key`.
+
+No separate key is needed: the card and the adapter compare specs with `==`, and a spec can be a dictionary key. `identity` stays as it is: it leaves out `var_layer` on purpose, so that a selected var stays selected when the user switches matrix. Specs of the two classes are never equal to each other.
+
+**Why these fields.** A layer's identity is made only of the fields that name the data the user picked: the table, `obs` column or var, the key, and the matrix. They do not change when the data changes. `value_kind` describes the data instead: discovery classified it from the column's values at one moment, and it can be out of date by the time the layer is looked up again. That is why it is removed from the spec rather than only left out of a comparison. A field added to a spec later must also name the data, not describe it; how the data was colored belongs in the style result.
+
+The style result (`LabelsStyleResult`, `ShapesStyleResult`) does not identify the layer either, for three reasons:
+
+- **The lookup happens before coloring.** `ensure_styled_*_loaded(...)` first looks for an existing layer for the requested spec, and only then colors it. In the new card, leaving loaded sources out of the completer and matching rows to layers happen without any coloring at all.
+- **The binding stores the spec, not the style result.** The style result goes to the status card and is then dropped.
+- **It describes how the layer was colored last, and changes between restyles of the same layer.** `palette_source` changes from `"default_missing"` to `"stored"` once a palette for the column is added to the table's `uns`, and `value_kind` changes with the column. Keyed on the style result, such a restyle would look like a different layer.
+
+What else follows from the removal:
+
+- **Discovery** still classifies each column, to decide whether to offer it, but no longer stores the result on the spec.
+- **The style results keep their `value_kind`.** They record what coloring did, and the status cards read it. `TableColorValueKind`, `ShapeColorValueKind` and their validation functions stay for them.
+- **A binding is never replaced because of a changed kind.** The binding replacement in "Adapter changes" is only needed when a shapes binding's `fill` changes.
+- **The planned colorbar** in `Roadmap/colormap/colormap.md` decides from the loaded layer's style result whether a source is continuous, not from the spec.
 
 ### Shapes Fill
 
@@ -396,12 +411,12 @@ following `replace_primary_shapes_layer(...)`:
 - add it to the viewer and register it as a styled binding with `style_spec` and `fill` before the old layer is removed. `fill` is normalized to `False` when the replacement is rendered as `Points`. If building, coloring or registering fails, only the replacement is removed, and the old layer and binding stay as they are;
 - keep the old layer's place in the layer list, its `visible` and `opacity`, and its name. `_add_layer_to_viewer(...)` appends, so the replacement is moved to the old layer's index (`LayerList.move(...)`) before the old layer is removed. Napari adds a suffix to the name while both layers are present, so the name is set again after the removal, as `replace_primary_shapes_layer(...)` does.
 
-Registering the replacement and removing the old layer emit `shapes_layers_changed`, so the card swaps the row. The row's Fill state comes from the new binding, and its warning, if any, is keyed by `layer_key`, so neither is lost.
+Registering the replacement and removing the old layer emit `shapes_layers_changed`, so the card swaps the row. The row's Fill state comes from the new binding, and its warning, if any, is keyed by the spec, so neither is lost.
 
 **Viewer.** `_on_shapes_element_written(...)` and `_on_shapes_element_reloaded(...)` already rebuild the shapes cards for an event in the active SpatialData object and coordinate system. After that, they rebuild every live styled shapes layer of `event.shapes_name`:
 
 - the event does not say what changed, so every write or reload rebuilds, whether or not the geometry changed;
-- the spec is the fresh one with the same `layer_key`, as for table refresh, taken from the rebuilt card's shapes-column sources or linked-table sources. A source with no fresh counterpart, or a rebuild that raises `ValueError`, keeps the old layer and gets a row warning with the error message;
+- the spec is the one stored on the binding, as for table refresh. A rebuild that raises `ValueError`, for example because the colored column was removed or can no longer color a layer, keeps the old layer and gets a row warning with the error message;
 - `fill` is the binding's `fill`;
 - the primary shapes layer is left alone. The Annotation widget already keeps it in sync: `sync_primary_shapes_layer_binding(...)` after a save, and `replace_primary_shapes_layer(...)` after a reload.
 
@@ -421,6 +436,7 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
 
 - **Refresh after table changes**: the Viewer restyles affected loaded layers automatically, scoped to the table changes that touch them, as described in "Refresh after table changes". Rows get no refresh button.
 - **Missing source**: when the table or column of a loaded layer disappears, the layer stays in the viewer as it is and its row shows a warning. The Viewer never removes it automatically.
+- **Failed first load**: a styled layer is colored before it is added to the viewer and registered. When coloring or registering a newly created layer fails, no layer is left, no row appears, and the Viewer shows the error card. A failed restyle of a loaded layer keeps the layer, as under "Missing source". This is part of phase 2. See "Adapter changes", item 5.
 - **Row labels with several linked tables**: when an element has more than one linked table, table-backed rows are prefixed with the table name. Rows stay in one flat list in napari layer order; they are not grouped under table headings.
 - **Shared row**: the generic part of `_ImageLayerRow` moves to `_LayerRow` in a new neutral module, `src/spatiato/widgets/layer_row.py`. `_ImageLayerRow` stays in `image_layer_row.py` as a subclass that adds the color button and colormap sync, together with the image channel and colormap helpers. It is not generalized in place, because labels and shapes rows would then sit in an image-named class with a color option that has to be off for them. It is not moved and renamed as a whole either, because the neutral module would then hold image colormap and channel code. See "Shared layer row".
 - **Primary row placement**: the primary layer has its own row at the top of the card, above "Linked table" and the other color-source controls. It is not part of the loaded list, because:
@@ -431,13 +447,13 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
   - other widgets restyle (Object Classification, Spatial Query) or edit (Annotation) the primary layer, so it is a different kind of layer from the colored ones;
   - the list's scroll area could scroll it out of view.
 - **Primary shapes binding sync**: `sync_primary_shapes_layer_binding(...)` emits `shapes_layers_changed`, so cards re-read the replaced binding object. It still does not emit `primary_shapes_layer_registered`. See "Adapter changes".
-- **Matching key**: styled layers are matched on a new `layer_key` property of the spec classes in `src/spatiato/core/_color_source.py`, shared by the adapter and the cards. `identity` keeps its role of preserving a selection across matrix switches. See "Matching a loaded source".
-- **Restyle spec**: a restyle after a table change uses the freshly classified source with the same `layer_key`, not the spec stored on the binding. Colors would be correct either way, because the coloring code classifies table columns itself. The lookup turns a column that is no longer colorable into the "source no longer available" warning instead of a silent restyle, and keeps the binding's spec equal to what the completer offers. The stored spec is used only on the Object Classification `"updated"` early return. See "Refresh after table changes".
+- **Specs name the data**: `value_kind` is removed from `TableColorSourceSpec` and `ShapeColumnColorSourceSpec`, so a spec holds only the fields that name the data the user picked, and plain spec equality identifies a loaded layer, for the adapter and the cards alike. No coloring path reads `value_kind` after phase 1, and it can go out of date when the data changes. The style result does not identify a layer either: it describes how the layer was last colored, and it keeps its `value_kind`. `identity` keeps its role of preserving a selection across matrix switches. This is part of phase 2. See "Matching a loaded source".
+- **Restyle spec**: a restyle after a table change, or a rebuild after a shapes write, uses the spec stored on the binding. Coloring reads the current data, and a source that is gone or can no longer color a layer raises and gets the row warning, so no freshly built source is looked up. See "Refresh after table changes".
 - **Fill for point-radius shapes**: only rows of layers rendered as `Shapes` show a Fill checkbox. Layers rendered as `Points` are always filled. See "Shapes Fill".
 - **Fill state**: stored as `fill` on `ShapesLayerBinding`, not in the card and not read back from the layer. It is added in phase 2 with the other adapter changes. See "Adapter changes" and "Shapes Fill".
-- **Source warnings**: the card's loaded list keeps the "source no longer available" warnings per `layer_key` and reapplies them when it reconciles its rows; `ViewerWidget` sets them through `set_styled_source_warning(...)`. See "Labels card".
+- **Source warnings**: the card's loaded list keeps the "source no longer available" warnings per spec and reapplies them when it reconciles its rows; `ViewerWidget` sets them through `set_styled_source_warning(...)`. See "Labels card".
 - **Status-card builders**: they take the element name and the spec directly, and `LabelsLoadRequest` / `ShapesLoadRequest` are deleted. See "Labels card" and "Shapes card".
-- **Shared value classification**: one classifier, `classify_color_values(...)` in `src/spatiato/core/color_value_classification.py`, decides how a column's values are colored, for discovery and for every coloring path: labels and shapes colored from a table, and shapes colored from their own columns. It returns an encoding, not only a kind, so the coloring paths know where categories and palettes come from. Coloring no longer reads `value_kind` from the spec, and a column that is no longer colorable raises and gets the row warning. Labels coloring of `object`-dtype boolean and 0/1 columns changes from continuous to categorical. This is phase 1. See "Shared value classification".
+- **Shared value classification**: one classifier, `classify_color_values(...)` in `src/spatiato/core/color_value_classification.py`, decides how a column's values are colored, for discovery and for every coloring path: labels and shapes colored from a table, and shapes colored from their own columns. It returns an encoding, not only a kind, so the coloring paths know where categories and palettes come from. Coloring no longer reads `value_kind` from the spec, and a column that is no longer colorable raises and gets the row warning. Labels coloring of `object`-dtype boolean and 0/1 columns changed from continuous to categorical. This was phase 1, which is done. See "Shared value classification".
 - **Geometry writes**: styled shapes layers follow saves and reloads of their shapes element. They are rebuilt as new layers in the same place, with the same visibility, opacity, name, spec and Fill; a failed rebuild keeps the old layer and shows a row warning. This is phase 7, in the same PR as the rest of this feature. See "Shapes geometry writes".
 
 ## Implementation Phases
@@ -452,13 +468,13 @@ Labels go before shapes:
 
 Phases 1 to 3 change no card. Phases 2 and 3 still cover the parts shapes need, so the shared design is tested before the labels card depends on it.
 
-1. **Shared value classification**: `classify_color_values(...)` in `src/spatiato/core/color_value_classification.py`, used by discovery and by the three coloring paths, including the shapes-column path, which stops reading `value_kind` from the spec. Start with tests that pin down today's results per column type. It touches only `core` and the two styling modules and has no UI, and phases 5 to 7 rely on discovery and coloring agreeing.
-2. **Adapter, for labels and shapes together**: the `layer_key` property on both spec classes in `src/spatiato/core/_color_source.py`; the `labels_layers_changed` / `shapes_layers_changed` signals, including the emission from `sync_primary_shapes_layer_binding(...)`; `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`; key-based matching in the styled-layer lookups and `find_bindings(...)`; the `fill` field on `ShapesLayerBinding`; and the binding replacement when `value_kind` or `fill` changes. Both element types are handled in the same adapter functions (`_handle_registered_binding(...)`, `_on_viewer_layer_inserted(...)`, `_on_viewer_layer_removed(...)`, `_on_viewer_layers_reordered(...)`, `_remove_layer_from_viewer_and_registry(...)`), so splitting the work would edit them twice.
+1. **Shared value classification** (done): `classify_color_values(...)` in `src/spatiato/core/color_value_classification.py`, used by discovery and by the three coloring paths, including the shapes-column path, which no longer reads `value_kind` from the spec. Tests pinned down the earlier results per column type first. It touched only `core` and the two styling modules and has no UI, and phases 5 to 7 rely on discovery and coloring agreeing.
+2. **Adapter, for labels and shapes together**: first, the removal of `value_kind` from both spec classes in `src/spatiato/core/_color_source.py`, from the specs that discovery, the var sources and Spatial Query build, and from the `"instance"` checks; then the `labels_layers_changed` / `shapes_layers_changed` signals, including the emission from `sync_primary_shapes_layer_binding(...)`; `remove_styled_labels_layer(...)` / `remove_styled_shapes_layer(...)`; the `fill` field on `ShapesLayerBinding`; the binding replacement when `fill` changes; and the build, color, add, register order in `ensure_styled_labels_loaded(...)` / `ensure_styled_shapes_loaded(...)`, so a failed first load leaves no layer. The lookups by spec need no change once `value_kind` is gone. Both element types are handled in the same adapter functions (`_handle_registered_binding(...)`, `_on_viewer_layer_inserted(...)`, `_on_viewer_layer_removed(...)`, `_on_viewer_layers_reordered(...)`, `_remove_layer_from_viewer_and_registry(...)`), so splitting the work would edit them twice.
 3. **Shared row**: add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it. Build and test the extra-control slot here, with a placeholder widget, although only shapes rows use it, so the row API does not change in phase 6.
 4. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh. Build the loaded list as a reusable widget so the shapes card can use it in phase 6, including its warning mapping and `set_styled_source_warning(...)`. Change the labels status-card builders to take the labels name and spec, and delete `LabelsLoadRequest`.
-5. **Table refresh**: scoped restyle on `table_state_changed` with the freshly classified spec, and stale-source warnings.
+5. **Table refresh**: scoped restyle on `table_state_changed` with the spec stored on the binding, and stale-source warnings.
 6. **Shapes card**: reuse the loaded list from phase 4, and add shapes-column sources and per-row Fill, shown only for layers rendered as `Shapes`. Change the shapes status-card builders to take the shapes name and spec, and delete `ShapesLoadRequest`.
-7. **Shapes geometry writes**: `rebuild_styled_shapes_layer(...)` in the adapter, and the rebuild of live styled shapes layers in `_on_shapes_element_written(...)` / `_on_shapes_element_reloaded(...)`. It is a separate slice because it fixes a gap that exists today, independent of the new card, but it ships in the same PR. It comes after phase 6, which provides the fresh shapes-column sources and the per-row Fill it relies on; the coloring-time classification comes from phase 1.
+7. **Shapes geometry writes**: `rebuild_styled_shapes_layer(...)` in the adapter, and the rebuild of live styled shapes layers in `_on_shapes_element_written(...)` / `_on_shapes_element_reloaded(...)`. It is a separate slice because it fixes a gap that exists today, independent of the new card, but it ships in the same PR. It comes after phase 6, which provides the per-row Fill it relies on; the coloring-time classification comes from phase 1.
 
 Release phases 4 to 7 together. Between them, the labels card loads immediately while the shapes card still uses **Add / Update in viewer**. That is fine on the feature branch, but confusing in a release.
 
@@ -468,19 +484,20 @@ Value classification (new `tests/test_color_value_classification.py`):
 
 - one case per encoding: a pandas categorical column, a boolean column, an `object` column of booleans with missing values, 0/1 integers with and without missing values, other integers, floats, and strings;
 - `None` for an all-missing non-categorical column and for a column with mixed value types, and `"pandas_categorical"` for an all-missing categorical column;
-- discovery (`tests/test_color_source_options.py`) offers the same sources with the same `value_kind` as before.
+- discovery (`tests/test_color_source_options.py`) offers the same sources as before.
 
 Labels styling (`tests/test_labels_styling.py`):
 
-- an `object`-dtype boolean column with missing values, and an `object`-dtype 0/1 column, are colored as categorical (today: continuous);
+- an `object`-dtype boolean column with missing values, and an `object`-dtype 0/1 column, are colored as categorical (before phase 1: continuous);
 - a 0/1 column is colored as categorical on a labels element whose own rows hold only 0s, because the full column is classified;
-- a column that discovery would not offer, for example one holding only missing values, raises `ValueError` (today: colored as continuous);
+- a column that discovery would not offer, for example one holding only missing values, raises `ValueError` (before phase 1: colored as continuous);
 - every other column type is colored as before.
 
 Color source specs (`tests/test_color_source.py`):
 
-- `layer_key` includes `var_layer` and leaves out `value_kind`, for `TableColorSourceSpec`;
-- `layer_key` of `ShapeColumnColorSourceSpec` is `(source_kind, value_key)`;
+- `TableColorSourceSpec` and `ShapeColumnColorSourceSpec` no longer take `value_kind`;
+- two table specs are equal exactly when their table, source kind, key and matrix are equal, so `vars (X)` and `vars (counts)` of the same var are different specs;
+- a table spec never equals a shapes-column spec;
 - `identity` is unchanged.
 
 Adapter (`tests/test_viewer_adapter.py`):
@@ -489,19 +506,23 @@ Adapter (`tests/test_viewer_adapter.py`):
 - they fire for bindings registered without a coordinate system;
 - `sync_primary_shapes_layer_binding(...)` emits `shapes_layers_changed` but not `primary_shapes_layer_registered`;
 - `remove_styled_*_layer(...)` removes only the matching variant and leaves siblings and the primary layer alone;
-- a spec that differs only in `value_kind` resolves to the existing styled layer, the binding then carries the new spec, keeps its other fields (for shapes, the rendered-row mapping), and the replacement emits the membership signal;
-- `find_bindings(style_spec=...)` matches on `layer_key`;
+- loading the same source again after its column changed kind resolves to the existing styled layer and restyles it, without a second layer;
 - `X` and a layer for the same var stay separate layers;
+- the instance-key column is still colored as instances, decided by its name alone;
 - `ShapesLayerBinding` rejects `fill=True` for a primary binding and for a binding rendered as `Points`;
 - `ensure_styled_shapes_loaded(..., fill=True)` records `fill=True` for a layer rendered as `Shapes`, and `False` for a point-radius layer rendered as `Points`;
 - restyling with a different `fill` replaces the binding and emits `shapes_layers_changed`; restyling with the same spec and `fill` keeps the binding object and emits nothing;
+- when coloring a newly created styled labels or shapes layer raises, the call raises, no layer or binding is left, and no membership signal fires;
+- when registering a newly created styled labels or shapes layer fails, the layer is removed from the viewer;
+- when restyling an existing styled layer raises, the layer and its binding stay;
+- a layer colored before it is added to the viewer keeps its colors after insertion: the colormap and features of a labels layer, and the colors of a shapes layer rendered as `Shapes` or as `Points`;
 - `rebuild_styled_shapes_layer(...)` puts a new layer in the old layer's place in the layer list, keeps `visible`, `opacity`, name, spec and `fill`, and emits `shapes_layers_changed`;
 - it handles a change of rendering mode from `Shapes` to `Points`, with `fill` normalized to `False`;
 - when building, coloring or registering the replacement fails, the old layer and binding stay, and no replacement is left in the viewer.
 
 Shapes styling (`tests/test_shapes_styling.py`):
 
-- a shapes-column layer whose column changed kind after loading is colored with the column's current kind, whatever `value_kind` the spec carries;
+- a shapes-column layer whose column changed kind after loading is colored with the column's current kind;
 - a shapes column that is no longer colorable raises `ValueError`;
 - table-backed and shapes-column coloring color every column type as before.
 
@@ -513,14 +534,15 @@ Layer rows:
 Viewer widget (`tests/test_viewer_widget.py`):
 
 - accepting a completer value loads the styled layer without any button click, and the row appears;
+- a first load whose coloring fails shows the error card, adds no row and leaves no layer in the viewer;
 - a loaded source is left out of the completer and comes back after removal;
 - deleting a styled layer in napari removes its row;
 - reordering layers in napari reorders the rows;
 - "Remove all" removes only styled layers, not the primary layer;
 - the primary row switches between **Load in viewer** and a live row when the primary layer is added or removed, including from napari;
 - an `obs` table update restyles a loaded layer colored by that column and leaves other layers alone;
-- a table rebuild that changes a column's `value_kind` restyles the loaded layer in place: no second layer is created, the binding carries the new spec, and the colors follow the new kind;
-- a column that still exists but is no longer colorable, for example one holding only missing values, gets the row warning instead of a restyle;
+- a table rebuild that changes how a column is classified restyles the loaded layer in place: no second layer is created, and the colors follow the new kind;
+- a column that still exists but can no longer color a layer, for example one holding only missing values, gets the row warning: the restyle raises;
 - a removed source keeps the layer and shows a row warning;
 - a warning survives a row rebuild (for example a Fill toggle) and is cleared by a successful restyle;
 - the status-card builders produce the same cards from the element name and spec as they did from the request;
@@ -531,3 +553,5 @@ Viewer widget (`tests/test_viewer_widget.py`):
 - shapes: a reload rebuilds styled shapes layers in the same way as a save.
 
 About 30 existing references to `add_update_button` in `tests/test_viewer_widget.py` cover the labels and shapes Add / Update flow and need to be rewritten for the new intents.
+
+Removing `value_kind` from the specs in phase 2 also removes about 150 `value_kind=` arguments from spec constructors across the tests, mostly in `tests/test_viewer_adapter.py`, `tests/test_shapes_styling.py`, `tests/test_viewer_widget.py`, `tests/test_viewer_status_card.py` and `tests/test_color_source.py`. The style results keep their `value_kind`, so assertions on `result.value_kind` stay.

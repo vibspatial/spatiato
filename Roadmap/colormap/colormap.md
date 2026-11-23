@@ -43,6 +43,8 @@ Continuous color source discovery is already explicit:
 - `TableColorSourceSpec.value_kind == "continuous"`
 - `ShapeColumnColorSourceSpec.value_kind == "continuous"`
 
+Note: `Roadmap/auto_load_table_coloring/auto_color.md` removes `value_kind` from both spec classes, because the coloring code classifies each column from its current values and the spec's kind can go out of date. Decide whether a loaded layer is continuous from its style result instead (`LabelsStyleResult.value_kind`, `ShapesStyleResult.value_kind`), which records the kind its coloring actually applied.
+
 Relevant files:
 
 - `src/spatiato/core/_color_source.py`
