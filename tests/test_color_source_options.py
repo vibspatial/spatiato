@@ -61,6 +61,39 @@ def test_get_table_obs_color_source_options_classifies_supported_columns(sdata_b
     assert option_by_key["instance_id"].identity == ("table", "obs_column", "instance_id")
 
 
+def test_get_table_obs_color_source_options_classifies_object_and_missing_columns(sdata_blobs: SpatialData) -> None:
+    table = sdata_blobs["table"]
+    n_obs = table.n_obs
+    # A boolean or 0/1 column with missing values has `object` dtype in pandas.
+    table.obs["object_bool_obs"] = pd.Series(
+        [None if index == 0 else index % 2 == 0 for index in range(n_obs)],
+        index=table.obs.index,
+        dtype="object",
+    )
+    table.obs["object_binary_obs"] = pd.Series(
+        [None if index == 0 else index % 2 for index in range(n_obs)],
+        index=table.obs.index,
+        dtype="object",
+    )
+    table.obs["all_missing_float_obs"] = pd.Series(np.nan, index=table.obs.index, dtype="float64")
+    table.obs["all_missing_cat_obs"] = pd.Categorical([None] * n_obs, categories=["a", "b"])
+    table.obs["mixed_obs"] = pd.Series(
+        ["a" if index % 2 else index for index in range(n_obs)],
+        index=table.obs.index,
+        dtype="object",
+    )
+
+    options = get_table_obs_color_source_options(sdata_blobs, "table")
+
+    option_by_key = {option.value_key: option for option in options}
+
+    assert option_by_key["object_bool_obs"].value_kind == "categorical"
+    assert option_by_key["object_binary_obs"].value_kind == "categorical"
+    assert option_by_key["all_missing_cat_obs"].value_kind == "categorical"
+    assert "all_missing_float_obs" not in option_by_key
+    assert "mixed_obs" not in option_by_key
+
+
 def test_get_table_var_layers_lists_x_first_then_the_layers_sorted(sdata_blobs: SpatialData) -> None:
     table = sdata_blobs["table"]
     table.layers["raw"] = table.X.copy()
