@@ -84,14 +84,8 @@ def apply_table_color_source_to_labels_layer(
     table = get_table(sdata, style_spec.table_name)
     table_metadata = validate_table_binding(sdata, labels_name, style_spec.table_name)
     region_rows, obs_index = _get_region_rows_by_instance(table, table_metadata, labels_name)
-    if style_spec.value_kind == "instance" or (
-        style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key
-    ):
-        if style_spec.source_kind != "obs_column" or style_spec.value_key != table_metadata.instance_key:
-            raise ValueError(
-                "Instance ID coloring must use the table instance key "
-                f"`{table_metadata.instance_key}` as an observation source."
-            )
+    if style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key:
+        # The instance key column colors each instance with its own color.
         style_result, features = _build_instance_key_colormap(region_rows, instance_key=table_metadata.instance_key)
         layer.colormap = label_colormap(background_value=0)
     elif style_spec.source_kind == "obs_column":

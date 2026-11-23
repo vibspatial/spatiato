@@ -158,9 +158,8 @@ def apply_shape_column_color_source_to_shapes_layer(
         for unnamed indexes.
 
     The column is classified from its current values with
-    ``classify_color_values(...)``. ``style_spec.value_kind`` records what
-    discovery saw when the source was listed, and may be out of date once the
-    shapes element changed, so it is not read here.
+    ``classify_color_values(...)``, so a column whose values changed since the
+    source was listed is colored by its current kind.
     """
     if style_spec.source_kind != "shape_column":
         raise ValueError(f"Shape color sources must use `source_kind='shape_column'`, got `{style_spec.source_kind}`.")
@@ -279,14 +278,8 @@ def apply_table_color_source_to_shapes_layer(
     )
 
     not_detected_rows = None
-    if style_spec.value_kind == "instance" or (
-        style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key
-    ):
-        if style_spec.source_kind != "obs_column" or style_spec.value_key != table_metadata.instance_key:
-            raise ValueError(
-                "Instance ID coloring must use the table instance key "
-                f"`{table_metadata.instance_key}` as an observation source."
-            )
+    if style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key:
+        # The instance key column colors each instance with its own color.
         style_result, rendered_row_colors, feature_values = _build_table_instance_shape_style(aligned_values)
     elif style_spec.source_kind == "obs_column":
         style_result, rendered_row_colors, feature_values = _build_table_obs_shape_style(
@@ -558,14 +551,7 @@ def _get_table_color_values_by_instance(
     table_metadata: SpatialDataTableMetadata,
     style_spec: TableColorSourceSpec,
 ) -> pd.Series:
-    if style_spec.value_kind == "instance" or (
-        style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key
-    ):
-        if style_spec.source_kind != "obs_column" or style_spec.value_key != table_metadata.instance_key:
-            raise ValueError(
-                "Instance ID coloring must use the table instance key "
-                f"`{table_metadata.instance_key}` as an observation source."
-            )
+    if style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key:
         values = region_instances.copy()
     elif style_spec.source_kind == "obs_column":
         if style_spec.value_key not in table.obs:
