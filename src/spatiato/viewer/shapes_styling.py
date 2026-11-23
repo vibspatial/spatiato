@@ -24,6 +24,7 @@ from spatiato.core.class_palette import (
     resolve_table_categorical_palette,
     validate_categorical_palette_source,
 )
+from spatiato.core.color_value_classification import ColorValueEncoding, classify_color_values
 from spatiato.core.spatialdata import SpatialDataTableMetadata, get_table, get_table_metadata, get_table_var_matrix
 from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
@@ -31,7 +32,6 @@ from spatiato.viewer._styling import (
     categorical_rgba_for_values,
     continuous_rgba_for_values,
     default_categorical_palette_for_categories,
-    is_string_like_series,
     normalize_category_value,
     zeros_mean_not_detected,
 )
@@ -156,6 +156,11 @@ def apply_shape_column_color_source_to_shapes_layer(
         GeoDataFrame index for napari-visible inspection and status-bar text.
         This follows the GeoDataFrame index name, falling back to ``"index"``
         for unnamed indexes.
+
+    The column is classified from its current values with
+    ``classify_color_values(...)``. ``style_spec.value_kind`` records what
+    discovery saw when the source was listed, and may be out of date once the
+    shapes element changed, so it is not read here.
     """
     if style_spec.source_kind != "shape_column":
         raise ValueError(f"Shape color sources must use `source_kind='shape_column'`, got `{style_spec.source_kind}`.")
@@ -175,15 +180,22 @@ def apply_shape_column_color_source_to_shapes_layer(
     rendered_row_values = source_values.iloc[source_row_id_by_rendered_row]
     rendered_row_values.index = pd.RangeIndex(len(rendered_row_values))
 
-    if style_spec.value_kind == "categorical":
+    classification = classify_color_values(source_values)
+    if classification is None:
+        raise ValueError(
+            f"Shape column `{style_spec.value_key}` cannot color a layer: "
+            "it holds no values, or values of mixed or unsupported types."
+        )
+    if classification.encoding == "continuous":
+        style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(rendered_row_values)
+    else:
         style_result, rendered_row_colors, feature_values = _build_categorical_shape_style(
             shapes_element=shapes_element,
             column_name=style_spec.value_key,
             source_values=source_values,
             rendered_row_values=rendered_row_values,
+            encoding=classification.encoding,
         )
-    else:
-        style_result, rendered_row_colors, feature_values = _build_continuous_shape_style(rendered_row_values)
 
     if isinstance(layer, Shapes):
         _apply_rendered_row_colors_to_shapes_layer(layer, rendered_row_colors, fill=fill)
@@ -646,6 +658,7 @@ def _build_categorical_shape_style(
     column_name: str,
     source_values: pd.Series,
     rendered_row_values: pd.Series,
+    encoding: ColorValueEncoding,
 ) -> tuple[ShapesStyleResult, np.ndarray, pd.Series]:
     """Build categorical colors from source-level values and rendered-row values.
 
@@ -666,6 +679,9 @@ def _build_categorical_shape_style(
         repeat one source value for multiple rendered polygon parts, and can be
         a subset of ``source_values`` when empty, invalid, or unsupported source
         geometries were skipped before rendering.
+    encoding
+        Classification of ``source_values`` by ``classify_color_values(...)``:
+        any encoding except ``"continuous"``.
 
     Returns
     -------
@@ -683,7 +699,7 @@ def _build_categorical_shape_style(
     companion_palette_allowed = True
     coercion_applied = False
 
-    if _is_categorical_dtype(source_values):
+    if encoding == "pandas_categorical":
         normalized_source_values = _normalize_category_series(source_values)
         normalized_rendered_row_values = _normalize_category_series(rendered_row_values)
         # Keep the original categorical series for color generation so
@@ -691,19 +707,19 @@ def _build_categorical_shape_style(
         # The normalized object series is still used for layer.features.
         color_values = rendered_row_values
         categories = _present_categories(normalized_source_values, source_values.cat.categories)
-    elif _is_bool_series(source_values):
+    elif encoding == "boolean":
         normalized_source_values = _normalize_category_series(source_values)
         normalized_rendered_row_values = _normalize_category_series(rendered_row_values)
         color_values = normalized_rendered_row_values
         categories = _present_categories(normalized_source_values, [False, True])
-    elif _is_exact_binary_integer_series(source_values):
+    elif encoding == "binary_integer":
         numeric_source_values = pd.to_numeric(source_values, errors="coerce").astype("Int64")
         numeric_rendered_row_values = pd.to_numeric(rendered_row_values, errors="coerce").astype("Int64")
         normalized_source_values = _normalize_category_series(numeric_source_values)
         normalized_rendered_row_values = _normalize_category_series(numeric_rendered_row_values)
         color_values = numeric_rendered_row_values
         categories = _present_categories(normalized_source_values, [0, 1])
-    elif is_string_like_series(source_values):
+    elif encoding == "string":
         normalized_rendered_row_values, categories = build_string_categorical_values(
             full_values=source_values,
             row_values=rendered_row_values,
@@ -719,11 +735,7 @@ def _build_categorical_shape_style(
         companion_palette_allowed = False
         coercion_applied = True
     else:
-        normalized_source_values = _normalize_category_series(source_values)
-        normalized_rendered_row_values = _normalize_category_series(rendered_row_values)
-        color_values = normalized_rendered_row_values
-        categories = list(pd.unique(normalized_source_values.dropna()))
-        companion_palette_allowed = False
+        raise ValueError(f"Shape column `{column_name}` has encoding `{encoding}`, which is not categorical.")
 
     if companion_palette_allowed:
         palette_source, palette = _resolve_shape_categorical_palette(
@@ -783,8 +795,16 @@ def _build_table_obs_shape_style(
 
     full_series = table.obs[column_name]
     rendered_row_values = aligned_values.rendered_row_values
+    # Classify the full column, not the rows of this shapes element, as discovery does.
+    classification = classify_color_values(full_series)
+    if classification is None:
+        raise ValueError(
+            f"Observation column `{column_name}` cannot color a layer: "
+            "it holds no values, or values of mixed or unsupported types."
+        )
+    encoding = classification.encoding
 
-    if _is_categorical_dtype(full_series):
+    if encoding == "pandas_categorical":
         normalized_rendered_row_values = _normalize_category_series(rendered_row_values)
         # Table-to-shapes alignment currently stores aligned values as an
         # object Series, so rebuild a categorical Series with the table's
@@ -813,7 +833,7 @@ def _build_table_obs_shape_style(
         )
         return style_result, rendered_row_colors, normalized_rendered_row_values
 
-    if _is_bool_series(full_series):
+    if encoding == "boolean":
         normalized_rendered_row_values = _normalize_category_series(rendered_row_values)
         present_values = set(full_series.dropna().tolist())
         categories = [value for value in (False, True) if value in present_values]
@@ -835,7 +855,7 @@ def _build_table_obs_shape_style(
         )
         return style_result, rendered_row_colors, normalized_rendered_row_values
 
-    if _is_exact_binary_integer_series(full_series):
+    if encoding == "binary_integer":
         numeric_rendered_row_values = pd.to_numeric(rendered_row_values, errors="coerce").astype("Int64")
         non_missing_source = pd.to_numeric(full_series.dropna(), errors="coerce").astype("int64")
         present_values = set(non_missing_source.tolist())
@@ -858,7 +878,7 @@ def _build_table_obs_shape_style(
         )
         return style_result, rendered_row_colors, numeric_rendered_row_values
 
-    if is_string_like_series(full_series):
+    if encoding == "string":
         string_rendered_row_values, categories = build_string_categorical_values(
             full_values=full_series,
             row_values=rendered_row_values,
@@ -1163,29 +1183,3 @@ def _format_value_preview(values: Sequence[Any]) -> str:
     if len(values) > 5:
         preview += ", ..."
     return preview
-
-
-def _is_categorical_dtype(values: pd.Series) -> bool:
-    return isinstance(values.dtype, pd.CategoricalDtype)
-
-
-def _is_bool_series(values: pd.Series) -> bool:
-    non_null = values.dropna()
-    if non_null.empty:
-        return False
-    if pd.api.types.is_bool_dtype(values.dtype):
-        return True
-    return all(isinstance(value, bool | np.bool_) for value in non_null.tolist())
-
-
-def _is_exact_binary_integer_series(values: pd.Series) -> bool:
-    non_null = values.dropna()
-    if non_null.empty:
-        return False
-    if not pd.api.types.is_integer_dtype(values.dtype) and not all(
-        isinstance(value, int | np.integer) and not isinstance(value, bool | np.bool_) for value in non_null.tolist()
-    ):
-        return False
-
-    normalized_values = {int(value) for value in pd.to_numeric(non_null, errors="coerce").dropna().tolist()}
-    return normalized_values == {0, 1}
