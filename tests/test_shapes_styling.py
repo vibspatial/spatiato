@@ -993,6 +993,95 @@ def test_apply_table_color_source_to_shapes_layer_coerces_string_obs_to_temporar
     assert layer.features["free_text"].to_list() == ["alpha", "beta"]
 
 
+@pytest.mark.parametrize("values", [[True, False, None], [1, 0, None]])
+def test_apply_table_color_source_to_shapes_layer_colors_object_bool_and_binary_obs_categorically(
+    values: list[object],
+) -> None:
+    # A boolean or 0/1 column with missing values has `object` dtype in pandas.
+    geodataframe = gpd.GeoDataFrame(
+        {},
+        geometry=[_polygon(0), _polygon(2), _polygon(4)],
+        index=pd.Index(["cell_1", "cell_2", "cell_3"], name="instance_id"),
+    )
+    obs_index = ["obs_1", "obs_2", "obs_3"]
+    table = ad.AnnData(
+        obs=pd.DataFrame(
+            {
+                "region": ["cells", "cells", "cells"],
+                "instance_id": ["cell_1", "cell_2", "cell_3"],
+                "state": pd.Series(values, index=obs_index, dtype="object"),
+            },
+            index=obs_index,
+        )
+    )
+    # The palette follows the categories `[False, True]` or `[0, 1]`.
+    table.uns["state_colors"] = ["red", "blue"]
+    layer = _make_shapes_layer(("cell_1", "cell_2", "cell_3"), source_shapes_index_feature_name="instance_id")
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="obs_column",
+        value_key="state",
+        value_kind="categorical",
+    )
+
+    result = apply_table_color_source_to_shapes_layer(
+        layer,
+        sdata=_make_shapes_sdata(geodataframe, table),
+        shapes_name="cells",
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=(0, 1, 2),
+        source_shapes_index_feature_name="instance_id",
+    )
+
+    assert result.value_kind == "categorical"
+    assert result.palette_source == "stored"
+    np.testing.assert_allclose(
+        layer.edge_color,
+        np.asarray(
+            [
+                _rgba("blue", SHAPES_EDGE_ALPHA),
+                _rgba("red", SHAPES_EDGE_ALPHA),
+                _rgba(SHAPES_MISSING_BASE_COLOR, SHAPES_EDGE_ALPHA),
+            ]
+        ),
+    )
+
+
+def test_apply_table_color_source_to_shapes_layer_rejects_an_obs_column_that_cannot_color() -> None:
+    geodataframe = gpd.GeoDataFrame(
+        {},
+        geometry=[_polygon(0), _polygon(2)],
+        index=pd.Index(["cell_1", "cell_2"], name="instance_id"),
+    )
+    table = ad.AnnData(
+        obs=pd.DataFrame(
+            {
+                "region": ["cells", "cells"],
+                "instance_id": ["cell_1", "cell_2"],
+                "unusable": [np.nan, np.nan],
+            },
+            index=["obs_1", "obs_2"],
+        )
+    )
+    layer = _make_shapes_layer(("cell_1", "cell_2"), source_shapes_index_feature_name="instance_id")
+    style_spec = TableColorSourceSpec(
+        table_name="table",
+        source_kind="obs_column",
+        value_key="unusable",
+        value_kind="continuous",
+    )
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        apply_table_color_source_to_shapes_layer(
+            layer,
+            sdata=_make_shapes_sdata(geodataframe, table),
+            shapes_name="cells",
+            style_spec=style_spec,
+            source_row_id_by_rendered_row=(0, 1),
+            source_shapes_index_feature_name="instance_id",
+        )
+
+
 def test_apply_table_color_source_to_shapes_layer_disambiguates_style_feature_from_source_index_feature() -> None:
     geodataframe = gpd.GeoDataFrame(
         {},
@@ -1286,6 +1375,66 @@ def test_apply_shape_column_color_source_to_shapes_layer_treats_string_object_va
     assert result.coercion_applied is True
     assert geodataframe["free_text"].dtype == original_dtype
     assert layer.features["free_text"].to_list() == ["alpha", "beta"]
+
+
+@pytest.mark.parametrize(
+    ("values", "stored_value_kind", "expected_value_kind"),
+    [
+        (["alpha", "beta"], "continuous", "categorical"),
+        ([0.5, 2.5], "categorical", "continuous"),
+    ],
+)
+def test_apply_shape_column_color_source_to_shapes_layer_classifies_the_current_column(
+    values: list[object],
+    stored_value_kind: str,
+    expected_value_kind: str,
+) -> None:
+    # The spec's `value_kind` records what discovery saw when the layer was
+    # loaded; coloring classifies the column as it is now.
+    geodataframe = gpd.GeoDataFrame(
+        {"group": values},
+        geometry=[_polygon(0), _polygon(2)],
+        index=["cell_1", "cell_2"],
+    )
+    layer = _make_shapes_layer(("cell_1", "cell_2"))
+    style_spec = ShapeColumnColorSourceSpec(
+        source_kind="shape_column",
+        value_key="group",
+        value_kind=stored_value_kind,
+    )
+
+    result = apply_shape_column_color_source_to_shapes_layer(
+        layer,
+        shapes_element=geodataframe,
+        style_spec=style_spec,
+        source_row_id_by_rendered_row=(0, 1),
+        source_shapes_index_feature_name="index",
+    )
+
+    assert result.value_kind == expected_value_kind
+
+
+def test_apply_shape_column_color_source_to_shapes_layer_rejects_a_column_that_cannot_color() -> None:
+    geodataframe = gpd.GeoDataFrame(
+        {"group": pd.Series([None, None], dtype="object")},
+        geometry=[_polygon(0), _polygon(2)],
+        index=["cell_1", "cell_2"],
+    )
+    layer = _make_shapes_layer(("cell_1", "cell_2"))
+    style_spec = ShapeColumnColorSourceSpec(
+        source_kind="shape_column",
+        value_key="group",
+        value_kind="categorical",
+    )
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        apply_shape_column_color_source_to_shapes_layer(
+            layer,
+            shapes_element=geodataframe,
+            style_spec=style_spec,
+            source_row_id_by_rendered_row=(0, 1),
+            source_shapes_index_feature_name="index",
+        )
 
 
 def test_apply_shape_column_color_source_to_shapes_layer_disambiguates_style_feature_from_source_index_feature() -> (
