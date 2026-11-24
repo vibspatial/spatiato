@@ -85,8 +85,11 @@ class LinkedTableColorSources:
     def from_table(cls, sdata: SpatialData, table_name: str) -> LinkedTableColorSources:
         """Return the color sources of the linked table `table_name`.
 
-        The colorable `obs` columns come from `get_table_obs_color_source_options(...)`,
-        and the matrices are listed by `get_table_var_layers(...)`.
+        The colorable `obs` columns come from
+        `get_table_obs_color_source_options(...)`: the instance key column, and
+        every other column except the region key for which
+        `classify_color_values(...)` does not return `None`. The matrices are
+        listed by `get_table_var_layers(...)`.
         """
         table = get_table(sdata, table_name)
         return cls(

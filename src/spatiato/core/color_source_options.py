@@ -15,9 +15,10 @@ if TYPE_CHECKING:
 def get_table_obs_color_source_options(sdata: SpatialData, table_name: str) -> list[TableColorSourceSpec]:
     """Return colorable `obs` columns for one linked table.
 
-    The instance key column is always offered: it colors each instance with
-    its own color, whatever its values. Every other column is offered when
-    `classify_color_values(...)` can classify it.
+    The region key column is never offered. The instance key column is always
+    offered: it colors each instance with its own color, whatever its values.
+    Every other column is offered when `classify_color_values(...)` does not
+    return `None` for it.
     """
     table = get_table(sdata, table_name)
     table_metadata = get_table_metadata(sdata, table_name)
