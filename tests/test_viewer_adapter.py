@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from matplotlib.colors import to_rgba
+from napari.components import ViewerModel
 from napari.layers import Image, Labels, Points, Shapes
 from napari.utils.colormaps import CyclicLabelColormap
 from shapely.geometry import LineString, Point, Polygon
@@ -333,6 +334,59 @@ def get_shapes_binding(adapter: ViewerAdapter, layer: Shapes | Points) -> Shapes
     return binding
 
 
+def record_membership_signals(adapter: ViewerAdapter) -> list[str]:
+    """Record each `labels_layers_changed` as "labels" and each `shapes_layers_changed` as "shapes"."""
+    events: list[str] = []
+    adapter.labels_layers_changed.connect(lambda: events.append("labels"))
+    adapter.shapes_layers_changed.connect(lambda: events.append("shapes"))
+    return events
+
+
+def make_membership_layer(element_type: str) -> Labels | Shapes:
+    if element_type == "labels":
+        return Labels(np.zeros((8, 8), dtype=np.int32), name="blobs_labels")
+    return make_shapes_layer()
+
+
+def register_membership_layer(
+    adapter: ViewerAdapter,
+    layer: Labels | Shapes,
+    *,
+    element_type: str,
+    role: str,
+    sdata: object | None,
+    coordinate_system: str | None = "global",
+) -> None:
+    """Register `layer` as a primary or styled labels or shapes layer."""
+    if element_type == "labels":
+        labels_style_spec = None
+        if role == "styled":
+            labels_style_spec = TableColorSourceSpec(
+                table_name="table", source_kind="obs_column", value_key="cell_type"
+            )
+        adapter.register_labels_layer(
+            layer,
+            sdata=sdata,
+            labels_name="blobs_labels",
+            coordinate_system=coordinate_system,
+            labels_role=role,
+            style_spec=labels_style_spec,
+        )
+        return
+
+    shapes_style_spec = None
+    if role == "styled":
+        shapes_style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    adapter.register_shapes_layer(
+        layer,
+        sdata=sdata,
+        shapes_name="cell_boundaries",
+        coordinate_system=coordinate_system,
+        shapes_role=role,
+        style_spec=shapes_style_spec,
+    )
+
+
 def test_app_state_initializes_viewer_services() -> None:
     viewer = DummyViewer()
 
@@ -368,6 +422,60 @@ def test_layer_binding_registry_registers_and_unregisters_layers() -> None:
 
     assert removed == binding
     assert registry.get_binding(layer) is None
+
+
+def test_layer_binding_registry_replace_binding_replaces_the_binding_of_a_registered_layer() -> None:
+    registry = LayerBindingRegistry()
+    layer = make_shapes_layer()
+    binding = registry.register_shapes_layer(
+        layer,
+        element_name="cell_boundaries",
+        coordinate_system="global",
+        shapes_role="styled",
+        style_spec=ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type"),
+    )
+    replacement = replace(binding, fill=True)
+
+    assert registry.replace_binding(replacement) is replacement
+    assert registry.get_binding(layer) is replacement
+    assert registry.iter_bindings() == (replacement,)
+
+
+def test_layer_binding_registry_replace_binding_rejects_a_layer_without_a_binding() -> None:
+    registry = LayerBindingRegistry()
+    binding = ShapesLayerBinding(layer=make_shapes_layer(), element_name="cell_boundaries", coordinate_system="global")
+
+    with pytest.raises(ValueError, match="no binding"):
+        registry.replace_binding(binding)
+
+    assert registry.iter_bindings() == ()
+
+
+@pytest.mark.parametrize(
+    ("shapes_role", "shapes_rendering_mode"),
+    [
+        pytest.param("primary", "shapes", id="primary"),
+        pytest.param("styled", "points", id="rendered-as-points"),
+    ],
+)
+def test_shapes_layer_binding_rejects_fill_unless_styled_and_rendered_as_shapes(
+    shapes_role: str,
+    shapes_rendering_mode: str,
+) -> None:
+    style_spec = None
+    if shapes_role == "styled":
+        style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    with pytest.raises(ValueError, match="fill"):
+        ShapesLayerBinding(
+            layer=make_shapes_layer(),
+            element_name="cell_boundaries",
+            coordinate_system="global",
+            shapes_role=shapes_role,
+            shapes_rendering_mode=shapes_rendering_mode,
+            style_spec=style_spec,
+            fill=True,
+        )
 
 
 def test_layer_binding_registry_tracks_channel_overlay_identity() -> None:
@@ -1842,6 +1950,164 @@ def test_viewer_adapter_remove_image_overlay_channel_fallback_unregisters_and_em
     assert adapter.layer_bindings.get_binding(layer) is None
 
 
+MEMBERSHIP_SIGNAL_CASES = (
+    pytest.param("labels", "primary", id="primary-labels"),
+    pytest.param("labels", "styled", id="styled-labels"),
+    pytest.param("shapes", "primary", id="primary-shapes"),
+    pytest.param("shapes", "styled", id="styled-shapes"),
+)
+
+
+@pytest.mark.parametrize(("element_type", "role"), MEMBERSHIP_SIGNAL_CASES)
+def test_viewer_adapter_membership_signal_emits_when_a_loaded_layer_is_registered(element_type: str, role: str) -> None:
+    layer = make_membership_layer(element_type)
+    viewer = DummyViewer([layer])
+    adapter = ViewerAdapter(viewer)
+    events = record_membership_signals(adapter)
+
+    register_membership_layer(adapter, layer, element_type=element_type, role=role, sdata=SimpleNamespace())
+
+    assert events == [element_type]
+
+
+@pytest.mark.parametrize(("element_type", "role"), MEMBERSHIP_SIGNAL_CASES)
+def test_viewer_adapter_membership_signal_emits_when_a_registered_layer_is_inserted(
+    element_type: str,
+    role: str,
+) -> None:
+    layer = make_membership_layer(element_type)
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    events = record_membership_signals(adapter)
+
+    register_membership_layer(adapter, layer, element_type=element_type, role=role, sdata=SimpleNamespace())
+    assert events == []
+
+    viewer.add_layer(layer)
+
+    assert events == [element_type]
+
+
+@pytest.mark.parametrize(("element_type", "role"), MEMBERSHIP_SIGNAL_CASES)
+def test_viewer_adapter_membership_signal_emits_after_napari_removes_a_registered_layer(
+    element_type: str,
+    role: str,
+) -> None:
+    layer = make_membership_layer(element_type)
+    viewer = DummyViewer([layer])
+    adapter = ViewerAdapter(viewer)
+    register_membership_layer(adapter, layer, element_type=element_type, role=role, sdata=SimpleNamespace())
+    events = record_membership_signals(adapter)
+    bindings_seen_on_signal: list[object] = []
+    signal = adapter.labels_layers_changed if element_type == "labels" else adapter.shapes_layers_changed
+    signal.connect(lambda: bindings_seen_on_signal.append(adapter.layer_bindings.get_binding(layer)))
+
+    viewer.layers.remove(layer)
+
+    assert events == [element_type]
+    # Consumers re-query the registry on the signal, so the binding must be gone by then.
+    assert bindings_seen_on_signal == [None]
+
+
+@pytest.mark.parametrize(("element_type", "role"), MEMBERSHIP_SIGNAL_CASES)
+def test_viewer_adapter_membership_signal_emits_when_layers_are_reordered(element_type: str, role: str) -> None:
+    layer = make_membership_layer(element_type)
+    viewer = DummyViewer([layer])
+    adapter = ViewerAdapter(viewer)
+    register_membership_layer(adapter, layer, element_type=element_type, role=role, sdata=SimpleNamespace())
+    events = record_membership_signals(adapter)
+
+    viewer.layers.events.reordered.emit()
+
+    assert events == [element_type]
+
+
+@pytest.mark.parametrize(("element_type", "role"), MEMBERSHIP_SIGNAL_CASES)
+def test_viewer_adapter_membership_signal_emits_when_a_removal_has_no_napari_event(
+    element_type: str,
+    role: str,
+) -> None:
+    layer = make_membership_layer(element_type)
+    viewer = SilentRemovalViewer([layer])
+    adapter = ViewerAdapter(viewer)
+    sdata = SimpleNamespace()
+    register_membership_layer(adapter, layer, element_type=element_type, role=role, sdata=sdata)
+    events = record_membership_signals(adapter)
+
+    removed_bindings = adapter.remove_layers_for_sdata(sdata)
+
+    assert [binding.layer for binding in removed_bindings] == [layer]
+    assert layer not in viewer.layers
+    assert events == [element_type]
+
+
+@pytest.mark.parametrize("element_type", ["labels", "shapes"])
+def test_viewer_adapter_membership_signal_emits_for_a_binding_without_a_coordinate_system(element_type: str) -> None:
+    layer = make_membership_layer(element_type)
+    viewer = DummyViewer([layer])
+    adapter = ViewerAdapter(viewer)
+    events = record_membership_signals(adapter)
+
+    register_membership_layer(
+        adapter,
+        layer,
+        element_type=element_type,
+        role="primary",
+        sdata=None,
+        coordinate_system=None,
+    )
+    viewer.layers.remove(layer)
+
+    assert events == [element_type, element_type]
+
+
+def test_viewer_adapter_membership_signals_ignore_image_and_unbound_layers() -> None:
+    image_layer = make_image_layer(name="blobs_image")
+    external_layer = make_shapes_layer(name="external")
+    viewer = DummyViewer([image_layer, external_layer])
+    adapter = ViewerAdapter(viewer)
+    events = record_membership_signals(adapter)
+
+    adapter.register_image_layer(
+        image_layer,
+        sdata=SimpleNamespace(),
+        image_name="blobs_image",
+        coordinate_system="global",
+        image_display_mode="stack",
+    )
+    viewer.layers.events.reordered.emit()
+    viewer.layers.remove(external_layer)
+
+    assert events == []
+
+
+def test_viewer_adapter_sync_primary_shapes_layer_binding_emits_shapes_layers_changed_only() -> None:
+    layer = make_shapes_layer()
+    viewer = DummyViewer([layer])
+    adapter = ViewerAdapter(viewer)
+    sdata = SimpleNamespace()
+    register_membership_layer(adapter, layer, element_type="shapes", role="primary", sdata=sdata)
+    previous_binding = adapter.layer_bindings.get_binding(layer)
+    registered_bindings: list[object] = []
+    adapter.primary_shapes_layer_registered.connect(registered_bindings.append)
+    events = record_membership_signals(adapter)
+
+    binding = adapter.sync_primary_shapes_layer_binding(
+        layer,
+        sdata=sdata,
+        shapes_name="cell_boundaries",
+        coordinate_system="global",
+        source_row_id_by_rendered_row=(0,),
+        source_shapes_index_feature_name="index",
+    )
+
+    # Card rows hold binding objects, so a new binding object must be announced.
+    assert binding is not previous_binding
+    assert adapter.layer_bindings.get_binding(layer) is binding
+    assert events == ["shapes"]
+    assert registered_bindings == []
+
+
 def test_viewer_adapter_ensure_styled_labels_loaded_creates_registered_overlay_with_stored_palette(sdata_blobs) -> None:
     table = sdata_blobs["table"]
     region_rows = table.obs.loc[table.obs["region"] == "blobs_labels"].copy()
@@ -1933,6 +2199,156 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_the_layer_after_its_c
     assert second.created is False
     assert second.layer is first.layer
     assert len(viewer.layers) == 1
+
+
+def test_viewer_adapter_get_loaded_styled_labels_layers_filters_by_style_spec(sdata_blobs) -> None:
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    instance_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+    var_spec = TableColorSourceSpec(table_name="table", source_kind="var", value_key="channel_0_sum")
+    instance_layer = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", instance_spec).layer
+    var_layer = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", var_spec).layer
+
+    assert adapter.get_loaded_styled_labels_layers(sdata_blobs, "blobs_labels", "global", style_spec=var_spec) == [
+        var_layer
+    ]
+    assert adapter.get_loaded_styled_labels_layers(sdata_blobs, "blobs_labels", "global") == [
+        instance_layer,
+        var_layer,
+    ]
+
+
+def test_viewer_adapter_remove_styled_labels_layer_removes_only_the_matching_variant(sdata_blobs) -> None:
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    instance_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+    var_spec = TableColorSourceSpec(table_name="table", source_kind="var", value_key="channel_0_sum")
+    primary_layer = adapter.ensure_labels_loaded(sdata_blobs, "blobs_labels", "global").layer
+    instance_layer = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", instance_spec).layer
+    var_layer = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", var_spec).layer
+    events = record_membership_signals(adapter)
+
+    removed_layer = adapter.remove_styled_labels_layer(sdata_blobs, "blobs_labels", "global", style_spec=var_spec)
+
+    assert removed_layer is var_layer
+    assert list(viewer.layers) == [primary_layer, instance_layer]
+    assert adapter.layer_bindings.get_binding(var_layer) is None
+    assert adapter.get_loaded_primary_labels_layer(sdata_blobs, "blobs_labels", "global") is primary_layer
+    assert adapter.get_loaded_styled_labels_layers(sdata_blobs, "blobs_labels", "global") == [instance_layer]
+    assert events == ["labels"]
+
+
+def test_viewer_adapter_remove_styled_labels_layer_returns_none_when_no_layer_matches(sdata_blobs) -> None:
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    primary_layer = adapter.ensure_labels_loaded(sdata_blobs, "blobs_labels", "global").layer
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+
+    removed_layer = adapter.remove_styled_labels_layer(sdata_blobs, "blobs_labels", "global", style_spec=style_spec)
+
+    assert removed_layer is None
+    assert list(viewer.layers) == [primary_layer]
+
+
+def test_viewer_adapter_remove_styled_labels_layer_rejects_two_layers_for_one_source(sdata_blobs) -> None:
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+    layers = [make_labels_layer(sdata=sdata_blobs), make_labels_layer(sdata=sdata_blobs)]
+    viewer = DummyViewer(layers)
+    adapter = ViewerAdapter(viewer)
+    for layer in layers:
+        adapter.register_labels_layer(
+            layer,
+            sdata=sdata_blobs,
+            labels_name="blobs_labels",
+            coordinate_system="global",
+            labels_role="styled",
+            style_spec=style_spec,
+        )
+
+    with pytest.raises(ValueError, match="multiple live styled layers"):
+        adapter.remove_styled_labels_layer(sdata_blobs, "blobs_labels", "global", style_spec=style_spec)
+
+    assert list(viewer.layers) == layers
+
+
+def test_viewer_adapter_ensure_styled_labels_loaded_leaves_no_layer_when_first_coloring_fails(sdata_blobs) -> None:
+    table = sdata_blobs["table"]
+    table.obs["empty"] = np.nan
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    events = record_membership_signals(adapter)
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="empty")
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+
+    assert list(viewer.layers) == []
+    assert adapter.layer_bindings.iter_bindings() == ()
+    assert events == []
+
+
+def test_viewer_adapter_ensure_styled_labels_loaded_removes_layer_if_registration_fails(
+    monkeypatch,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+
+    def fail_register(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(adapter, "register_labels_layer", fail_register)
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+
+    assert list(viewer.layers) == []
+    assert adapter.layer_bindings.iter_bindings() == ()
+
+
+def test_viewer_adapter_ensure_styled_labels_loaded_keeps_the_layer_when_a_restyle_fails(sdata_blobs) -> None:
+    table = sdata_blobs["table"]
+    table.obs["score"] = np.linspace(0.0, 1.0, table.n_obs)
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="score")
+    first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+    binding = adapter.layer_bindings.get_binding(first.layer)
+    table.obs["score"] = np.nan
+    events = record_membership_signals(adapter)
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+
+    assert list(viewer.layers) == [first.layer]
+    assert adapter.layer_bindings.get_binding(first.layer) is binding
+    assert events == []
+
+
+def test_viewer_adapter_styled_labels_layer_keeps_its_colors_when_added_to_a_napari_viewer(sdata_blobs) -> None:
+    """The layer is colored before it is added, so napari must keep its colormap and features."""
+    table = sdata_blobs["table"]
+    region_rows = table.obs.loc[table.obs["region"] == "blobs_labels"]
+    odd_instance = int(region_rows.loc[region_rows["instance_id"] % 2 == 1, "instance_id"].iloc[0])
+    even_instance = int(region_rows.loc[region_rows["instance_id"] % 2 == 0, "instance_id"].iloc[0])
+    table.obs["cell_type"] = pd.Categorical(
+        np.where(table.obs["instance_id"].to_numpy() % 2 == 0, "even", "odd"),
+        categories=["odd", "even"],
+    )
+    table.uns["cell_type_colors"] = ["#ff0000", "#00ff00"]
+    viewer = ViewerModel()
+    adapter = ViewerAdapter(viewer)
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="cell_type")
+
+    result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+
+    assert result.layer in viewer.layers
+    assert isinstance(result.layer.colormap, CompactLabelColormap)
+    assert np.allclose(result.layer.colormap.map(odd_instance), np.asarray(to_rgba("#ff0000"), dtype=np.float32))
+    assert np.allclose(result.layer.colormap.map(even_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
+    assert list(result.layer.features.columns) == ["index", "instance_id", "cell_type"]
 
 
 def test_viewer_adapter_ensure_styled_labels_loaded_updates_reused_variant_from_current_table(
@@ -3463,6 +3879,230 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_the_layer_after_its_c
     assert second.created is False
     assert second.layer is first.layer
     assert len(viewer.layers) == 1
+
+
+def test_viewer_adapter_get_loaded_styled_shapes_layers_filters_by_style_spec() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    cell_type_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    score_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="score")
+    cell_type_layer = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", cell_type_spec).layer
+    score_layer = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", score_spec).layer
+
+    assert adapter.get_loaded_styled_shapes_layers(sdata, "cell_boundaries", "global", style_spec=score_spec) == [
+        score_layer
+    ]
+    assert adapter.get_loaded_styled_shapes_layers(sdata, "cell_boundaries", "global") == [
+        cell_type_layer,
+        score_layer,
+    ]
+
+
+def test_viewer_adapter_remove_styled_shapes_layer_removes_only_the_matching_variant() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    cell_type_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    score_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="score")
+    primary_layer = adapter.ensure_shapes_loaded(sdata, "cell_boundaries", "global").layer
+    cell_type_layer = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", cell_type_spec).layer
+    score_layer = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", score_spec).layer
+    events = record_membership_signals(adapter)
+
+    removed_layer = adapter.remove_styled_shapes_layer(sdata, "cell_boundaries", "global", style_spec=score_spec)
+
+    assert removed_layer is score_layer
+    assert list(viewer.layers) == [primary_layer, cell_type_layer]
+    assert adapter.layer_bindings.get_binding(score_layer) is None
+    assert adapter.get_loaded_primary_shapes_layer(sdata, "cell_boundaries", "global") is primary_layer
+    assert adapter.get_loaded_styled_shapes_layers(sdata, "cell_boundaries", "global") == [cell_type_layer]
+    assert events == ["shapes"]
+
+
+def test_viewer_adapter_remove_styled_shapes_layer_returns_none_when_no_layer_matches() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    primary_layer = adapter.ensure_shapes_loaded(sdata, "cell_boundaries", "global").layer
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    removed_layer = adapter.remove_styled_shapes_layer(sdata, "cell_boundaries", "global", style_spec=style_spec)
+
+    assert removed_layer is None
+    assert list(viewer.layers) == [primary_layer]
+
+
+def test_viewer_adapter_remove_styled_shapes_layer_rejects_two_layers_for_one_source() -> None:
+    sdata = make_colorable_shapes_sdata()
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    layers = [make_shapes_layer(), make_shapes_layer()]
+    viewer = DummyViewer(layers)
+    adapter = ViewerAdapter(viewer)
+    for layer in layers:
+        adapter.register_shapes_layer(
+            layer,
+            sdata=sdata,
+            shapes_name="cell_boundaries",
+            coordinate_system="global",
+            shapes_role="styled",
+            style_spec=style_spec,
+        )
+
+    with pytest.raises(ValueError, match="multiple live styled layers"):
+        adapter.remove_styled_shapes_layer(sdata, "cell_boundaries", "global", style_spec=style_spec)
+
+    assert list(viewer.layers) == layers
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_records_fill_for_a_layer_rendered_as_shapes() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec, fill=True)
+
+    binding = get_shapes_binding(adapter, result.layer)
+    assert binding.shapes_rendering_mode == "shapes"
+    assert binding.fill is True
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_records_no_fill_for_a_point_radius_layer() -> None:
+    sdata = make_colorable_point_radius_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    # Fill has no effect on a `Points` layer, so the request is recorded as no fill.
+    result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec, fill=True)
+
+    binding = get_shapes_binding(adapter, result.layer)
+    assert binding.shapes_rendering_mode == "points"
+    assert binding.fill is False
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_replaces_the_binding_when_fill_changes() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
+    previous_binding = get_shapes_binding(adapter, first.layer)
+    events = record_membership_signals(adapter)
+
+    second = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec, fill=True)
+
+    binding = get_shapes_binding(adapter, second.layer)
+    assert second.layer is first.layer
+    assert binding is not previous_binding
+    # Every other field, including the rendered-row mapping, is kept.
+    assert binding == replace(previous_binding, fill=True)
+    assert events == ["shapes"]
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_keeps_the_binding_when_fill_is_unchanged() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec, fill=True)
+    previous_binding = get_shapes_binding(adapter, first.layer)
+    events = record_membership_signals(adapter)
+
+    second = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec, fill=True)
+
+    assert get_shapes_binding(adapter, second.layer) is previous_binding
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("make_sdata", "shapes_name"),
+    [
+        pytest.param(make_colorable_shapes_sdata, "cell_boundaries", id="rendered-as-shapes"),
+        pytest.param(make_colorable_point_radius_shapes_sdata, "cell_centroids", id="rendered-as-points"),
+    ],
+)
+def test_viewer_adapter_ensure_styled_shapes_loaded_leaves_no_layer_when_first_coloring_fails(
+    make_sdata: Callable[[], SimpleNamespace],
+    shapes_name: str,
+) -> None:
+    sdata = make_sdata()
+    sdata.shapes[shapes_name]["empty"] = [None, None]
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    events = record_membership_signals(adapter)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="empty")
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        adapter.ensure_styled_shapes_loaded(sdata, shapes_name, "global", style_spec)
+
+    assert list(viewer.layers) == []
+    assert adapter.layer_bindings.iter_bindings() == ()
+    assert events == []
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_leaves_no_layer_when_first_table_coloring_fails() -> None:
+    sdata = make_table_backed_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="missing")
+
+    with pytest.raises(ValueError):
+        adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
+
+    assert list(viewer.layers) == []
+    assert adapter.layer_bindings.iter_bindings() == ()
+
+
+def test_viewer_adapter_ensure_styled_shapes_loaded_keeps_the_layer_when_a_restyle_fails() -> None:
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="score")
+    first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
+    binding = get_shapes_binding(adapter, first.layer)
+    sdata.shapes["cell_boundaries"]["score"] = [None, None]
+    events = record_membership_signals(adapter)
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec, fill=True)
+
+    assert list(viewer.layers) == [first.layer]
+    # The failed restyle asked for another fill, but the binding is only replaced after coloring succeeds.
+    assert adapter.layer_bindings.get_binding(first.layer) is binding
+    assert events == []
+
+
+def test_viewer_adapter_styled_shapes_layer_keeps_its_colors_when_added_to_a_napari_viewer() -> None:
+    """The layer is colored before it is added, so napari must keep its colors and features."""
+    sdata = make_colorable_shapes_sdata()
+    viewer = ViewerModel()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec, fill=True)
+
+    assert result.layer in viewer.layers
+    np.testing.assert_allclose(result.layer.face_color[0], (*to_rgba("#ff0000")[:3], SHAPES_FACE_ALPHA))
+    np.testing.assert_allclose(result.layer.edge_color[1], (*to_rgba("#00ff00")[:3], 1.0))
+    assert result.layer.features["cell_type"].to_list() == ["T", "B"]
+
+
+def test_viewer_adapter_point_backed_styled_shapes_layer_keeps_its_colors_when_added_to_a_napari_viewer() -> None:
+    """The layer is colored before it is added, so napari must keep its colors and features."""
+    sdata = make_colorable_point_radius_shapes_sdata()
+    viewer = ViewerModel()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
+
+    assert isinstance(result.layer, Points)
+    assert result.layer in viewer.layers
+    np.testing.assert_allclose(result.layer.face_color[0], to_rgba("#ff0000"))
+    np.testing.assert_allclose(result.layer.border_color[1], to_rgba("#00ff00"))
+    assert result.layer.features["cell_type"].to_list() == ["T", "B"]
 
 
 def test_viewer_adapter_ensure_styled_shapes_loaded_creates_distinct_variants_for_different_style_specs() -> None:
