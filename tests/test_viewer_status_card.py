@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from spatiato.core._color_source import ShapeColumnColorSourceSpec, TableColorSourceSpec, TableColorValueKind
+from spatiato.core._color_source import ShapeColumnColorSourceSpec, TableColorSourceSpec
 from spatiato.widgets.viewer.status_card import (
     _ViewerStatusCardSpec,
     build_image_loaded_card_spec,
@@ -18,20 +18,16 @@ from spatiato.widgets.viewer.status_card import (
 )
 
 
-def _obs_source(value_key: str, *, value_kind: TableColorValueKind = "categorical") -> TableColorSourceSpec:
-    return TableColorSourceSpec(
-        table_name="table", source_kind="obs_column", value_key=value_key, value_kind=value_kind
-    )
+def _obs_source(value_key: str) -> TableColorSourceSpec:
+    return TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key=value_key)
 
 
 def _var_source(value_key: str, *, var_layer: str | None = None) -> TableColorSourceSpec:
-    return TableColorSourceSpec(
-        table_name="table", source_kind="var", value_key=value_key, value_kind="continuous", var_layer=var_layer
-    )
+    return TableColorSourceSpec(table_name="table", source_kind="var", value_key=value_key, var_layer=var_layer)
 
 
 def _shape_column_source(value_key: str) -> ShapeColumnColorSourceSpec:
-    return ShapeColumnColorSourceSpec(source_kind="shape_column", value_key=value_key, value_kind="categorical")
+    return ShapeColumnColorSourceSpec(source_kind="shape_column", value_key=value_key)
 
 
 def test_viewer_status_card_spec_rejects_invalid_kind() -> None:
@@ -171,7 +167,7 @@ def test_build_styled_labels_card_spec_uses_tooltip_for_shortened_names() -> Non
 def test_build_styled_labels_card_spec_reports_instance_coloring() -> None:
     request = SimpleNamespace(
         labels_name="blobs_labels",
-        selected_color_source=_obs_source("instance_id", value_kind="instance"),
+        selected_color_source=_obs_source("instance_id"),
     )
     result = SimpleNamespace(
         created=True,
@@ -305,7 +301,7 @@ def test_build_styled_shapes_card_spec_formats_table_var_source(var_layer: str |
 def test_build_styled_shapes_card_spec_reports_table_backed_instance_coloring() -> None:
     request = SimpleNamespace(
         shapes_name="blobs_circles",
-        selected_color_source=_obs_source("instance_id", value_kind="instance"),
+        selected_color_source=_obs_source("instance_id"),
     )
     result = SimpleNamespace(
         created=True,

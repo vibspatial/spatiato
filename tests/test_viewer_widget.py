@@ -1198,7 +1198,6 @@ def test_viewer_widget_labels_card_offers_the_vars_of_every_matrix(qtbot, sdata_
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
         var_layer="counts",
     )
     assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (counts): channel_1_sum"'
@@ -1256,17 +1255,9 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
     _patch_linked_tables(
         monkeypatch,
         lambda table_name: (
-            [
-                TableColorSourceSpec(
-                    table_name=table_name, source_kind="obs_column", value_key="cell_type", value_kind="categorical"
-                )
-            ]
+            [TableColorSourceSpec(table_name=table_name, source_kind="obs_column", value_key="cell_type")]
             if table_name == "table_a"
-            else [
-                TableColorSourceSpec(
-                    table_name=table_name, source_kind="var", value_key="GeneA", value_kind="continuous"
-                )
-            ]
+            else [TableColorSourceSpec(table_name=table_name, source_kind="var", value_key="GeneA")]
         ),
     )
 
@@ -1439,7 +1430,6 @@ def test_viewer_widget_selects_first_linked_table_when_event_creates_first_table
             table_name="new_table",
             source_kind="obs_column",
             value_key="cell_type",
-            value_kind="categorical",
         )
     ]
     widget.app_state.record_table_mutation(
@@ -1471,7 +1461,6 @@ def test_viewer_widget_preserves_labels_card_color_source_selection_after_event(
                 table_name="table",
                 source_kind="obs_column",
                 value_key="cell_type",
-                value_kind="categorical",
             )
         ]
     }
@@ -1500,7 +1489,6 @@ def test_viewer_widget_preserves_labels_card_color_source_selection_after_event(
             table_name="new_table",
             source_kind="obs_column",
             value_key="other_type",
-            value_kind="categorical",
         )
     ]
     widget.app_state.record_table_mutation(
@@ -1529,7 +1517,6 @@ def test_viewer_widget_refreshes_table_color_sources_when_user_class_is_created(
                 table_name="table",
                 source_kind="obs_column",
                 value_key="cell_type",
-                value_kind="categorical",
             )
         ]
     }
@@ -1557,7 +1544,6 @@ def test_viewer_widget_refreshes_table_color_sources_when_user_class_is_created(
             table_name="table",
             source_kind="obs_column",
             value_key="user_class",
-            value_kind="categorical",
         ),
     ]
 
@@ -1623,7 +1609,6 @@ def test_viewer_widget_ignores_classification_table_events_for_other_sdata(qtbot
                 table_name="table",
                 source_kind="obs_column",
                 value_key="cell_type",
-                value_kind="categorical",
             )
         ]
     }
@@ -1649,7 +1634,6 @@ def test_viewer_widget_ignores_classification_table_events_for_other_sdata(qtbot
             table_name="table",
             source_kind="obs_column",
             value_key="user_class",
-            value_kind="categorical",
         ),
     ]
 
@@ -2379,8 +2363,11 @@ def test_viewer_widget_styled_overlay_instance_key_uses_success_card(qtbot, sdat
     assert "Used instance colors." in widget.global_action_feedback_label.text()
     binding = widget.app_state.viewer_adapter.layer_bindings.get_binding(viewer.layers[0])
     assert binding is not None
-    assert binding.style_spec is not None
-    assert binding.style_spec.value_kind == "instance"
+    # The spec names the instance key column; the column's name alone makes it
+    # color instances.
+    assert binding.style_spec == TableColorSourceSpec(
+        table_name="table", source_kind="obs_column", value_key="instance_id"
+    )
 
 
 def test_viewer_widget_styled_overlay_invalid_palette_uses_warning_card(qtbot, sdata_blobs) -> None:
@@ -3422,7 +3409,6 @@ def test_viewer_widget_shapes_card_omits_shape_column_when_only_table_sources(qt
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     monkeypatch.setattr(
@@ -3476,7 +3462,6 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
                 table_name="table_a",
                 source_kind="obs_column",
                 value_key="cell_type",
-                value_kind="categorical",
             )
         ],
         "table_b": [
@@ -3484,7 +3469,6 @@ def test_viewer_widget_shapes_card_exposes_linked_table_sources(qtbot, monkeypat
                 table_name="table_b",
                 source_kind="var",
                 value_key="GeneA",
-                value_kind="continuous",
             )
         ],
     }
@@ -3551,7 +3535,7 @@ def test_viewer_widget_shapes_card_reads_the_selected_var_from_the_selected_laye
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
     sdata = _make_colorable_shapes_sdata(cell_type_colors=["red", "blue"])
-    var_source = TableColorSourceSpec(table_name="table", source_kind="var", value_key="GeneA", value_kind="continuous")
+    var_source = TableColorSourceSpec(table_name="table", source_kind="var", value_key="GeneA")
     monkeypatch.setattr(
         viewer_widget_module,
         "get_annotating_table_names",
@@ -3587,7 +3571,6 @@ def test_viewer_widget_add_update_shapes_with_table_source_dispatches_to_styled_
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     recorded_calls: list[tuple[object, str, str, TableColorSourceSpec, bool]] = []
     result_layer = object()
@@ -3672,7 +3655,6 @@ def test_viewer_widget_add_update_shapes_with_shape_column_dispatches_to_styled_
     assert request.selected_color_source == ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="score",
-        value_kind="continuous",
     )
     assert request.fill_shapes is True
 
@@ -3702,7 +3684,6 @@ def test_viewer_widget_add_update_styled_shapes_creates_and_updates_layer(qtbot)
     assert binding.style_spec == ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     np.testing.assert_allclose(layer.face_color[:, 3], np.zeros(len(layer.data)))
     _assert_action_feedback_card(widget, title="Styled Shapes Created", kind="success")
@@ -3845,7 +3826,6 @@ def test_viewer_widget_table_backed_styled_shapes_alignment_error_is_feedback(qt
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     def raise_alignment_error(*args: object, **kwargs: object) -> None:

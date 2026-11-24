@@ -464,7 +464,6 @@ def test_layer_binding_registry_tracks_shapes_role_and_style_spec() -> None:
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     binding = registry.register_shapes_layer(
@@ -502,7 +501,6 @@ def test_layer_binding_registry_tracks_table_backed_shapes_style_spec() -> None:
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     binding = registry.register_shapes_layer(
@@ -529,7 +527,6 @@ def test_shapes_layer_binding_rejects_invalid_role_style_spec_combinations() -> 
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     with pytest.raises(ValueError, match="Primary shapes bindings must not carry"):
@@ -556,7 +553,6 @@ def test_labels_layer_binding_rejects_invalid_role_style_spec_combinations() -> 
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     with pytest.raises(ValueError, match="Primary labels bindings must not carry"):
@@ -596,7 +592,6 @@ def test_layer_binding_registry_tracks_labels_role_and_style_spec() -> None:
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     binding = registry.register_labels_layer(
@@ -682,7 +677,6 @@ def test_viewer_adapter_primary_labels_lookup_ignores_styled_variants(sdata_blob
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     adapter.register_labels_layer(
@@ -1648,7 +1642,6 @@ def test_viewer_adapter_primary_labels_signal_ignores_styled_bindings(sdata_blob
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     adapter.primary_labels_layers_changed.connect(lambda: labels_events.append("changed"))
@@ -1864,7 +1857,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_creates_registered_overlay_w
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -1902,7 +1894,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdat
         table_name="table",
         source_kind="var",
         value_key="channel_0_sum",
-        value_kind="continuous",
     )
 
     first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -1912,6 +1903,35 @@ def test_viewer_adapter_ensure_styled_labels_loaded_reuses_matching_variant(sdat
     assert first.created is True
     assert second.created is False
     assert second.value_kind == "continuous"
+    assert len(viewer.layers) == 1
+
+
+def test_viewer_adapter_ensure_styled_labels_loaded_reuses_the_layer_after_its_column_changed_kind(
+    sdata_blobs,
+) -> None:
+    """A spec names the table column, not how it is colored.
+
+    The column is classified from its current values each time the layer is
+    colored, and the kind is reported in the load result. After the values
+    change kind, the same spec must still find the existing layer and recolor
+    it by the new kind. It must not create a second layer for the same column,
+    and it must not keep the old kind. Putting the value kind back in the spec
+    would break this.
+    """
+    table = sdata_blobs["table"]
+    table.obs["score"] = np.linspace(0.0, 1.0, table.n_obs)
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="score")
+
+    first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+    table.obs["score"] = pd.Categorical(np.where(table.obs["instance_id"].to_numpy() % 2 == 0, "even", "odd"))
+    second = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
+
+    assert first.value_kind == "continuous"
+    assert second.value_kind == "categorical"
+    assert second.created is False
+    assert second.layer is first.layer
     assert len(viewer.layers) == 1
 
 
@@ -1934,7 +1954,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_updates_reused_variant_from_
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     first = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -1966,13 +1985,11 @@ def test_viewer_adapter_ensure_styled_labels_loaded_creates_distinct_variants_fo
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     style_b = TableColorSourceSpec(
         table_name="table",
         source_kind="var",
         value_key="channel_0_sum",
-        value_kind="continuous",
     )
     viewer = DummyViewer()
     adapter = ViewerAdapter(viewer)
@@ -1998,7 +2015,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_invalid_palette_falls_back(s
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2021,7 +2037,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_bool_obs_categoricall
         table_name="table",
         source_kind="obs_column",
         value_key="is_even",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2053,7 +2068,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_binary_int_obs_catego
         table_name="table",
         source_kind="obs_column",
         value_key="binary_state",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2082,7 +2096,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_a_single_value_int_ob
         table_name="table",
         source_kind="obs_column",
         value_key="all_ones",
-        value_kind="continuous",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2105,7 +2118,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_non_binary_int_obs_co
         table_name="table",
         source_kind="obs_column",
         value_key="object_score",
-        value_kind="continuous",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2130,7 +2142,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_colors_instance_key_as_label
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2160,7 +2171,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_rejects_duplicate_instance_i
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="contains duplicate values within that region"):
@@ -2181,7 +2191,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_rejects_duplicates_after_num
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="after labels-specific numeric coercion"):
@@ -2203,7 +2212,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_coerces_string_obs_to_catego
         table_name="table",
         source_kind="obs_column",
         value_key="sample_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", style_spec)
@@ -2231,7 +2239,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_warns_for_high_cardinality_s
         table_name="table",
         source_kind="obs_column",
         value_key="cell_uuid",
-        value_kind="categorical",
     )
 
     warning_messages: list[str] = []
@@ -2267,7 +2274,6 @@ def test_viewer_adapter_ensure_styled_labels_loaded_names_a_var_layer_after_its_
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
         var_layer=var_layer,
     )
 
@@ -2284,7 +2290,6 @@ def test_viewer_adapter_keeps_one_styled_labels_layer_per_matrix_of_a_var(sdata_
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
     )
     counts_spec = replace(x_spec, var_layer="counts")
 
@@ -2864,7 +2869,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_registered_variant_w
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -2898,7 +2902,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_removes_layer_if_registratio
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     def fail_register(*args, **kwargs):
@@ -2921,7 +2924,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_point_backed_categor
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -2967,7 +2969,6 @@ def test_viewer_adapter_point_backed_shape_column_styling_keeps_data_driven_colo
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -2992,7 +2993,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_point_backed_continu
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="score",
-        value_kind="continuous",
     )
 
     first = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -3033,7 +3033,6 @@ def test_viewer_adapter_point_backed_shape_column_styling_disambiguates_index_fe
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -3053,7 +3052,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_table_backed_variant
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3088,7 +3086,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_point_backed_table_v
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -3133,7 +3130,6 @@ def test_viewer_adapter_point_backed_table_styling_keeps_data_driven_colors_afte
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -3159,7 +3155,6 @@ def test_viewer_adapter_point_backed_table_var_styling() -> None:
         table_name="table",
         source_kind="var",
         value_key="GeneA",
-        value_kind="continuous",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -3188,7 +3183,6 @@ def test_viewer_adapter_point_backed_table_instance_styling() -> None:
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_centroids", "global", style_spec)
@@ -3243,7 +3237,6 @@ def test_viewer_adapter_table_backed_shapes_uses_named_index_as_instance_key() -
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3294,7 +3287,6 @@ def test_viewer_adapter_table_backed_shapes_allows_duplicate_instance_index() ->
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3315,7 +3307,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_table_backed_variant_
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3340,7 +3331,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_updates_fill_alpha_on_existi
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3363,7 +3353,6 @@ def test_viewer_adapter_styled_shapes_layer_applies_edge_width_control_to_all_sh
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3379,7 +3368,6 @@ def test_viewer_adapter_styled_shapes_layer_keeps_palette_when_current_edge_colo
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3396,7 +3384,6 @@ def test_viewer_adapter_styled_shapes_status_includes_selected_shape_column() ->
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3414,7 +3401,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_coexists_with_primary_shapes
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     primary_layer = adapter.ensure_shapes_loaded(sdata, "cell_boundaries", "global").layer
@@ -3441,7 +3427,6 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_matching_variant() ->
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="score",
-        value_kind="continuous",
     )
 
     first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
@@ -3454,6 +3439,32 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_matching_variant() ->
     assert len(viewer.layers) == 1
 
 
+def test_viewer_adapter_ensure_styled_shapes_loaded_reuses_the_layer_after_its_column_changed_kind() -> None:
+    """A spec names the column, not how it is colored.
+
+    The column is classified from its current values each time the layer is
+    colored, and the kind is reported in the load result. After the values
+    change kind, the same spec must still find the existing layer and recolor
+    it by the new kind. It must not create a second layer for the same column,
+    and it must not keep the old kind. Putting the value kind back in the spec
+    would break this.
+    """
+    sdata = make_colorable_shapes_sdata()
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    style_spec = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="score")
+
+    first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
+    sdata.shapes["cell_boundaries"]["score"] = ["low", "high"]
+    second = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec)
+
+    assert first.value_kind == "continuous"
+    assert second.value_kind == "categorical"
+    assert second.created is False
+    assert second.layer is first.layer
+    assert len(viewer.layers) == 1
+
+
 def test_viewer_adapter_ensure_styled_shapes_loaded_creates_distinct_variants_for_different_style_specs() -> None:
     sdata = make_colorable_shapes_sdata()
     viewer = DummyViewer()
@@ -3461,12 +3472,10 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_distinct_variants_fo
     categorical_style = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     continuous_style = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="score",
-        value_kind="continuous",
     )
 
     first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", categorical_style)
@@ -3487,13 +3496,11 @@ def test_viewer_adapter_ensure_styled_shapes_loaded_creates_distinct_variants_fo
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     table_b_style = TableColorSourceSpec(
         table_name="table_b",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     first = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", table_a_style)
@@ -3517,7 +3524,6 @@ def test_viewer_adapter_remove_shapes_layer_removes_only_primary_shapes_layer() 
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     primary_layer = adapter.ensure_shapes_loaded(sdata, "cell_boundaries", "global").layer
     styled_layer = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec).layer
@@ -3537,7 +3543,6 @@ def test_viewer_adapter_remove_layers_outside_coordinate_system_removes_primary_
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     primary_layer = adapter.ensure_shapes_loaded(sdata, "cell_boundaries", "global").layer
     styled_layer = adapter.ensure_styled_shapes_loaded(sdata, "cell_boundaries", "global", style_spec).layer
