@@ -15,7 +15,7 @@ from spatiato.core.color_source_options import (
 )
 
 
-def test_get_table_obs_color_source_options_classifies_supported_columns(sdata_blobs: SpatialData) -> None:
+def test_get_table_obs_color_source_options_offers_supported_columns(sdata_blobs: SpatialData) -> None:
     table = sdata_blobs["table"]
     n_obs = table.n_obs
     repeated_values = ["a", "b"] * (n_obs // 2) + (["a"] if n_obs % 2 else [])
@@ -42,15 +42,18 @@ def test_get_table_obs_color_source_options_classifies_supported_columns(sdata_b
     option_by_key = {option.value_key: option for option in options}
 
     assert "region" not in option_by_key
-    assert option_by_key["instance_id"].value_kind == "instance"
-    assert option_by_key["cat_obs"].value_kind == "categorical"
-    assert option_by_key["bool_obs"].value_kind == "categorical"
-    assert option_by_key["binary_int_obs"].value_kind == "categorical"
-    assert option_by_key["int_obs"].value_kind == "continuous"
-    assert option_by_key["float_obs"].value_kind == "continuous"
-    assert option_by_key["string_obs"].value_kind == "categorical"
-    assert option_by_key["string_id_obs"].value_kind == "categorical"
-    assert option_by_key["cat_id_obs"].value_kind == "categorical"
+    for column_name in (
+        "instance_id",
+        "cat_obs",
+        "bool_obs",
+        "binary_int_obs",
+        "int_obs",
+        "float_obs",
+        "string_obs",
+        "string_id_obs",
+        "cat_id_obs",
+    ):
+        assert column_name in option_by_key
     assert "datetime_obs" not in option_by_key
     assert "object_obs" not in option_by_key
     assert option_by_key["cat_obs"].source_kind == "obs_column"
@@ -61,7 +64,9 @@ def test_get_table_obs_color_source_options_classifies_supported_columns(sdata_b
     assert option_by_key["instance_id"].identity == ("table", "obs_column", "instance_id")
 
 
-def test_get_table_obs_color_source_options_classifies_object_and_missing_columns(sdata_blobs: SpatialData) -> None:
+def test_get_table_obs_color_source_options_offers_object_and_missing_columns_that_classify(
+    sdata_blobs: SpatialData,
+) -> None:
     table = sdata_blobs["table"]
     n_obs = table.n_obs
     # A boolean or 0/1 column with missing values has `object` dtype in pandas.
@@ -87,9 +92,9 @@ def test_get_table_obs_color_source_options_classifies_object_and_missing_column
 
     option_by_key = {option.value_key: option for option in options}
 
-    assert option_by_key["object_bool_obs"].value_kind == "categorical"
-    assert option_by_key["object_binary_obs"].value_kind == "categorical"
-    assert option_by_key["all_missing_cat_obs"].value_kind == "categorical"
+    assert "object_bool_obs" in option_by_key
+    assert "object_binary_obs" in option_by_key
+    assert "all_missing_cat_obs" in option_by_key
     assert "all_missing_float_obs" not in option_by_key
     assert "mixed_obs" not in option_by_key
 
@@ -117,7 +122,7 @@ def test_get_table_var_layers_is_empty_for_a_table_without_any_matrix(sdata_blob
     assert get_table_var_layers(sdata_blobs, "table") == ()
 
 
-def test_get_shape_column_color_source_options_classifies_supported_columns() -> None:
+def test_get_shape_column_color_source_options_offers_supported_columns() -> None:
     geodataframe = gpd.GeoDataFrame(
         {
             "cat_shape": pd.Categorical(["a", "b", "a"]),
@@ -153,13 +158,16 @@ def test_get_shape_column_color_source_options_classifies_supported_columns() ->
     assert "all_missing" not in option_by_key
     assert "mixed_shape" not in option_by_key
     assert "object_shape" not in option_by_key
-    assert option_by_key["cat_shape"].value_kind == "categorical"
-    assert option_by_key["bool_shape"].value_kind == "categorical"
-    assert option_by_key["binary_int_shape"].value_kind == "categorical"
-    assert option_by_key["int_shape"].value_kind == "continuous"
-    assert option_by_key["float_shape"].value_kind == "continuous"
-    assert option_by_key["string_shape"].value_kind == "categorical"
-    assert option_by_key["radius"].value_kind == "continuous"
+    for column_name in (
+        "cat_shape",
+        "bool_shape",
+        "binary_int_shape",
+        "int_shape",
+        "float_shape",
+        "string_shape",
+        "radius",
+    ):
+        assert column_name in option_by_key
     assert option_by_key["cat_shape"].source_kind == "shape_column"
     assert option_by_key["cat_shape"].display_name == "cat_shape"
     assert option_by_key["cat_shape"].identity == ("shape_column", "cat_shape")

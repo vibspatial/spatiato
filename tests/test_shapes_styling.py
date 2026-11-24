@@ -115,7 +115,6 @@ def test_align_table_color_source_to_shapes_rows_allows_partial_coverage_and_dup
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -177,7 +176,6 @@ def test_align_table_color_source_to_shapes_rows_extracts_var_values_from_region
         table_name="table",
         source_kind="var",
         value_key="GeneB",
-        value_kind="continuous",
         var_layer=var_layer,
     )
 
@@ -214,7 +212,6 @@ def test_align_table_color_source_to_shapes_rows_preserves_instance_key_values_f
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -242,7 +239,6 @@ def test_align_table_color_source_to_shapes_rows_requires_table_to_annotate_shap
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="does not annotate shapes element"):
@@ -277,7 +273,6 @@ def test_align_table_color_source_to_shapes_rows_uses_named_index_as_shapes_inst
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -314,7 +309,6 @@ def test_align_table_color_source_to_shapes_rows_allows_duplicate_named_index_in
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -342,7 +336,6 @@ def test_align_table_color_source_to_shapes_rows_accepts_matching_instance_key_c
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -370,7 +363,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_instance_key_column_whe
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="both as a GeoDataFrame column and as the GeoDataFrame index name"):
@@ -391,7 +383,6 @@ def test_align_table_color_source_to_shapes_rows_requires_shapes_instance_identi
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="must use GeoDataFrame index"):
@@ -417,7 +408,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_missing_shapes_instance
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="contains missing values for source row"):
@@ -442,7 +432,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_missing_table_instance_
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="contains missing values for table row"):
@@ -475,7 +464,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_duplicate_table_instanc
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="contains duplicate values within that region"):
@@ -500,7 +488,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_table_instances_missing
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="are not present"):
@@ -526,7 +513,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_table_instances_missing
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="resolved shapes instance identities"):
@@ -551,7 +537,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_empty_selected_region()
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="no table rows annotate"):
@@ -576,7 +561,6 @@ def test_align_table_color_source_to_shapes_rows_tracks_unannotated_instance_ind
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     aligned = _align_table_color_source_to_shapes_rows(
@@ -605,7 +589,6 @@ def test_align_table_color_source_to_shapes_rows_rejects_unknown_source_row_id()
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     with pytest.raises(ValueError, match="Could not align rendered shapes back"):
@@ -641,7 +624,6 @@ def test_apply_table_color_source_to_shapes_layer_uses_table_categorical_palette
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -712,7 +694,6 @@ def test_apply_table_color_source_to_shapes_layer_colors_point_backed_shapes() -
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -766,7 +747,6 @@ def test_apply_table_color_source_to_shapes_layer_colors_string_instances_with_l
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -815,7 +795,6 @@ def test_apply_table_color_source_to_shapes_layer_uses_positive_integer_instance
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -865,7 +844,6 @@ def test_apply_table_color_source_to_shapes_layer_colors_sparse_var_continuously
         table_name="table",
         source_kind="var",
         value_key="GeneB",
-        value_kind="continuous",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -928,7 +906,6 @@ def test_apply_table_color_source_to_shapes_layer_draws_not_detected_var_zeros_t
         table_name="table",
         source_kind="var",
         value_key="GeneA",
-        value_kind="continuous",
     )
 
     apply_table_color_source_to_shapes_layer(
@@ -975,7 +952,6 @@ def test_apply_table_color_source_to_shapes_layer_coerces_string_obs_to_temporar
         table_name="table",
         source_kind="obs_column",
         value_key="free_text",
-        value_kind="categorical",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -1021,7 +997,6 @@ def test_apply_table_color_source_to_shapes_layer_colors_object_bool_and_binary_
         table_name="table",
         source_kind="obs_column",
         value_key="state",
-        value_kind="categorical",
     )
 
     result = apply_table_color_source_to_shapes_layer(
@@ -1068,7 +1043,6 @@ def test_apply_table_color_source_to_shapes_layer_rejects_an_obs_column_that_can
         table_name="table",
         source_kind="obs_column",
         value_key="unusable",
-        value_kind="continuous",
     )
 
     with pytest.raises(ValueError, match="cannot color a layer"):
@@ -1102,7 +1076,6 @@ def test_apply_table_color_source_to_shapes_layer_disambiguates_style_feature_fr
         table_name="table",
         source_kind="obs_column",
         value_key="instance_id",
-        value_kind="instance",
     )
 
     apply_table_color_source_to_shapes_layer(
@@ -1131,7 +1104,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_uses_stored_categorical
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1181,7 +1153,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_uses_continuous_colorma
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="score",
-        value_kind="continuous",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1218,7 +1189,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_can_fill_faces() -> Non
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="score",
-        value_kind="continuous",
     )
 
     apply_shape_column_color_source_to_shapes_layer(
@@ -1257,7 +1227,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_rejects_invalid_compani
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="group",
-        value_kind="categorical",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1296,7 +1265,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_uses_stored_palettes_fo
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="group",
-        value_kind="categorical",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1330,7 +1298,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_reports_missing_compani
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="group",
-        value_kind="categorical",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1359,7 +1326,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_treats_string_object_va
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="free_text",
-        value_kind="categorical",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1378,19 +1344,17 @@ def test_apply_shape_column_color_source_to_shapes_layer_treats_string_object_va
 
 
 @pytest.mark.parametrize(
-    ("values", "stored_value_kind", "expected_value_kind"),
+    ("values", "expected_value_kind"),
     [
-        (["alpha", "beta"], "continuous", "categorical"),
-        ([0.5, 2.5], "categorical", "continuous"),
+        (["alpha", "beta"], "categorical"),
+        ([0.5, 2.5], "continuous"),
     ],
 )
 def test_apply_shape_column_color_source_to_shapes_layer_classifies_the_current_column(
     values: list[object],
-    stored_value_kind: str,
     expected_value_kind: str,
 ) -> None:
-    # The spec's `value_kind` records what discovery saw when the layer was
-    # loaded; coloring classifies the column as it is now.
+    # The same spec colors a column by the kind its values have now.
     geodataframe = gpd.GeoDataFrame(
         {"group": values},
         geometry=[_polygon(0), _polygon(2)],
@@ -1400,7 +1364,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_classifies_the_current_
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="group",
-        value_kind=stored_value_kind,
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1424,7 +1387,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_rejects_a_column_that_c
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="group",
-        value_kind="categorical",
     )
 
     with pytest.raises(ValueError, match="cannot color a layer"):
@@ -1450,7 +1412,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_disambiguates_style_fea
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_id",
-        value_kind="categorical",
     )
 
     apply_shape_column_color_source_to_shapes_layer(
@@ -1476,7 +1437,6 @@ def test_apply_shape_column_color_source_to_shapes_layer_allows_duplicate_source
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="group",
-        value_kind="categorical",
     )
 
     result = apply_shape_column_color_source_to_shapes_layer(
@@ -1503,7 +1463,6 @@ def test_build_styled_shapes_layer_name_returns_stable_shape_column_variant_name
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     assert build_styled_shapes_layer_name("cell_boundaries", style_spec) == "cell_boundaries[column: cell_type]"
@@ -1514,19 +1473,16 @@ def test_build_styled_shapes_layer_name_returns_stable_table_variant_names() -> 
         table_name="table",
         source_kind="obs_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
     x_style = TableColorSourceSpec(
         table_name="table",
         source_kind="var",
         value_key="GeneA",
-        value_kind="continuous",
     )
     layer_style = TableColorSourceSpec(
         table_name="table",
         source_kind="var",
         value_key="GeneA",
-        value_kind="continuous",
         var_layer="counts",
     )
 

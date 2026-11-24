@@ -632,7 +632,6 @@ def test_shapes_annotation_widget_active_primary_shapes_candidate_rejects_incomp
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="label",
-        value_kind="categorical",
     )
 
     assert widget._active_primary_shapes_candidate(Image(np.zeros((2, 2)))) is None
@@ -849,7 +848,6 @@ def test_shapes_annotation_widget_active_registration_ignores_incompatible_prima
     style_spec = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="label",
-        value_kind="categorical",
     )
 
     styled_layer = Shapes([], ndim=2, name="blobs_polygons")

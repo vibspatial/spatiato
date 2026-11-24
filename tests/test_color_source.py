@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -18,24 +18,45 @@ def test_table_color_source_spec_rejects_invalid_source_kind() -> None:
             table_name="table",
             source_kind="layer",
             value_key="cell_type",
-            value_kind="categorical",
         )
 
 
-def test_table_color_source_spec_rejects_invalid_value_kind() -> None:
-    with pytest.raises(ValueError, match="Invalid table color value kind"):
-        TableColorSourceSpec(
-            table_name="table",
-            source_kind="obs_column",
-            value_key="cell_type",
-            value_kind="ordinal",
-        )
+@pytest.mark.parametrize("spec_class", [TableColorSourceSpec, ShapeColumnColorSourceSpec])
+def test_color_source_specs_do_not_take_a_value_kind(spec_class: type) -> None:
+    # A spec names the data; how it is colored is decided from the data.
+    assert "value_kind" not in {field.name for field in fields(spec_class)}
+
+
+def test_table_color_source_specs_are_equal_exactly_when_they_name_the_same_data() -> None:
+    source = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="cell_type")
+
+    assert source == TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="cell_type")
+    assert hash(source) == hash(
+        TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="cell_type")
+    )
+    assert source != replace(source, table_name="other_table")
+    assert source != replace(source, value_key="leiden")
+    assert source != TableColorSourceSpec(table_name="table", source_kind="var", value_key="cell_type")
+
+
+def test_table_and_shape_column_color_source_specs_are_never_equal() -> None:
+    table_source = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="cell_type")
+    shape_source = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    assert table_source != shape_source
+    assert len({table_source, shape_source}) == 2
+
+
+def test_shape_column_color_source_specs_are_equal_exactly_when_they_name_the_same_column() -> None:
+    source = ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+
+    assert source == ShapeColumnColorSourceSpec(source_kind="shape_column", value_key="cell_type")
+    assert source != replace(source, value_key="area")
+    assert source.identity == ("shape_column", "cell_type")
 
 
 def test_table_color_source_spec_reads_a_var_layer_only_for_a_var_source() -> None:
-    source = TableColorSourceSpec(
-        table_name="table", source_kind="var", value_key="GeneA", value_kind="continuous", var_layer="counts"
-    )
+    source = TableColorSourceSpec(table_name="table", source_kind="var", value_key="GeneA", var_layer="counts")
 
     assert source.identity == ("table", "var", "GeneA")
     assert replace(source, var_layer=None).identity == source.identity
@@ -47,7 +68,6 @@ def test_table_color_source_spec_reads_a_var_layer_only_for_a_var_source() -> No
             table_name="table",
             source_kind="obs_column",
             value_key="cell_type",
-            value_kind="categorical",
             var_layer="counts",
         )
     with pytest.raises(ValueError, match="`var_layer` must be a non-empty layer name"):
@@ -59,16 +79,6 @@ def test_shape_color_source_spec_rejects_invalid_source_kind() -> None:
         ShapeColumnColorSourceSpec(
             source_kind="obs_column",
             value_key="cell_type",
-            value_kind="categorical",
-        )
-
-
-def test_shape_color_source_spec_rejects_invalid_value_kind() -> None:
-    with pytest.raises(ValueError, match="Invalid shape color value kind"):
-        ShapeColumnColorSourceSpec(
-            source_kind="shape_column",
-            value_key="cell_type",
-            value_kind="instance",
         )
 
 
@@ -77,13 +87,11 @@ def test_explicit_shape_source_union_covers_shape_columns_and_table_sources() ->
         ShapeColumnColorSourceSpec(
             source_kind="shape_column",
             value_key="cell_type",
-            value_kind="categorical",
         ),
         TableColorSourceSpec(
             table_name="table",
             source_kind="obs_column",
             value_key="cell_type",
-            value_kind="categorical",
         ),
     ]
 

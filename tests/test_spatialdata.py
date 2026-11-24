@@ -159,7 +159,6 @@ def test_shape_color_source_spec_identity_and_display_name() -> None:
     source = ShapeColumnColorSourceSpec(
         source_kind="shape_column",
         value_key="cell_type",
-        value_kind="categorical",
     )
 
     assert source.identity == ("shape_column", "cell_type")

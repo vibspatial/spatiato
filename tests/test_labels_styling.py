@@ -46,12 +46,11 @@ def _style_blobs_labels(sdata: SpatialData, style_spec: TableColorSourceSpec) ->
     return layer, result
 
 
-def _obs_style_spec(column_name: str, value_kind: str, *, table_name: str = "table") -> TableColorSourceSpec:
+def _obs_style_spec(column_name: str, *, table_name: str = "table") -> TableColorSourceSpec:
     return TableColorSourceSpec(
         table_name=table_name,
         source_kind="obs_column",
         value_key=column_name,
-        value_kind=value_kind,
     )
 
 
@@ -59,7 +58,7 @@ def test_apply_table_color_source_to_labels_layer_colors_float_obs_continuously(
     table = sdata_blobs["table"]
     table.obs["score"] = pd.Series(np.linspace(0.0, 1.0, table.n_obs), index=table.obs.index, dtype="float64")
 
-    layer, result = _style_blobs_labels(sdata_blobs, _obs_style_spec("score", "continuous"))
+    layer, result = _style_blobs_labels(sdata_blobs, _obs_style_spec("score"))
 
     assert result.value_kind == "continuous"
     assert result.palette_source is None
@@ -85,7 +84,7 @@ def test_apply_table_color_source_to_labels_layer_classifies_the_full_column_not
         layer,
         sdata=sdata_blobs_multi_region,
         labels_name="blobs_labels",
-        style_spec=_obs_style_spec("state", "categorical", table_name="table_multi"),
+        style_spec=_obs_style_spec("state", table_name="table_multi"),
     )
 
     assert result.value_kind == "categorical"
@@ -112,7 +111,7 @@ def test_apply_table_color_source_to_labels_layer_colors_object_bool_and_binary_
     # The palette follows the categories `[False, True]` or `[0, 1]`.
     table.uns["state_colors"] = ["#ff0000", "#00ff00"]
 
-    layer, result = _style_blobs_labels(sdata_blobs, _obs_style_spec("state", "categorical"))
+    layer, result = _style_blobs_labels(sdata_blobs, _obs_style_spec("state"))
 
     assert result.value_kind == "categorical"
     assert result.palette_source == "stored"
@@ -139,7 +138,7 @@ def test_apply_table_color_source_to_labels_layer_rejects_an_obs_column_that_can
     table.obs["unusable"] = values
 
     with pytest.raises(ValueError, match="cannot color a layer"):
-        _style_blobs_labels(sdata_blobs, _obs_style_spec("unusable", "continuous"))
+        _style_blobs_labels(sdata_blobs, _obs_style_spec("unusable"))
 
 
 @pytest.mark.parametrize(("other_value", "zero_is_transparent"), [(5.0, True), (-1.0, False)])
@@ -164,7 +163,6 @@ def test_apply_table_color_source_to_labels_layer_draws_not_detected_var_zeros_t
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
     )
 
     layer, _ = _style_blobs_labels(sdata_blobs, style_spec)
@@ -189,7 +187,6 @@ def test_apply_table_color_source_to_labels_layer_colors_var_continuously(
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
     )
     # Reference: the same var from the fixture's in-memory `X`.
     expected_layer, _ = _style_blobs_labels(sdata_blobs, style_spec)

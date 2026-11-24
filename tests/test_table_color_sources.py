@@ -7,9 +7,7 @@ from spatialdata import SpatialData
 from spatiato.core._color_source import TableColorSourceSpec
 from spatiato.widgets.viewer._table_color_sources import ColorSourceKindEntry, LinkedTableColorSources
 
-_OBS_SOURCE = TableColorSourceSpec(
-    table_name="table", source_kind="obs_column", value_key="cell_type", value_kind="categorical"
-)
+_OBS_SOURCE = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="cell_type")
 _OBSERVATIONS_ENTRY = ColorSourceKindEntry(label="Observations", source_kind="obs_column")
 
 
@@ -47,9 +45,7 @@ def test_linked_table_color_sources_offer_the_vars_of_the_matrix_of_an_entry() -
 
     assert linked_table.sources_for(obs_entry) == [_OBS_SOURCE]
     assert linked_table.sources_for(counts_entry) == [
-        TableColorSourceSpec(
-            table_name="table", source_kind="var", value_key=var_name, value_kind="continuous", var_layer="counts"
-        )
+        TableColorSourceSpec(table_name="table", source_kind="var", value_key=var_name, var_layer="counts")
         for var_name in ("GeneA", "GeneB")
     ]
     assert [source.var_layer for source in linked_table.sources_for(x_entry)] == [None, None]
