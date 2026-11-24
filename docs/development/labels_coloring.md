@@ -7,8 +7,10 @@ drawing fast for large tables, and how a color change reaches the screen. It
 is an internal developer contract, not user documentation.
 
 Not covered here: how a table column is chosen and validated for coloring, how
-annotations are written to the table ([`classifier.md`](classifier.md),
-[`table_state.md`](table_state.md)), and hover/feature lookup on the layer.
+styled layers are loaded, restyled and removed
+([`styled_layers.md`](styled_layers.md)), how annotations are written to the
+table ([`classifier.md`](classifier.md), [`table_state.md`](table_state.md)),
+and hover/feature lookup on the layer.
 
 ## Terminology
 
