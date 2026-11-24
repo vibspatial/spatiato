@@ -99,7 +99,6 @@ def load_and_style_spatial_annotation_labels(
             table_name=table_name,
             source_kind="obs_column",
             value_key=column_name,
-            value_kind="categorical",
         ),
     )
     viewer_adapter.activate_layer(load_result.layer)

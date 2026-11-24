@@ -57,8 +57,8 @@ class LinkedTableColorSources:
     """The color sources one linked table offers to a card of the Viewer widget.
 
     Build it with `from_table(...)`. The `obs` side and the var side are held
-    differently on purpose. An `obs` column is a complete source: its value
-    kind is known from the column, and it reads no matrix. A var is only
+    differently on purpose. An `obs` column is a complete source: it reads no
+    matrix. A var is only
     complete once a matrix is chosen, through the selected "Vars" entry, so
     the vars are held as names, and `sources_for(...)` builds their sources.
 
@@ -85,7 +85,7 @@ class LinkedTableColorSources:
     def from_table(cls, sdata: SpatialData, table_name: str) -> LinkedTableColorSources:
         """Return the color sources of the linked table `table_name`.
 
-        The `obs` columns are classified by `get_table_obs_color_source_options(...)`,
+        The colorable `obs` columns come from `get_table_obs_color_source_options(...)`,
         and the matrices are listed by `get_table_var_layers(...)`.
         """
         table = get_table(sdata, table_name)
@@ -127,7 +127,6 @@ class LinkedTableColorSources:
                 table_name=self.table_name,
                 source_kind="var",
                 value_key=var_name,
-                value_kind="continuous",
                 var_layer=entry.var_layer,
             )
             for var_name in self.var_names
