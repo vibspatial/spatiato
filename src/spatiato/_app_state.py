@@ -308,6 +308,11 @@ class ShapesElementReloadedEvent:
     source: str = "shapes_annotation_widget"
 
 
+# Source of the coordinate-system change that `SpatiatoAppState.set_sdata(...)`
+# makes for a new SpatialData object. `sdata_changed` always follows it.
+SET_SDATA_COORDINATE_SYSTEM_SOURCE = "set_sdata"
+
+
 @dataclass(frozen=True)
 class CoordinateSystemChangedEvent:
     """Describe a shared active coordinate-system change for one viewer session."""
@@ -493,7 +498,7 @@ class SpatiatoAppState(QObject):
 
         self.sdata = sdata
         next_coordinate_system = self._resolve_coordinate_system_for_sdata(sdata, previous=old_coordinate_system)
-        self._update_coordinate_system_state(next_coordinate_system, source="set_sdata")
+        self._update_coordinate_system_state(next_coordinate_system, source=SET_SDATA_COORDINATE_SYSTEM_SOURCE)
         # Notify connected widgets/controllers that the loaded SpatialData changed
         # (controllers/widgets that listen via e.g. self._app_state.sdata_changed.connect(self._on_sdata_changed))
         self.sdata_changed.emit(sdata)
