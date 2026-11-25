@@ -21,6 +21,7 @@ from qtpy.QtWidgets import (
 )
 
 from spatiato._app_state import (
+    SET_SDATA_COORDINATE_SYSTEM_SOURCE,
     CoordinateSystemChangedEvent,
     ShapesElementReloadedEvent,
     ShapesElementWrittenEvent,
@@ -375,9 +376,15 @@ class ViewerWidget(QWidget):
             self._sync_coordinate_system_combo_selection(self._app_state.coordinate_system)
 
     def _on_app_state_coordinate_system_changed(self, event: CoordinateSystemChangedEvent) -> None:
-        """Refresh the combo and cards when the shared coordinate system changes."""
-        del event
+        """Refresh the combo and cards when the shared coordinate system changes.
+
+        A change made by `set_sdata(...)` only clears the action feedback:
+        `sdata_changed` follows it, and `refresh_from_sdata(...)` then
+        refreshes the combo and the cards once, for the new SpatialData object.
+        """
         self._clear_action_feedback()
+        if event.source == SET_SDATA_COORDINATE_SYSTEM_SOURCE:
+            return
         self._sync_coordinate_system_combo_selection(self._app_state.coordinate_system)
         self._refresh_coordinate_system_content()
 
@@ -397,8 +404,10 @@ class ViewerWidget(QWidget):
         if event.source == "object_classification_annotation" and event.change_kind == "updated":
             return
 
-        self._refresh_labels_card_linked_tables()
-        self._refresh_shapes_card_linked_tables()
+        # The labels and shapes cards share one discovery of each linked table.
+        discovered_tables: dict[str, LinkedTableColorSources] = {}
+        self._refresh_labels_card_linked_tables(discovered_tables)
+        self._refresh_shapes_card_linked_tables(discovered_tables)
 
     def _on_shapes_element_written(self, event: object) -> None:
         """Refresh the shapes section after same-session annotation writes."""
@@ -515,8 +524,10 @@ class ViewerWidget(QWidget):
             points_names=points_names,
         )
         self._rebuild_image_cards(sdata, image_names)
-        self._rebuild_labels_cards(sdata, labels_names)
-        self._rebuild_shapes_cards(sdata, shapes_names)
+        # The labels and shapes cards share one discovery of each linked table.
+        discovered_tables: dict[str, LinkedTableColorSources] = {}
+        self._rebuild_labels_cards(sdata, labels_names, discovered_tables)
+        self._rebuild_shapes_cards(sdata, shapes_names, discovered_tables)
         self._refresh_points_section(sdata, points_names)
         self._update_section_empty_states(image_names, labels_names, shapes_names, points_names)
 
@@ -538,7 +549,7 @@ class ViewerWidget(QWidget):
             shapes_names=shapes_names,
             points_names=points_names,
         )
-        self._rebuild_shapes_cards(sdata, shapes_names)
+        self._rebuild_shapes_cards(sdata, shapes_names, discovered_tables={})
         self.shapes_group.set_count(len(shapes_names))
         self.shapes_empty_label.setVisible(not shapes_names)
         self.shapes_section.setVisible(bool(shapes_names))
@@ -627,7 +638,12 @@ class ViewerWidget(QWidget):
             self._image_rows.append(row)
             self._refresh_image_card_membership(card)
 
-    def _rebuild_labels_cards(self, sdata: SpatialData, labels_names: list[str]) -> None:
+    def _rebuild_labels_cards(
+        self,
+        sdata: SpatialData,
+        labels_names: list[str],
+        discovered_tables: dict[str, LinkedTableColorSources],
+    ) -> None:
         _clear_layout(self.labels_section_layout)
         self._labels_cards = []
         self._labels_rows = []
@@ -637,7 +653,7 @@ class ViewerWidget(QWidget):
             table_names = get_annotating_table_names(sdata, labels_name)
             card = _LabelsCardWidget(
                 labels_name=labels_name,
-                linked_tables=_get_linked_tables(sdata, table_names),
+                linked_tables=_get_linked_tables(sdata, table_names, discovered_tables),
             )
             card.add_update_requested.connect(self._add_or_update_labels_layer)
             row = _DisclosureElementWidget(
@@ -657,25 +673,30 @@ class ViewerWidget(QWidget):
             self._labels_cards.append(card)
             self._labels_rows.append(row)
 
-    def _refresh_labels_card_linked_tables(self) -> None:
+    def _refresh_labels_card_linked_tables(self, discovered_tables: dict[str, LinkedTableColorSources]) -> None:
         sdata = self._app_state.sdata
         if sdata is None:
             return
 
         for card in self._labels_cards:
             table_names = get_annotating_table_names(sdata, card.labels_name)
-            card.set_linked_tables(_get_linked_tables(sdata, table_names))
+            card.set_linked_tables(_get_linked_tables(sdata, table_names, discovered_tables))
 
-    def _refresh_shapes_card_linked_tables(self) -> None:
+    def _refresh_shapes_card_linked_tables(self, discovered_tables: dict[str, LinkedTableColorSources]) -> None:
         sdata = self._app_state.sdata
         if sdata is None:
             return
 
         for card in self._shape_cards:
             table_names = get_annotating_table_names(sdata, card.shapes_name)
-            card.set_linked_tables(_get_linked_tables(sdata, table_names))
+            card.set_linked_tables(_get_linked_tables(sdata, table_names, discovered_tables))
 
-    def _rebuild_shapes_cards(self, sdata: SpatialData, shapes_names: list[str]) -> None:
+    def _rebuild_shapes_cards(
+        self,
+        sdata: SpatialData,
+        shapes_names: list[str],
+        discovered_tables: dict[str, LinkedTableColorSources],
+    ) -> None:
         _clear_layout(self.shapes_section_layout)
         self._shape_cards = []
         self._shape_rows = []
@@ -686,7 +707,7 @@ class ViewerWidget(QWidget):
             card = _ShapesCardWidget(
                 shapes_name=shapes_name,
                 shape_column_color_sources=get_shape_column_color_source_options(sdata, shapes_name),
-                linked_tables=_get_linked_tables(sdata, table_names),
+                linked_tables=_get_linked_tables(sdata, table_names, discovered_tables),
             )
             card.add_update_requested.connect(self._add_or_update_shapes_layer)
             row = _DisclosureElementWidget(
@@ -1680,9 +1701,38 @@ class ViewerWidget(QWidget):
             self.coordinate_system_combo.setCurrentIndex(index)
 
 
-def _get_linked_tables(sdata: SpatialData, table_names: list[str]) -> dict[str, LinkedTableColorSources]:
-    """Return the color sources of each linked table, by table name."""
-    return {table_name: LinkedTableColorSources.from_table(sdata, table_name) for table_name in table_names}
+def _get_linked_tables(
+    sdata: SpatialData,
+    table_names: list[str],
+    discovered_tables: dict[str, LinkedTableColorSources],
+) -> dict[str, LinkedTableColorSources]:
+    """Return the color sources of each table linked to one card, by table name.
+
+    Discovering a table's color sources classifies every `obs` column, which
+    is slow for a large table. One table often annotates several elements,
+    and each of their cards needs its sources. `discovered_tables` lets the
+    cards of one rebuild or refresh (one pass) share them: it holds the tables
+    discovered so far in the pass, and the tables discovered here are added
+    to it.
+
+    For example, take a table that annotates two sections in the same
+    coordinate system, `labels_section_1` and `labels_section_2`. It is
+    discovered once, for the `labels_section_1` card, and the
+    `labels_section_2` card gets the same object from `discovered_tables`.
+    Sections in different coordinate systems never share: the cards are built
+    only for the elements of the active coordinate system. The labels and
+    shapes cards of a pass share the dictionary, so a table that annotates
+    both labels and shapes elements is also discovered once.
+
+    Each pass starts with an empty dictionary, so it reads the tables as they
+    are then. The dictionary is not a cache kept between passes.
+    """
+    linked_tables: dict[str, LinkedTableColorSources] = {}
+    for table_name in table_names:
+        if table_name not in discovered_tables:
+            discovered_tables[table_name] = LinkedTableColorSources.from_table(sdata, table_name)
+        linked_tables[table_name] = discovered_tables[table_name]
+    return linked_tables
 
 
 def _clear_layout(layout: QLayout) -> None:

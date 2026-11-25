@@ -1212,7 +1212,7 @@ def test_viewer_widget_labels_card_offers_the_vars_of_every_matrix(qtbot, sdata_
 
     # A refresh of the linked tables keeps the matrix and the var.
     card.color_source_kind_combo.setCurrentIndex(4)
-    widget._refresh_labels_card_linked_tables()
+    widget._refresh_labels_card_linked_tables({})
     assert card.selected_kind_entry.var_layer == "raw"
     assert card.color_source_value_input.text() == "channel_1_sum"
     assert card.selected_color_source.var_layer == "raw"
@@ -1575,12 +1575,12 @@ def test_viewer_widget_skips_linked_table_refresh_for_updated_user_class_annotat
     monkeypatch.setattr(
         widget,
         "_refresh_labels_card_linked_tables",
-        lambda: refresh_calls.append("labels"),
+        lambda discovered_tables: refresh_calls.append("labels"),
     )
     monkeypatch.setattr(
         widget,
         "_refresh_shapes_card_linked_tables",
-        lambda: refresh_calls.append("shapes"),
+        lambda discovered_tables: refresh_calls.append("shapes"),
     )
     widget.app_state.table_state_changed.connect(emitted_events.append)
 
@@ -1646,6 +1646,85 @@ def test_viewer_widget_ignores_classification_table_events_for_other_sdata(qtbot
     )
 
     assert card._color_source_completer_model.stringList() == ["cell_type"]
+
+
+def test_viewer_widget_discovers_each_linked_table_once_per_pass(qtbot, monkeypatch) -> None:
+    """The labels and shapes cards of one rebuild or refresh share the color sources of each linked table.
+
+    A table is discovered once per pass, however many elements it annotates,
+    and every card linked to it holds the same object. The next pass discovers
+    the tables again.
+    """
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    fake_sdata = object()
+    table_names_by_element = {
+        "labels_a": ["table"],
+        "labels_b": ["table", "other_table"],
+        "shapes_a": ["table"],
+    }
+
+    qtbot.addWidget(widget)
+
+    _patch_coordinate_system_names(monkeypatch, ["global"])
+    monkeypatch.setattr(viewer_widget_module, "_get_images_in_coordinate_system", lambda sdata, coordinate_system: [])
+    monkeypatch.setattr(viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: [])
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "_get_labels_in_coordinate_system",
+        lambda sdata, coordinate_system: ["labels_a", "labels_b"],
+    )
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "_get_shapes_in_coordinate_system",
+        lambda sdata, coordinate_system: ["shapes_a"],
+    )
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "get_annotating_table_names",
+        lambda sdata, element_name: list(table_names_by_element[element_name]),
+    )
+    monkeypatch.setattr(viewer_widget_module, "get_shape_column_color_source_options", lambda sdata, shapes_name: [])
+    _patch_linked_tables(monkeypatch)
+    build_table_sources = LinkedTableColorSources.from_table
+    discovered_tables: list[str] = []
+
+    def count_discovery(sdata: object, table_name: str) -> LinkedTableColorSources:
+        discovered_tables.append(table_name)
+        return build_table_sources(sdata, table_name)
+
+    monkeypatch.setattr(LinkedTableColorSources, "from_table", staticmethod(count_discovery))
+
+    def assert_cards_share_table() -> LinkedTableColorSources:
+        labels_a, labels_b = widget.labels_cards
+        (shapes_a,) = widget.shape_cards
+        table_sources = labels_a._linked_tables["table"]
+        assert labels_b._linked_tables["table"] is table_sources
+        assert shapes_a._linked_tables["table"] is table_sources
+        return table_sources
+
+    # Building the cards.
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(fake_sdata)
+
+    assert sorted(discovered_tables) == ["other_table", "table"]
+    built_table_sources = assert_cards_share_table()
+
+    # Refreshing the labels and shapes cards after a table change.
+    discovered_tables.clear()
+    widget.app_state.record_table_mutation(_table_event(fake_sdata, TableComponentPath("obs", ("cell_type",))))
+
+    assert sorted(discovered_tables) == ["other_table", "table"]
+    refreshed_table_sources = assert_cards_share_table()
+    assert refreshed_table_sources is not built_table_sources
+
+    # Rebuilding only the shapes cards after a shapes write.
+    discovered_tables.clear()
+    widget.app_state.emit_shapes_element_written(
+        ShapesElementWrittenEvent(sdata=fake_sdata, shapes_name="shapes_a", coordinate_system="global")
+    )
+
+    assert discovered_tables == ["table"]
 
 
 @pytest.mark.parametrize(
@@ -2034,6 +2113,74 @@ def test_viewer_widget_refreshes_from_shared_coordinate_system_changes(qtbot, mo
     assert [card.image_name for card in widget.image_cards] == ["image_local"]
     assert [card.labels_name for card in widget.labels_cards] == ["labels_local"]
     assert [card.shapes_name for card in widget.shape_cards] == ["shape_local"]
+
+
+def test_viewer_widget_builds_the_cards_once_when_spatialdata_is_set(qtbot, monkeypatch) -> None:
+    """Setting a SpatialData object that changes the coordinate system rebuilds the cards once.
+
+    `set_sdata(...)` emits `coordinate_system_changed` and then
+    `sdata_changed`; the cards are rebuilt for the second. The coordinate
+    system change still clears the action feedback.
+    """
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    first_sdata = object()
+    second_sdata = object()
+    coordinate_systems_by_sdata = {first_sdata: ["global"], second_sdata: ["local"]}
+
+    qtbot.addWidget(widget)
+
+    def get_coordinate_systems(sdata: object) -> list[str]:
+        return list(coordinate_systems_by_sdata[sdata])
+
+    monkeypatch.setattr(viewer_widget_module, "get_coordinate_system_names_from_sdata", get_coordinate_systems)
+    monkeypatch.setattr(app_state_module, "get_coordinate_system_names_from_sdata", get_coordinate_systems)
+    monkeypatch.setattr(
+        viewer_widget_module,
+        "_get_labels_in_coordinate_system",
+        lambda sdata, coordinate_system: [f"labels_{coordinate_system}"],
+    )
+    monkeypatch.setattr(viewer_widget_module, "_get_images_in_coordinate_system", lambda sdata, coordinate_system: [])
+    monkeypatch.setattr(viewer_widget_module, "_get_shapes_in_coordinate_system", lambda sdata, coordinate_system: [])
+    monkeypatch.setattr(viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: [])
+    monkeypatch.setattr(viewer_widget_module, "get_annotating_table_names", lambda sdata, labels_name: [])
+    _patch_linked_tables(monkeypatch)
+    refresh_content = widget._refresh_coordinate_system_content
+    refreshed_coordinate_systems: list[str | None] = []
+
+    def count_refresh() -> None:
+        refreshed_coordinate_systems.append(widget.app_state.coordinate_system)
+        refresh_content()
+
+    monkeypatch.setattr(widget, "_refresh_coordinate_system_content", count_refresh)
+
+    # A first load.
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(first_sdata)
+
+    assert refreshed_coordinate_systems == ["global"]
+    assert widget.coordinate_system_combo.currentText() == "global"
+    assert [card.labels_name for card in widget.labels_cards] == ["labels_global"]
+
+    # Replacing the SpatialData object with one in another coordinate system.
+    widget._set_action_feedback(title="Labels Layer Created", lines=["Created."], kind="success")
+    refreshed_coordinate_systems.clear()
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(second_sdata, discard_current=True)
+
+    assert refreshed_coordinate_systems == ["local"]
+    assert widget.coordinate_system_combo.currentText() == "local"
+    assert [card.labels_name for card in widget.labels_cards] == ["labels_local"]
+    assert widget.global_action_feedback_label.isHidden()
+
+    # Clearing the SpatialData object.
+    refreshed_coordinate_systems.clear()
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(None, discard_current=True)
+
+    assert refreshed_coordinate_systems == []
+    assert widget.labels_cards == []
+    assert widget.coordinate_system_combo.count() == 0
 
 
 def test_viewer_widget_coordinate_system_switch_prunes_old_spatiato_layers(qtbot, monkeypatch) -> None:
