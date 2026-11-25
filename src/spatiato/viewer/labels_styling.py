@@ -20,13 +20,12 @@ from spatiato.core.class_palette import (
     resolve_table_categorical_palette,
     validate_categorical_palette_source,
 )
-from spatiato.core.color_source_options import has_exact_binary_zero_one_values
+from spatiato.core.color_value_classification import classify_color_values
 from spatiato.core.spatialdata import get_table, get_table_var_matrix, validate_table_binding
 from spatiato.core.table_matrix import read_matrix_column
 from spatiato.viewer._styling import (
     build_string_categorical_values,
     default_categorical_palette_for_categories,
-    is_string_like_series,
     normalize_category_value,
     zeros_mean_not_detected,
 )
@@ -85,14 +84,8 @@ def apply_table_color_source_to_labels_layer(
     table = get_table(sdata, style_spec.table_name)
     table_metadata = validate_table_binding(sdata, labels_name, style_spec.table_name)
     region_rows, obs_index = _get_region_rows_by_instance(table, table_metadata, labels_name)
-    if style_spec.value_kind == "instance" or (
-        style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key
-    ):
-        if style_spec.source_kind != "obs_column" or style_spec.value_key != table_metadata.instance_key:
-            raise ValueError(
-                "Instance ID coloring must use the table instance key "
-                f"`{table_metadata.instance_key}` as an observation source."
-            )
+    if style_spec.source_kind == "obs_column" and style_spec.value_key == table_metadata.instance_key:
+        # The instance key column colors each instance with its own color.
         style_result, features = _build_instance_key_colormap(region_rows, instance_key=table_metadata.instance_key)
         layer.colormap = label_colormap(background_value=0)
     elif style_spec.source_kind == "obs_column":
@@ -132,8 +125,16 @@ def _build_obs_column_colormap(
 
     full_series = table.obs[column_name]
     region_series = region_rows[column_name]
+    # Classify the full column, not the rows of this labels element, as discovery does.
+    classification = classify_color_values(full_series)
+    if classification is None:
+        raise ValueError(
+            f"Observation column `{column_name}` cannot color a layer: "
+            "it holds no values, or values of mixed or unsupported types."
+        )
+    encoding = classification.encoding
 
-    if _is_categorical_dtype(full_series):
+    if encoding == "pandas_categorical":
         categories = [normalize_category_value(value) for value in full_series.cat.categories]
         palette_source, palette = resolve_table_categorical_palette(
             table=table,
@@ -152,7 +153,7 @@ def _build_obs_column_colormap(
         )
         return style_result, colormap, pd.DataFrame({column_name: region_series}, index=region_rows.index)
 
-    if pd.api.types.is_bool_dtype(full_series):
+    if encoding == "boolean":
         categories = [value for value in (False, True) if value in set(full_series.dropna().tolist())]
         palette_source, palette = resolve_table_categorical_palette(
             table=table,
@@ -171,7 +172,7 @@ def _build_obs_column_colormap(
         )
         return style_result, colormap, pd.DataFrame({column_name: region_series}, index=region_rows.index)
 
-    if pd.api.types.is_integer_dtype(full_series) and has_exact_binary_zero_one_values(full_series.dropna().tolist()):
+    if encoding == "binary_integer":
         categories = [0, 1]
         numeric_region_series = pd.to_numeric(region_series, errors="coerce").astype("Int64")
         palette_source, palette = resolve_table_categorical_palette(
@@ -191,7 +192,7 @@ def _build_obs_column_colormap(
         )
         return style_result, colormap, pd.DataFrame({column_name: numeric_region_series}, index=region_rows.index)
 
-    if is_string_like_series(full_series):
+    if encoding == "string":
         string_region_values, categories = build_string_categorical_values(
             full_values=full_series,
             row_values=region_series,
@@ -325,7 +326,3 @@ def _format_instance_preview(instance_ids: list[Any]) -> str:
     if len(instance_ids) > 5:
         preview += ", ..."
     return preview
-
-
-def _is_categorical_dtype(values: pd.Series) -> bool:
-    return isinstance(values.dtype, pd.CategoricalDtype)

@@ -46,6 +46,101 @@ def _style_blobs_labels(sdata: SpatialData, style_spec: TableColorSourceSpec) ->
     return layer, result
 
 
+def _obs_style_spec(column_name: str, *, table_name: str = "table") -> TableColorSourceSpec:
+    return TableColorSourceSpec(
+        table_name=table_name,
+        source_kind="obs_column",
+        value_key=column_name,
+    )
+
+
+def test_apply_table_color_source_to_labels_layer_colors_float_obs_continuously(sdata_blobs: SpatialData) -> None:
+    table = sdata_blobs["table"]
+    table.obs["score"] = pd.Series(np.linspace(0.0, 1.0, table.n_obs), index=table.obs.index, dtype="float64")
+
+    layer, result = _style_blobs_labels(sdata_blobs, _obs_style_spec("score"))
+
+    assert result.value_kind == "continuous"
+    assert result.palette_source is None
+    assert result.coercion_applied is False
+    assert isinstance(layer.colormap, CompactLabelColormap)
+
+
+def test_apply_table_color_source_to_labels_layer_classifies_the_full_column_not_the_region_rows(
+    sdata_blobs_multi_region: SpatialData,
+) -> None:
+    # The rows of `blobs_labels` hold only 0s and those of `blobs_labels_2` only
+    # 1s. The full column is a 0/1 column, while the rows of `blobs_labels`
+    # alone would classify as continuous.
+    table = sdata_blobs_multi_region["table_multi"]
+    table.obs["state"] = pd.Series(
+        (table.obs["region"].astype(str) == "blobs_labels_2").to_numpy(dtype=np.int64),
+        index=table.obs.index,
+        dtype="int64",
+    )
+    layer = Labels(np.asarray(sdata_blobs_multi_region.labels["blobs_labels"]))
+
+    result = apply_table_color_source_to_labels_layer(
+        layer,
+        sdata=sdata_blobs_multi_region,
+        labels_name="blobs_labels",
+        style_spec=_obs_style_spec("state", table_name="table_multi"),
+    )
+
+    assert result.value_kind == "categorical"
+
+
+@pytest.mark.parametrize(("true_value", "false_value"), [(True, False), (1, 0)], ids=["bool", "binary"])
+def test_apply_table_color_source_to_labels_layer_colors_object_bool_and_binary_obs_categorically(
+    sdata_blobs: SpatialData,
+    true_value: object,
+    false_value: object,
+) -> None:
+    # A boolean or 0/1 column with missing values has `object` dtype in pandas.
+    table = sdata_blobs["table"]
+    instance_ids = table.obs["instance_id"].to_numpy(dtype=np.int64)
+    values: list[object] = []
+    for row, instance_id in enumerate(instance_ids):
+        if row == 0:
+            values.append(None)
+        elif instance_id % 2 == 0:
+            values.append(true_value)
+        else:
+            values.append(false_value)
+    table.obs["state"] = pd.Series(values, index=table.obs.index, dtype="object")
+    # The palette follows the categories `[False, True]` or `[0, 1]`.
+    table.uns["state_colors"] = ["#ff0000", "#00ff00"]
+
+    layer, result = _style_blobs_labels(sdata_blobs, _obs_style_spec("state"))
+
+    assert result.value_kind == "categorical"
+    assert result.palette_source == "stored"
+    true_instance = int(table.obs.loc[table.obs["state"] == true_value, "instance_id"].iloc[0])
+    false_instance = int(table.obs.loc[table.obs["state"] == false_value, "instance_id"].iloc[0])
+    assert np.allclose(layer.colormap.map(true_instance), np.asarray(to_rgba("#00ff00"), dtype=np.float32))
+    assert np.allclose(layer.colormap.map(false_instance), np.asarray(to_rgba("#ff0000"), dtype=np.float32))
+
+
+@pytest.mark.parametrize("column_kind", ["all_missing", "mixed"])
+def test_apply_table_color_source_to_labels_layer_rejects_an_obs_column_that_cannot_color(
+    sdata_blobs: SpatialData,
+    column_kind: str,
+) -> None:
+    table = sdata_blobs["table"]
+    if column_kind == "all_missing":
+        values = pd.Series(np.nan, index=table.obs.index, dtype="float64")
+    else:
+        values = pd.Series(
+            ["a" if row % 2 else row for row in range(table.n_obs)],
+            index=table.obs.index,
+            dtype="object",
+        )
+    table.obs["unusable"] = values
+
+    with pytest.raises(ValueError, match="cannot color a layer"):
+        _style_blobs_labels(sdata_blobs, _obs_style_spec("unusable"))
+
+
 @pytest.mark.parametrize(("other_value", "zero_is_transparent"), [(5.0, True), (-1.0, False)])
 def test_apply_table_color_source_to_labels_layer_draws_not_detected_var_zeros_transparent(
     sdata_blobs: SpatialData,
@@ -68,7 +163,6 @@ def test_apply_table_color_source_to_labels_layer_draws_not_detected_var_zeros_t
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
     )
 
     layer, _ = _style_blobs_labels(sdata_blobs, style_spec)
@@ -93,7 +187,6 @@ def test_apply_table_color_source_to_labels_layer_colors_var_continuously(
         table_name="table",
         source_kind="var",
         value_key="channel_1_sum",
-        value_kind="continuous",
     )
     # Reference: the same var from the fixture's in-memory `X`.
     expected_layer, _ = _style_blobs_labels(sdata_blobs, style_spec)

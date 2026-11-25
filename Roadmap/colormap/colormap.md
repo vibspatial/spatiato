@@ -38,14 +38,18 @@ This feature adds an interactive colorbar for continuous styled layers. The user
 
 ## Current Code Shape
 
-Continuous color source discovery is already explicit:
+Whether a source is colored continuously is decided when it is colored, not stored on the source:
 
-- `TableColorSourceSpec.value_kind == "continuous"`
-- `ShapeColumnColorSourceSpec.value_kind == "continuous"`
+- `TableColorSourceSpec` and `ShapeColumnColorSourceSpec` only name the data: the table, source kind, key and matrix, or the shapes column. They carry no value kind (see `Roadmap/auto_load_table_coloring/auto_color.md`, "Matching a loaded source").
+- The coloring code classifies a column from its current values with `classify_color_values(...)` in `src/spatiato/core/color_value_classification.py`. Vars are always colored as continuous.
+- The style result records the kind the coloring applied: `LabelsStyleResult.value_kind` and `ShapesStyleResult.value_kind` are `"continuous"` for a continuous layer. It is returned by `ensure_styled_labels_loaded(...)` / `ensure_styled_shapes_loaded(...)` and is not stored on the layer binding.
+
+A colorbar therefore decides from a loaded layer's style result whether the layer is continuous, not from its spec.
 
 Relevant files:
 
 - `src/spatiato/core/_color_source.py`
+- `src/spatiato/core/color_value_classification.py`
 - `src/spatiato/core/spatialdata.py`
 - `src/spatiato/viewer/_styling.py`
 - `src/spatiato/viewer/labels_styling.py`

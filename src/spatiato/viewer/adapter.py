@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
@@ -46,6 +46,7 @@ from spatiato.viewer.points_styling import (
 )
 from spatiato.viewer.shapes_styling import (
     ShapesLoadResult,
+    ShapesStyleResult,
     apply_shape_column_color_source_to_shapes_layer,
     apply_table_color_source_to_shapes_layer,
     build_styled_shapes_layer_name,
@@ -354,6 +355,11 @@ class ShapesLayerBinding(BaseLayerBinding):
         Number of source geometry rows that could not be rendered, for example
         empty, unsupported, or invalid geometries that could not be converted
         into renderable polygons or ellipses.
+    fill
+        Whether a styled layer fills its shapes with their colors, or only
+        colors their edges. Only a styled layer rendered as ``Shapes`` can
+        fill: fill has no effect on the ``Points`` layer of point-radius
+        shapes.
     """
 
     element_type: Literal["shapes"] = "shapes"
@@ -363,6 +369,7 @@ class ShapesLayerBinding(BaseLayerBinding):
     source_row_id_by_rendered_row: SourceRowIdByRenderedRow = ()
     source_shapes_index_feature_name: str = DEFAULT_SHAPES_INDEX_FEATURE_NAME
     skipped_geometry_count: int = 0
+    fill: bool = False
 
     def __post_init__(self) -> None:
         if self.shapes_rendering_mode not in ("shapes", "points"):
@@ -371,6 +378,8 @@ class ShapesLayerBinding(BaseLayerBinding):
             raise ValueError("Primary shapes bindings must not carry a style specification.")
         if self.shapes_role == "styled" and self.style_spec is None:
             raise ValueError("Styled shapes bindings require a style specification.")
+        if self.fill and (self.shapes_role != "styled" or self.shapes_rendering_mode != "shapes"):
+            raise ValueError("Only a styled shapes binding rendered as `Shapes` can have `fill=True`.")
 
 
 LayerBinding = (
@@ -647,6 +656,7 @@ class LayerBindingRegistry:
         source_row_id_by_rendered_row: SourceRowIdByRenderedRow = (),
         source_shapes_index_feature_name: str = DEFAULT_SHAPES_INDEX_FEATURE_NAME,
         skipped_geometry_count: int = 0,
+        fill: bool = False,
     ) -> ShapesLayerBinding:
         """Register a shapes layer binding."""
         binding = ShapesLayerBinding(
@@ -660,9 +670,26 @@ class LayerBindingRegistry:
             source_row_id_by_rendered_row=source_row_id_by_rendered_row,
             source_shapes_index_feature_name=source_shapes_index_feature_name,
             skipped_geometry_count=skipped_geometry_count,
+            fill=fill,
         )
         self._register_binding(binding)
         return binding
+
+    def replace_binding(self, binding: LayerBinding) -> LayerBinding:
+        """Replace the binding of the registered layer `binding.layer` with `binding`.
+
+        Bindings are frozen, so a changed binding is a new object, for example
+        one built with `dataclasses.replace(...)`. Use a `register_*_layer(...)`
+        method for a layer that has no binding yet.
+
+        Raises
+        ------
+        ValueError
+            If `binding.layer` has no binding.
+        """
+        if id(binding.layer) not in self._bindings:
+            raise ValueError("Cannot replace the binding of a layer that has no binding.")
+        return self._register_binding(binding)
 
     def _register_binding(self, binding: LayerBinding) -> LayerBinding:
         """Store a binding in the registry."""
@@ -785,6 +812,19 @@ class ViewerAdapter(QObject):
     changes such as visibility, colormap, or contrast limits; consumers that
     synchronize those properties subscribe directly to the corresponding
     napari layer events.
+
+    Labels and shapes membership lifecycle
+    --------------------------------------
+    ``labels_layers_changed`` and ``shapes_layers_changed`` are the same kind
+    of invalidation signal for labels and shapes layers, primary or styled.
+    They are emitted at the same points as ``image_layers_changed``. Every
+    labels or shapes binding counts, even one without a SpatialData object or
+    coordinate system: consumers filter on both when they re-query.
+
+    ``shapes_layers_changed`` is also emitted when the binding object of a
+    loaded shapes layer is replaced: by ``sync_primary_shapes_layer_binding(...)``,
+    and when a styled shapes layer is restyled with another ``fill``. Consumers
+    that keep binding objects must re-read them then.
     """
 
     # Emitted when the set/order of live primary Labels layers changes.
@@ -798,6 +838,11 @@ class ViewerAdapter(QObject):
     # Viewer and Histogram consumers should re-query current viewer membership;
     # the signal carries no payload to avoid stale binding data on removal.
     image_layers_changed = Signal()
+    # Emitted when the set/order of live labels layers (primary or styled) changes.
+    labels_layers_changed = Signal()
+    # Emitted when the set/order of live shapes layers (primary or styled)
+    # changes, or when the binding object of a loaded shapes layer is replaced.
+    shapes_layers_changed = Signal()
     active_layer_changed = Signal(object)
 
     def __init__(self, viewer: Any | None = None, layer_bindings: LayerBindingRegistry | None = None) -> None:
@@ -923,6 +968,7 @@ class ViewerAdapter(QObject):
         source_row_id_by_rendered_row: SourceRowIdByRenderedRow = (),
         source_shapes_index_feature_name: str = DEFAULT_SHAPES_INDEX_FEATURE_NAME,
         skipped_geometry_count: int = 0,
+        fill: bool = False,
     ) -> ShapesLayerBinding:
         """Register a shapes layer in the shared binding registry."""
         binding = self._layer_bindings.register_shapes_layer(
@@ -936,6 +982,7 @@ class ViewerAdapter(QObject):
             source_row_id_by_rendered_row=source_row_id_by_rendered_row,
             source_shapes_index_feature_name=source_shapes_index_feature_name,
             skipped_geometry_count=skipped_geometry_count,
+            fill=fill,
         )
         self._handle_registered_binding(binding)
         return binding
@@ -977,8 +1024,14 @@ class ViewerAdapter(QObject):
         source_row_id_by_rendered_row: SourceRowIdByRenderedRow,
         source_shapes_index_feature_name: str,
     ) -> ShapesLayerBinding:
-        """Refresh a loaded primary shapes layer binding without emitting a registration event."""
-        return self._layer_bindings.register_shapes_layer(
+        """Refresh a loaded primary shapes layer binding without emitting a registration event.
+
+        The layer gets a new binding object, so this emits ``shapes_layers_changed``
+        for consumers that keep binding objects. It does not emit
+        ``primary_shapes_layer_registered``, which the Annotation widget reacts
+        to as a new registration.
+        """
+        binding = self._layer_bindings.register_shapes_layer(
             layer,
             element_name=shapes_name,
             coordinate_system=coordinate_system,
@@ -988,14 +1041,23 @@ class ViewerAdapter(QObject):
             source_row_id_by_rendered_row=source_row_id_by_rendered_row,
             source_shapes_index_feature_name=source_shapes_index_feature_name,
         )
+        if self._is_layer_loaded_in_viewer(layer):
+            self.shapes_layers_changed.emit()
+        return binding
 
     def _handle_registered_binding(self, binding: LayerBinding) -> None:
-        if _is_primary_labels_binding(binding) and self._is_layer_loaded_in_viewer(binding.layer):
+        if not self._is_layer_loaded_in_viewer(binding.layer):
+            return
+        if _is_primary_labels_binding(binding):
             self.primary_labels_layers_changed.emit()
-        if _is_primary_shapes_binding(binding) and self._is_layer_loaded_in_viewer(binding.layer):
+        if _is_primary_shapes_binding(binding):
             self.primary_shapes_layer_registered.emit(binding)
-        if _is_usable_image_binding(binding) and self._is_layer_loaded_in_viewer(binding.layer):
+        if _is_usable_image_binding(binding):
             self.image_layers_changed.emit()
+        if _is_labels_binding(binding):
+            self.labels_layers_changed.emit()
+        if _is_shapes_binding(binding):
+            self.shapes_layers_changed.emit()
 
     def unregister_layer(self, layer: Layer) -> LayerBinding | None:
         """Remove a layer from the shared binding registry."""
@@ -1040,6 +1102,10 @@ class ViewerAdapter(QObject):
             self.primary_labels_layers_changed.emit()
         if _is_usable_image_binding(binding):
             self.image_layers_changed.emit()
+        if _is_labels_binding(binding):
+            self.labels_layers_changed.emit()
+        if _is_shapes_binding(binding):
+            self.shapes_layers_changed.emit()
 
     def _on_viewer_layer_removed(self, event: Any) -> None:
         """Unregister Spatiato-managed layers when they disappear from the viewer."""
@@ -1050,6 +1116,8 @@ class ViewerAdapter(QObject):
         binding = self._layer_bindings.get_binding(layer)
         had_primary_labels_semantics = _is_pickable_primary_labels_layer(layer, binding)
         had_usable_image_semantics = _is_usable_image_binding(binding)
+        had_labels_binding = _is_labels_binding(binding)
+        had_shapes_binding = _is_shapes_binding(binding)
         removed_binding = self.unregister_layer(layer)
         if removed_binding is None:
             logger.warning(
@@ -1059,6 +1127,10 @@ class ViewerAdapter(QObject):
             self.primary_labels_layers_changed.emit()
         if had_usable_image_semantics:
             self.image_layers_changed.emit()
+        if had_labels_binding:
+            self.labels_layers_changed.emit()
+        if had_shapes_binding:
+            self.shapes_layers_changed.emit()
 
     def _on_viewer_layers_reordered(self, event: Any) -> None:
         del event
@@ -1071,6 +1143,10 @@ class ViewerAdapter(QObject):
             _is_usable_image_binding(self._layer_bindings.get_binding(layer)) for layer in self._iter_candidate_layers()
         ):
             self.image_layers_changed.emit()
+        if any(_is_labels_binding(self._layer_bindings.get_binding(layer)) for layer in self._iter_candidate_layers()):
+            self.labels_layers_changed.emit()
+        if any(_is_shapes_binding(self._layer_bindings.get_binding(layer)) for layer in self._iter_candidate_layers()):
+            self.shapes_layers_changed.emit()
 
     def activate_layer(self, layer: Layer | None) -> bool:
         """Make a layer active in the viewer when supported."""
@@ -1154,8 +1230,13 @@ class ViewerAdapter(QObject):
         sdata: SpatialData,
         labels_name: str,
         coordinate_system: str | None = None,
+        *,
+        style_spec: TableColorSourceSpec | None = None,
     ) -> list[Labels]:
-        """Return all loaded styled labels layers for one labels element."""
+        """Return the loaded styled labels layers of one labels element, in viewer order.
+
+        With `style_spec`, return only the layers styled by that source.
+        """
         matches: list[Labels] = []
         for layer in self._iter_candidate_layers():
             if not _is_pickable_labels_layer(layer):
@@ -1168,6 +1249,7 @@ class ViewerAdapter(QObject):
                 element_name=labels_name,
                 coordinate_system=coordinate_system,
                 labels_role="styled",
+                style_spec=style_spec,
             ):
                 matches.append(layer)
 
@@ -1226,8 +1308,13 @@ class ViewerAdapter(QObject):
         sdata: SpatialData,
         shapes_name: str,
         coordinate_system: str | None = None,
+        *,
+        style_spec: ShapeColumnColorSourceSpec | TableColorSourceSpec | None = None,
     ) -> list[Shapes | Points]:
-        """Return all loaded styled shapes layers for one shapes element."""
+        """Return the loaded styled shapes layers of one shapes element, in viewer order.
+
+        With `style_spec`, return only the layers styled by that source.
+        """
         matches: list[Shapes | Points] = []
         for layer in self._iter_candidate_layers():
             if not _is_semantic_shapes_layer(layer):
@@ -1240,6 +1327,7 @@ class ViewerAdapter(QObject):
                 element_name=shapes_name,
                 coordinate_system=coordinate_system,
                 shapes_role="styled",
+                style_spec=style_spec,
             ):
                 matches.append(layer)
 
@@ -1453,7 +1541,15 @@ class ViewerAdapter(QObject):
         coordinate_system: str,
         style_spec: TableColorSourceSpec,
     ) -> LabelsLoadResult:
-        """Load or update one styled labels overlay variant."""
+        """Load or restyle the styled labels layer of one source.
+
+        An existing layer for `style_spec` is restyled from the current table
+        rather than returned unchanged. A new layer is colored before it is
+        added to the viewer and registered, so a source that cannot color
+        leaves no layer behind. An existing layer whose restyle fails keeps its
+        binding and its last colors.
+        """
+        layer_name = build_styled_labels_layer_name(labels_name, style_spec)
         existing_layer = self.get_loaded_styled_labels_layer(
             sdata,
             labels_name,
@@ -1462,34 +1558,34 @@ class ViewerAdapter(QObject):
         )
         created = existing_layer is None
         if existing_layer is None:
-            layer = _build_labels_layer(
-                sdata,
-                labels_name,
-                coordinate_system,
-                name=build_styled_labels_layer_name(labels_name, style_spec),
-            )
-            _add_layer_to_viewer(self._viewer, layer)
-            self.register_labels_layer(
-                layer,
-                sdata=sdata,
-                labels_name=labels_name,
-                coordinate_system=coordinate_system,
-                labels_role="styled",
-                style_spec=style_spec,
-            )
+            layer = _build_labels_layer(sdata, labels_name, coordinate_system, name=layer_name)
         else:
             layer = existing_layer
 
-        layer.name = build_styled_labels_layer_name(labels_name, style_spec)
-        # This method backs the viewer's "Add / Update in viewer" action:
-        # existing styled overlays are intentionally restyled from the current
-        # table state rather than returned unchanged.
         style_result = apply_table_color_source_to_labels_layer(
             layer,
             sdata=sdata,
             labels_name=labels_name,
             style_spec=style_spec,
         )
+        if created:
+            _add_layer_to_viewer(self._viewer, layer)
+            try:
+                self.register_labels_layer(
+                    layer,
+                    sdata=sdata,
+                    labels_name=labels_name,
+                    coordinate_system=coordinate_system,
+                    labels_role="styled",
+                    style_spec=style_spec,
+                )
+            except Exception:
+                # Remove the layer so a failed registration leaves no
+                # unregistered Spatiato-created layer in the viewer.
+                _remove_layer_after_failed_registration(self._viewer, layer)
+                raise
+
+        layer.name = layer_name
         return LabelsLoadResult(
             layer=layer,
             created=created,
@@ -1861,7 +1957,20 @@ class ViewerAdapter(QObject):
         *,
         fill: bool = False,
     ) -> ShapesLoadResult:
-        """Load or update one styled shapes layer variant."""
+        """Load or restyle the styled shapes layer of one source.
+
+        An existing layer for `style_spec` is restyled from the current data
+        rather than returned unchanged. A new layer is colored before it is
+        added to the viewer and registered, so a source that cannot color
+        leaves no layer behind. An existing layer whose restyle fails keeps its
+        binding and its last colors.
+
+        `fill` is recorded on the binding of a layer rendered as `Shapes`. A
+        point-radius layer rendered as `Points` records `False`, since fill has
+        no effect there. Restyling a layer with another `fill` replaces its
+        binding, which emits `shapes_layers_changed`.
+        """
+        layer_name = build_styled_shapes_layer_name(shapes_name, style_spec)
         existing_layer = self.get_loaded_styled_shapes_layer(
             sdata,
             shapes_name,
@@ -1874,10 +1983,22 @@ class ViewerAdapter(QObject):
                 sdata,
                 shapes_name,
                 coordinate_system,
-                name=build_styled_shapes_layer_name(shapes_name, style_spec),
+                name=layer_name,
                 sync_current_colors=False,
             )
             layer = built_layer.layer
+            binding_fill = fill and built_layer.shapes_rendering_mode == "shapes"
+            # The layer has no binding yet, so it is colored with the
+            # rendered-row mapping that the build returned.
+            style_result = _apply_styled_shapes_color_source(
+                layer,
+                sdata=sdata,
+                shapes_name=shapes_name,
+                style_spec=style_spec,
+                source_row_id_by_rendered_row=built_layer.source_row_id_by_rendered_row,
+                source_shapes_index_feature_name=built_layer.source_shapes_index_feature_name,
+                fill=binding_fill,
+            )
             _add_layer_to_viewer(self._viewer, layer)
             try:
                 binding = self.register_shapes_layer(
@@ -1891,6 +2012,7 @@ class ViewerAdapter(QObject):
                     source_row_id_by_rendered_row=built_layer.source_row_id_by_rendered_row,
                     source_shapes_index_feature_name=built_layer.source_shapes_index_feature_name,
                     skipped_geometry_count=built_layer.skipped_geometry_count,
+                    fill=binding_fill,
                 )
             except Exception:
                 # The layer is already visible in napari. Remove it so failed Spatiato
@@ -1903,33 +2025,24 @@ class ViewerAdapter(QObject):
             binding = self._layer_bindings.get_binding(layer)
             if not isinstance(binding, ShapesLayerBinding):
                 raise ValueError("Styled shapes layer is missing its Spatiato shapes binding.")
-
-        layer.name = build_styled_shapes_layer_name(shapes_name, style_spec)
-        if isinstance(style_spec, ShapeColumnColorSourceSpec):
-            shapes = getattr(sdata, "shapes", {})
-            if shapes_name not in shapes:
-                raise ValueError(f"Shapes element `{shapes_name}` is not available in the selected SpatialData object.")
-
-            style_result = apply_shape_column_color_source_to_shapes_layer(
-                layer,
-                shapes_element=shapes[shapes_name],
-                style_spec=style_spec,
-                source_row_id_by_rendered_row=binding.source_row_id_by_rendered_row,
-                source_shapes_index_feature_name=binding.source_shapes_index_feature_name,
-                fill=fill,
-            )
-        elif isinstance(style_spec, TableColorSourceSpec):
-            style_result = apply_table_color_source_to_shapes_layer(
+            binding_fill = fill and binding.shapes_rendering_mode == "shapes"
+            style_result = _apply_styled_shapes_color_source(
                 layer,
                 sdata=sdata,
                 shapes_name=shapes_name,
                 style_spec=style_spec,
                 source_row_id_by_rendered_row=binding.source_row_id_by_rendered_row,
                 source_shapes_index_feature_name=binding.source_shapes_index_feature_name,
-                fill=fill,
+                fill=binding_fill,
             )
-        else:
-            raise ValueError(f"Unsupported styled shapes color source spec: {style_spec!r}.")
+            # Replace the binding only after coloring succeeded, so it always
+            # records the fill the layer shows.
+            if binding.fill != binding_fill:
+                binding = replace(binding, fill=binding_fill)
+                self._layer_bindings.replace_binding(binding)
+                self._handle_registered_binding(binding)
+
+        layer.name = layer_name
         return ShapesLoadResult(
             layer=layer,
             created=created,
@@ -1948,6 +2061,36 @@ class ViewerAdapter(QObject):
         if layer is None:
             return None
 
+        self._remove_layer_from_viewer_and_registry(layer)
+        return layer
+
+    def remove_styled_labels_layer(
+        self,
+        sdata: SpatialData,
+        labels_name: str,
+        coordinate_system: str,
+        *,
+        style_spec: TableColorSourceSpec,
+    ) -> Labels | None:
+        """Remove the styled labels layer of one source, leaving the other labels layers.
+
+        Return `None` when no layer is loaded for `style_spec`.
+
+        Raises
+        ------
+        ValueError
+            If more than one live layer is styled by `style_spec`.
+        """
+        layers = self.get_loaded_styled_labels_layers(sdata, labels_name, coordinate_system, style_spec=style_spec)
+        if not layers:
+            return None
+        if len(layers) > 1:
+            raise ValueError(
+                f"Found multiple live styled layers for labels `{labels_name}`, "
+                f"coordinate system `{coordinate_system}`, and source `{style_spec.source_label}`."
+            )
+
+        layer = layers[0]
         self._remove_layer_from_viewer_and_registry(layer)
         return layer
 
@@ -2034,6 +2177,36 @@ class ViewerAdapter(QObject):
         self._remove_layer_from_viewer_and_registry(layer)
         return layer
 
+    def remove_styled_shapes_layer(
+        self,
+        sdata: SpatialData,
+        shapes_name: str,
+        coordinate_system: str,
+        *,
+        style_spec: ShapeColumnColorSourceSpec | TableColorSourceSpec,
+    ) -> Shapes | Points | None:
+        """Remove the styled shapes layer of one source, leaving the other shapes layers.
+
+        Return `None` when no layer is loaded for `style_spec`.
+
+        Raises
+        ------
+        ValueError
+            If more than one live layer is styled by `style_spec`.
+        """
+        layers = self.get_loaded_styled_shapes_layers(sdata, shapes_name, coordinate_system, style_spec=style_spec)
+        if not layers:
+            return None
+        if len(layers) > 1:
+            raise ValueError(
+                f"Found multiple live styled layers for shapes `{shapes_name}`, "
+                f"coordinate system `{coordinate_system}`, and source `{style_spec.source_label}`."
+            )
+
+        layer = layers[0]
+        self._remove_layer_from_viewer_and_registry(layer)
+        return layer
+
     def remove_layers_outside_coordinate_system(
         self,
         *,
@@ -2096,6 +2269,10 @@ class ViewerAdapter(QObject):
                 self.primary_labels_layers_changed.emit()
             if _is_usable_image_binding(binding):
                 self.image_layers_changed.emit()
+            if _is_labels_binding(binding):
+                self.labels_layers_changed.emit()
+            if _is_shapes_binding(binding):
+                self.shapes_layers_changed.emit()
 
     def _get_loaded_labels_layer_for_coordinate_system(
         self,
@@ -2431,6 +2608,47 @@ def _flatten_multiscale_element(element: DataTree) -> list[DataArray]:
         assert len(values) == 1
         multiscale_data.append(next(iter(values)))
     return multiscale_data
+
+
+def _apply_styled_shapes_color_source(
+    layer: Shapes | Points,
+    *,
+    sdata: SpatialData,
+    shapes_name: str,
+    style_spec: ShapeColumnColorSourceSpec | TableColorSourceSpec,
+    source_row_id_by_rendered_row: SourceRowIdByRenderedRow,
+    source_shapes_index_feature_name: str,
+    fill: bool,
+) -> ShapesStyleResult:
+    """Color one styled shapes layer from a shapes column or a linked table.
+
+    It uses only the layer and `sdata`, never the viewer or the binding
+    registry, so a new layer can be colored before it is added and registered.
+    """
+    if isinstance(style_spec, ShapeColumnColorSourceSpec):
+        shapes = getattr(sdata, "shapes", {})
+        if shapes_name not in shapes:
+            raise ValueError(f"Shapes element `{shapes_name}` is not available in the selected SpatialData object.")
+
+        return apply_shape_column_color_source_to_shapes_layer(
+            layer,
+            shapes_element=shapes[shapes_name],
+            style_spec=style_spec,
+            source_row_id_by_rendered_row=source_row_id_by_rendered_row,
+            source_shapes_index_feature_name=source_shapes_index_feature_name,
+            fill=fill,
+        )
+    if isinstance(style_spec, TableColorSourceSpec):
+        return apply_table_color_source_to_shapes_layer(
+            layer,
+            sdata=sdata,
+            shapes_name=shapes_name,
+            style_spec=style_spec,
+            source_row_id_by_rendered_row=source_row_id_by_rendered_row,
+            source_shapes_index_feature_name=source_shapes_index_feature_name,
+            fill=fill,
+        )
+    raise ValueError(f"Unsupported styled shapes color source spec: {style_spec!r}.")
 
 
 def _build_shapes_layer(

@@ -4998,7 +4998,7 @@ wheels = [
 
 [[package]]
 name = "spatiato"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "dask", extra = ["dataframe"], marker = "platform_machine == 'arm64' or sys_platform != 'darwin'" },
