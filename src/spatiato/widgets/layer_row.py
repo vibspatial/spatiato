@@ -82,6 +82,7 @@ class _LayerRow(QWidget):
         self.display_label = display_label
         self.accessibility_label = accessibility_label
         self._warning_message: str | None = None
+        self._controls: list[QWidget] = []
         self._disposed = False
         prefix = self._object_name_prefix
         self.setObjectName(f"{prefix}_row")
@@ -134,11 +135,18 @@ class _LayerRow(QWidget):
     def add_control(self, control: QWidget) -> None:
         """Add `control` to the row, between the label and the warning.
 
-        Controls are laid out in the order they are added. The row only lays
-        the control out: the owner or subclass that adds it connects its
-        signals.
+        Controls are laid out, and reached with the Tab key, in the order they
+        are added. The row only lays the control out: the owner or subclass
+        that adds it connects its signals.
         """
+        previous = self._controls[-1] if self._controls else self.visibility_button
         self._row_layout.insertWidget(self._row_layout.indexOf(self.warning_label), control)
+        # Qt orders Tab focus by when a widget became a child of the row, so a
+        # control added now would come after the remove button. Put it after the
+        # previous control, or the eye button, and before the remove button.
+        QWidget.setTabOrder(previous, control)
+        QWidget.setTabOrder(control, self.remove_button)
+        self._controls.append(control)
 
     def set_warning(self, message: str | None) -> None:
         """Show `message` as a warning icon with a tooltip, or remove the warning for `None`."""

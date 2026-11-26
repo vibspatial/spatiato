@@ -48,6 +48,7 @@ WIDGET_WARNING_HOVER_COLOR = "#4f402c"
 TOOLTIP_TEXT_COLOR = WIDGET_TEXT_COLOR
 DISCLOSURE_CHEVRON_SIZE = 14
 VISIBILITY_EYE_ICON_SIZE = 16
+WARNING_ICON_SIZE = 16
 HEADER_LOGO_WIDTH = 220
 LOGO_NAVY_COLOR = "#10244B"
 LOGO_DARK_SURFACE_COLOR = WIDGET_TEXT_COLOR
@@ -220,6 +221,32 @@ def create_visibility_eye_icon(*, visible: bool, color: str = WIDGET_TEXT_COLOR)
         painter.drawLine(QPointF(2.2, 2.2), QPointF(13.8, 13.8))
         painter.setPen(pen)
         painter.drawLine(QPointF(2.2, 2.2), QPointF(13.8, 13.8))
+
+    painter.end()
+    return QIcon(pixmap)
+
+
+def create_warning_icon(*, color: str = WIDGET_WARNING_TEXT_COLOR) -> QIcon:
+    """Return a compact warning triangle with an exclamation mark."""
+    pixmap = QPixmap(WARNING_ICON_SIZE, WARNING_ICON_SIZE)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.6)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+
+    triangle = QPainterPath()
+    triangle.moveTo(8.0, 1.8)
+    triangle.lineTo(14.6, 13.8)
+    triangle.lineTo(1.4, 13.8)
+    triangle.closeSubpath()
+    painter.drawPath(triangle)
+    painter.drawLine(QPointF(8.0, 6.0), QPointF(8.0, 9.2))
+    painter.drawPoint(QPointF(8.0, 11.5))
 
     painter.end()
     return QIcon(pixmap)

@@ -3,37 +3,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from qtpy.QtCore import QSignalBlocker, QSize, Qt, Signal
+from qtpy.QtCore import Signal
 from qtpy.QtGui import QColor
-from qtpy.QtWidgets import (
-    QHBoxLayout,
-    QPushButton,
-    QToolButton,
-    QWidget,
-)
+from qtpy.QtWidgets import QWidget
 
 from spatiato.viewer.adapter import ImageLayerBinding
 from spatiato.viewer.image_styling import DEFAULT_OVERLAY_COLORS
+from spatiato.widgets.layer_row import _LayerRow
 from spatiato.widgets.overlay_color_button import OverlayColorButton
-from spatiato.widgets.shared_styles import (
-    WIDGET_BORDER_COLOR,
-    WIDGET_PANEL_MUTED_COLOR,
-    WIDGET_TEXT_COLOR,
-    _ElidedLabel,
-    create_visibility_eye_icon,
-    format_tooltip,
-)
-
-_IMAGE_LAYER_VISIBILITY_BUTTON_STYLESHEET = (
-    "QToolButton {"
-    "background: transparent; "
-    "border: 1px solid transparent; "
-    "border-radius: 5px; "
-    "padding: 2px;}"
-    f"QToolButton:hover {{ background-color: {WIDGET_PANEL_MUTED_COLOR}; "
-    f"border-color: {WIDGET_BORDER_COLOR}; }}"
-    f"QToolButton:focus {{ border-color: {WIDGET_TEXT_COLOR}; }}"
-)
 
 
 @dataclass(frozen=True)
@@ -43,29 +20,18 @@ class _ImageColormapPresentation:
     solid_color: str | None
 
 
-class _ImageLayerRow(QWidget):
-    """Present one loaded image layer and bridge intent with live napari state.
+class _ImageLayerRow(_LayerRow):
+    """Present one loaded image layer, with a color button for its colormap.
 
-    A row keeps its construction-time binding for its entire lifetime. Its owner
-    must dispose this row and construct another one when the binding changes.
+    It follows the contract of `_LayerRow`, and adds color intent. The color
+    button emits ``color_change_requested``, and the owning Viewer or Histogram
+    widget, which binds its own channel, card, or image identity while
+    connecting the signal, validates the current live binding before assigning
+    ``layer.colormap``. napari then emits ``layer.events.colormap``, and every
+    row bound to that layer renders the accepted colormap.
 
-    User actions never mutate the layer directly. Identity-free visibility,
-    color, and removal intent returns to the owning Viewer or Histogram widget,
-    which binds its own channel, card, or image identity while connecting the
-    signals. The owner validates the current live binding before assigning
-    ``layer.visible`` or ``layer.colormap``, or requesting removal through
-    ``ViewerAdapter``.
-
-    A successful property assignment causes napari to emit
-    ``layer.events.visible`` or ``layer.events.colormap``. Every row bound to
-    that layer receives the native event, reads the accepted layer property, and
-    refreshes its presentation. Owners do not manually emit napari events or
-    render a requested value as though napari had already accepted it.
-
-    Explicit presentation refreshes are used for no-op or rejected assignments,
-    where no native property-change event may be emitted. Presentation updates
-    use ``QSignalBlocker`` where needed so reflecting napari state cannot emit
-    another user request.
+    The color button is the row's control, between the label and the remove
+    button. ``show_colormap=False`` hides it, for example for an RGB stack.
 
     ``ViewerWidget`` and ``HistogramWidget`` intentionally retain separate
     intent handlers. Although their visibility and colormap assignments are
@@ -75,9 +41,9 @@ class _ImageLayerRow(QWidget):
     shared mutation handler.
     """
 
-    remove_requested = Signal()
-    visibility_change_requested = Signal(bool)
     color_change_requested = Signal(str)
+    _object_name_prefix = "image_layer"
+    binding: ImageLayerBinding
 
     def __init__(
         self,
@@ -88,103 +54,40 @@ class _ImageLayerRow(QWidget):
         show_colormap: bool = True,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
-        self.binding = binding
-        self.display_label = display_label
-        self.accessibility_label = accessibility_label
+        super().__init__(
+            binding,
+            display_label=display_label,
+            accessibility_label=accessibility_label,
+            parent=parent,
+        )
         self._show_colormap = show_colormap
-        self._disposed = False
-        self.setObjectName("image_layer_row")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-
-        self.visibility_button = QToolButton(self)
-        self.visibility_button.setObjectName("image_layer_visibility_button")
-        self.visibility_button.setCheckable(True)
-        self.visibility_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.visibility_button.setFixedSize(28, 22)
-        self.visibility_button.setIconSize(QSize(16, 16))
-        self.visibility_button.setStyleSheet(_IMAGE_LAYER_VISIBILITY_BUTTON_STYLESHEET)
-
-        self.layer_label = _ElidedLabel(display_label, self)
-        self.layer_label.setObjectName("image_layer_label")
-        self.layer_label.setAccessibleName(accessibility_label)
 
         self.color_button = OverlayColorButton(DEFAULT_OVERLAY_COLORS[0], self)
         self.color_button.setObjectName("image_layer_color_button")
-        self.color_button.setVisible(self._show_colormap)
-
-        self.remove_button = QPushButton("×")
-        self.remove_button.setObjectName("image_layer_remove_button")
-        remove_message = f"Remove {accessibility_label} from viewer"
-        self.remove_button.setAccessibleName(remove_message)
-        self.remove_button.setToolTip(format_tooltip(remove_message))
-        self.remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.remove_button.setFixedWidth(28)
-        self.remove_button.clicked.connect(lambda _checked=False: self.remove_requested.emit())
-
-        self.visibility_button.toggled.connect(self._on_visibility_toggled)
+        self.color_button.setVisible(show_colormap)
         self.color_button.color_selected.connect(self._on_color_selected)
+        self.add_control(self.color_button)
 
-        layout.addWidget(self.visibility_button)
-        layout.addWidget(self.layer_label, 1)
-        layout.addWidget(self.color_button)
-        layout.addWidget(self.remove_button)
-        self._connect_presentation_events()
-        self.refresh_presentation()
+        if show_colormap:
+            binding.layer.events.colormap.connect(self._on_layer_colormap_changed)
+            self._sync_colormap_from_layer()
 
     def refresh_presentation(self) -> None:
         """Render visibility and colormap from the authoritative live layer."""
-        self._apply_visibility(self.binding.layer.visible)
+        super().refresh_presentation()
         if self._show_colormap:
             self._sync_colormap_from_layer()
 
-    def dispose(self) -> None:
-        """Idempotently disconnect this row from its napari layer."""
-        if self._disposed:
-            return
-        self._disposed = True
-        layer = self.binding.layer
-        try:
-            layer.events.visible.disconnect(self._on_layer_visible_changed)
-        except (TypeError, RuntimeError, ValueError):
-            pass
+    def _disconnect_layer_events(self) -> None:
+        super()._disconnect_layer_events()
         if self._show_colormap:
-            try:
-                layer.events.colormap.disconnect(self._on_layer_colormap_changed)
-            except (TypeError, RuntimeError, ValueError):
-                pass
-
-    def _connect_presentation_events(self) -> None:
-        layer = self.binding.layer
-        layer.events.visible.connect(self._on_layer_visible_changed)
-        if self._show_colormap:
-            layer.events.colormap.connect(self._on_layer_colormap_changed)
-
-    def _on_layer_visible_changed(self, _event: object) -> None:
-        self._apply_visibility(self.binding.layer.visible)
+            self._disconnect_layer_event(self.binding.layer.events.colormap, self._on_layer_colormap_changed)
 
     def _on_layer_colormap_changed(self, _event: object) -> None:
         self._sync_colormap_from_layer()
 
-    def _on_visibility_toggled(self, visible: bool) -> None:
-        self.visibility_change_requested.emit(visible)
-
     def _on_color_selected(self, color: str) -> None:
         self.color_change_requested.emit(color)
-
-    def _apply_visibility(self, visible: bool) -> None:
-        # Reflect napari state without turning this programmatic eye update into
-        # another owner visibility-change request.
-        with QSignalBlocker(self.visibility_button):
-            self.visibility_button.setChecked(visible)
-        self.visibility_button.setIcon(create_visibility_eye_icon(visible=visible))
-        action = "Hide" if visible else "Show"
-        message = f"{action} {self.accessibility_label}"
-        self.visibility_button.setAccessibleName(message)
-        self.visibility_button.setToolTip(format_tooltip(message))
 
     def _sync_colormap_from_layer(self) -> None:
         presentation = _colormap_presentation_from_layer(self.binding.layer)
