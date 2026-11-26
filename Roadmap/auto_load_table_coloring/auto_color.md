@@ -96,7 +96,7 @@ Relevant files:
 - The "No color source" entry is removed from the **Color source** combo. The primary layer has its own row (see below). The combo defaults to its first entry.
 - Accepting a value in the completer (completer activation or Enter on an exact match) sends one add intent. On success the input is cleared, as `finish_overlay_channel_add(...)` does for images.
 - Sources that are already loaded are left out of the completer, as loaded channels are for images.
-- The loaded list shows every styled layer of the element, across all linked tables and source kinds, in napari layer order. The row label is `style_spec.source_label` (`obs: leiden`, `vars (X): CD3`, `column: area`). When the element has more than one linked table, table-backed rows are prefixed with the table name.
+- The loaded list shows every styled layer of the element, across all linked tables and source kinds, in napari layer order. The row label is `style_spec.source_label` (`obs: leiden`, `vars (X): CD3`, `column: area`). When the element has more than one linked table, table-backed rows are prefixed with the table name and a middle dot: `table_multi · obs: leiden`.
 - The list reuses the image card's presentation: count label, "Remove all", scroll area capped at 10 visible rows, and an empty state ("No colored layers in viewer").
 - The **Add / Update in viewer** button and the action hint label are removed.
 
@@ -107,7 +107,7 @@ The primary labels layer is the shared surface that Object Classification and Sp
 Mirror the image card's Stack pattern:
 
 - no primary layer loaded: show a **Load in viewer** button;
-- primary layer loaded: show a row with eye toggle, the layer name and a remove button.
+- primary layer loaded: show a row with eye toggle, the element name (`labels_name` or `shapes_name`) and a remove button. The label is the element name, not the layer name: a row's label is set when the row is built, so a layer renamed in napari would leave a stale label.
 
 The row is the first form row of the card, labelled "Primary layer", above "Linked table". It is kept out of the loaded list of styled layers (see "Decisions"), and the card reconciles it from a separate `primary_binding`.
 
@@ -268,6 +268,22 @@ As implemented in phase 3:
 
    `rebuild_styled_shapes_layer(...)` in phase 8 follows the same order (see "Shapes geometry writes").
 
+6. **Every layer of one element.** `_get_live_labels_bindings(...)` (see "Viewer widget") splits the live layers of one labels element into the primary layer and the styled layers, in napari layer order, and raises `ValueError` for duplicates. For that it needs every labels layer of the element, of both roles. No existing lookup gives that:
+
+   - `get_loaded_primary_labels_layer(...)` returns only the first primary layer, so a duplicate primary layer cannot be detected;
+   - `get_loaded_styled_labels_layers(...)` returns only the styled layers;
+   - the adapter does not give widgets its viewer, and `LayerBindingRegistry.find_bindings(...)` follows registration order and can hold the binding of a layer that is not yet in the viewer.
+
+   Add
+
+   ```python
+   def get_loaded_labels_layers(
+       self, sdata, labels_name, coordinate_system=None
+   ) -> list[Labels]: ...
+   ```
+
+   It returns every registered labels layer of the element that is in the viewer, primary and styled, in viewer order, as `get_loaded_image_layers(...)` does for images. It is added in phase 5. Phase 7 adds `get_loaded_shapes_layers(...)` for the shapes card in the same way.
+
 ### Shared layer row
 
 Split today's `_ImageLayerRow` into a neutral base class and an image subclass (see "Decisions").
@@ -327,6 +343,13 @@ It follows `set_loaded_image_bindings(...)`: validate the whole snapshot first, 
 
 The loaded list (count label, "Remove all", scroll area capped at 10 rows, empty state, and the reconcile of styled rows) is built as a widget of its own, so the shapes card reuses it. The two cards already duplicate their color-source control logic; the loaded list should not be duplicated as well.
 
+The loaded list is `_StyledLayerList`, in a new module `src/spatiato/widgets/viewer/styled_layer_list.py`. It takes the image card's presentation without changing the image card's behavior:
+
+- the two stylesheets it shares with the image card, `_SUBSECTION_LABEL_STYLESHEET` and `_CHANNEL_PANEL_STYLESHEET` in `image_widget.py`, move to `src/spatiato/widgets/viewer/styles.py` as public constants, and `image_widget.py` imports them from there;
+- the list has its own row cap and scroll-height code, following `_set_channel_scroll_height(...)`. The image card keeps its own.
+
+The card and the loaded list have a `dispose()`, as `_ImageCardWidget` does, which disposes their rows so the rows disconnect from napari's layer events. Today `_rebuild_labels_cards(...)` and `_clear_cards(...)` in the Viewer widget only clear the layout. That is fine while labels cards hold no rows, but a deleted row would stay connected to its layer's `visible` event. The Viewer widget therefore disposes the labels cards before it clears them, in a `_dispose_labels_cards()` called from both places, as `_dispose_image_cards()` is for image cards.
+
 The loaded list also holds the "source no longer available" warnings, as a mapping from spec to message, and applies them every time it reconciles its styled rows. They are not stored on the rows: a row is rebuilt whenever its binding object changes, for example on a Fill replacement or a geometry rebuild, and a flag on the row would be lost. `ViewerWidget` sets and clears a warning through the card:
 
 ```python
@@ -361,7 +384,8 @@ The card no longer emits `ShapesLoadRequest`, and the type is deleted. As for la
 
 Mirror the image handlers:
 
-- `_get_live_labels_bindings(...)` / `_get_live_shapes_bindings(...)`: partition the live bindings of one element in the active `sdata` and coordinate system into the primary binding and the styled bindings, in viewer order. Raise `ValueError` for duplicates.
+- `_get_live_labels_bindings(...)` / `_get_live_shapes_bindings(...)`: partition the live bindings of one element in the active `sdata` and coordinate system into the primary binding and the styled bindings, in viewer order. Raise `ValueError` for duplicates. They read the layers through `get_loaded_labels_layers(...)` / `get_loaded_shapes_layers(...)` (see "Adapter changes", item 6).
+- `_dispose_labels_cards()` / `_dispose_shapes_cards()`: dispose the cards before `_rebuild_labels_cards(...)` / `_rebuild_shapes_cards(...)` and `_clear_cards(...)` clear them (see "Labels card").
 - `_refresh_labels_card_membership(card)` / `_refresh_shapes_card_membership(card)`: call the reconcile method, or report a card-scoped membership error.
 - Connect `labels_layers_changed` / `shapes_layers_changed` to refresh every labels / shapes card. Refresh each card once when it is built in `_rebuild_labels_cards(...)` / `_rebuild_shapes_cards(...)`.
 - Add handlers: when the source is already live, reconcile and activate its layer. Otherwise call `ensure_styled_labels_loaded(...)` / `ensure_styled_shapes_loaded(...)`, activate the new layer and show the existing status card (`build_styled_labels_card_spec(...)` / `build_styled_shapes_card_spec(...)`). When the load raises `ValueError`, show the error card as today. The adapter leaves no layer behind (see "Adapter changes", item 5), so no row appears and the source stays in the completer.
@@ -485,7 +509,7 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
 - **Refresh after table changes**: the Viewer restyles affected loaded layers automatically, scoped to the table changes that touch them, as described in "Refresh after table changes". Rows get no refresh button.
 - **Missing source**: when the table or column of a loaded layer disappears, the layer stays in the viewer as it is and its row shows a warning. The Viewer never removes it automatically.
 - **Failed first load**: a styled layer is colored before it is added to the viewer and registered. When coloring or registering a newly created layer fails, no layer is left, no row appears, and the Viewer shows the error card. A failed restyle of a loaded layer keeps the layer, as under "Missing source". This is part of phase 2b. See "Adapter changes", item 5.
-- **Row labels with several linked tables**: when an element has more than one linked table, table-backed rows are prefixed with the table name. Rows stay in one flat list in napari layer order; they are not grouped under table headings.
+- **Row labels with several linked tables**: when an element has more than one linked table, table-backed rows are prefixed with the table name and a middle dot, as in `table_multi · obs: leiden`. Rows stay in one flat list in napari layer order; they are not grouped under table headings.
 - **Shared row**: the generic part of `_ImageLayerRow` moves to `_LayerRow` in a new neutral module, `src/spatiato/widgets/layer_row.py`. `_ImageLayerRow` stays in `image_layer_row.py` as a subclass that adds the color button and colormap sync, together with the image channel and colormap helpers. It is not generalized in place, because labels and shapes rows would then sit in an image-named class with a color option that has to be off for them. It is not moved and renamed as a whole either, because the neutral module would then hold image colormap and channel code. See "Shared layer row".
 - **Primary row placement**: the primary layer has its own row at the top of the card, above "Linked table" and the other color-source controls. It is not part of the loaded list, because:
   - the list follows napari layer order, so the primary layer could not be pinned first without an exception;
@@ -494,6 +518,7 @@ If shapes loading feels too slow with immediate loading, a busy indicator on the
   - the image card keeps its Stack row in a container separate from the overlay list in the same way;
   - other widgets restyle (Object Classification, Spatial Query) or edit (Annotation) the primary layer, so it is a different kind of layer from the colored ones;
   - the list's scroll area could scroll it out of view.
+- **Primary row label**: the primary row shows the element name, not the layer name, because a row's label is set when the row is built and would go stale when the layer is renamed in napari. See "Primary layer row".
 - **Primary shapes binding sync**: `sync_primary_shapes_layer_binding(...)` emits `shapes_layers_changed`, so cards re-read the replaced binding object. It still does not emit `primary_shapes_layer_registered`. See "Adapter changes".
 - **Specs name the data**: `value_kind` is removed from `TableColorSourceSpec` and `ShapeColumnColorSourceSpec`, so a spec holds only the fields that name the data the user picked, and plain spec equality identifies a loaded layer, for the adapter and the cards alike. No coloring path reads `value_kind` after phase 1, and it can go out of date when the data changes. The style result does not identify a layer either: it describes how the layer was last colored, and it keeps its `value_kind`. `identity` keeps its role of preserving a selection across matrix switches. This is phase 2a. See "Matching a loaded source".
 - **Restyle spec**: a restyle after a table change, or a rebuild after a shapes write, uses the spec stored on the binding. Coloring reads the current data, and a source that is gone or can no longer color a layer raises and gets the row warning, so no freshly built source is looked up. See "Refresh after table changes".
@@ -525,9 +550,9 @@ Phases 1 to 4 change no card. Phases 2 and 4 still cover the parts shapes need, 
    2a comes first because it is mechanical and touches many test files, while 2b adds behavior. Kept apart, the 2b diff holds only new behavior, and its tests are written against specs without `value_kind`.
 3. **Discovery cost** (done): the vectorized `classify_color_values(...)`, with the same rules, and one `LinkedTableColorSources` per linked table per pass, shared by the labels and shapes cards of that pass, instead of one per card (see "Discovery cost"). It changes no card and no result: the existing classification and discovery tests pass unchanged. It is independent of the other phases, and comes before the cards so that the refreshes they add stay cheap.
 4. **Shared row** (done): add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it. Build and test the extra-control slot here, with a placeholder widget, although only shapes rows use it, so the row API does not change in phase 7.
-5. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh. Build the loaded list as a reusable widget so the shapes card can use it in phase 7, including its warning mapping and `set_styled_source_warning(...)`. Change the labels status-card builders to take the labels name and spec, and delete `LabelsLoadRequest`.
+5. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh. Build the loaded list as a reusable widget, `_StyledLayerList`, so the shapes card can use it in phase 7, including its warning mapping and `set_styled_source_warning(...)`. Add `get_loaded_labels_layers(...)` to the adapter ("Adapter changes", item 6), and dispose the labels cards before the Viewer widget clears them. Change the labels status-card builders to take the labels name and spec, and delete `LabelsLoadRequest`.
 6. **Table refresh**: scoped restyle on `table_state_changed` with the spec stored on the binding, and stale-source warnings.
-7. **Shapes card**: reuse the loaded list from phase 5, and add shapes-column sources and per-row Fill, shown only for layers rendered as `Shapes`. Change the shapes status-card builders to take the shapes name and spec, and delete `ShapesLoadRequest`.
+7. **Shapes card**: reuse the loaded list from phase 5, and add shapes-column sources and per-row Fill, shown only for layers rendered as `Shapes`. Add `get_loaded_shapes_layers(...)` to the adapter, and dispose the shapes cards before the Viewer widget clears them, as for labels. Change the shapes status-card builders to take the shapes name and spec, and delete `ShapesLoadRequest`.
 8. **Shapes geometry writes**: `rebuild_styled_shapes_layer(...)` in the adapter, and the rebuild of live styled shapes layers in `_on_shapes_element_written(...)` / `_on_shapes_element_reloaded(...)`. It is a separate slice because it fixes a gap that exists today, independent of the new card, but it ships in the same PR. It comes after phase 7, which provides the per-row Fill it relies on; the coloring-time classification comes from phase 1.
 
 `docs/development/styled_layers.md` describes the adapter contract as of phase 2b. Each of phases 5 to 8 updates it with what it adds:
@@ -537,7 +562,7 @@ Phases 1 to 4 change no card. Phases 2 and 4 still cover the parts shapes need, 
 - phase 7: the shapes card, and the per-row Fill checkbox as the source of the `fill` passed to a restyle;
 - phase 8: `rebuild_styled_shapes_layer(...)`, the rebuild after a geometry write, added to "Loading and restyling".
 
-Release phases 5 to 8 together. Between them, the labels card loads immediately while the shapes card still uses **Add / Update in viewer**. That is fine on the feature branch, but confusing in a release.
+Release phases 5 to 8 together. Between them, the labels card loads immediately while the shapes card still uses **Add / Update in viewer**. Between phases 5 and 6, a loaded styled labels layer is also not restyled after a table change, for example one colored by `user_class` while Object Classification annotates: **Add / Update** is gone, and its source is no longer in the completer. That is fine on the feature branch, but confusing in a release.
 
 ## Tests
 
@@ -577,6 +602,7 @@ Adapter (`tests/test_viewer_adapter.py`):
 - `remove_styled_*_layer(...)` removes only the matching variant and leaves siblings and the primary layer alone;
 - `remove_styled_*_layer(...)` returns `None` when no layer matches, and raises `ValueError` when two live layers match the same spec;
 - `get_loaded_styled_*_layers(..., style_spec=...)` returns only the layers for that spec, and every styled layer of the element without it;
+- `get_loaded_labels_layers(...)` and, in phase 7, `get_loaded_shapes_layers(...)` return the primary and styled layers of one element in viewer order, filtered by coordinate system when one is given, and leave out the layers of other elements and the bindings of layers that are not in the viewer;
 - loading the same source again after its column changed kind resolves to the existing styled layer and restyles it, without a second layer;
 - `X` and a layer for the same var stay separate layers;
 - the instance-key column is still colored as instances, decided by its name alone;
@@ -611,7 +637,9 @@ Viewer widget (`tests/test_viewer_widget.py`):
 - deleting a styled layer in napari removes its row;
 - reordering layers in napari reorders the rows;
 - "Remove all" removes only styled layers, not the primary layer;
-- the primary row switches between **Load in viewer** and a live row when the primary layer is added or removed, including from napari;
+- the primary row switches between **Load in viewer** and a live row when the primary layer is added or removed, including from napari, and the live row is labelled with the element name;
+- with more than one linked table, table-backed rows are prefixed with the table name (`table_multi · obs: leiden`); with one linked table they are not;
+- rebuilding the cards, for example on a coordinate-system change, and clearing them dispose their rows: changing the visibility of a layer afterwards reaches no deleted row;
 - an `obs` table update restyles a loaded layer colored by that column and leaves other layers alone;
 - a table rebuild that changes how a column is classified restyles the loaded layer in place: no second layer is created, and the colors follow the new kind;
 - a column that still exists but can no longer color a layer, for example one holding only missing values, gets the row warning: the restyle raises;
