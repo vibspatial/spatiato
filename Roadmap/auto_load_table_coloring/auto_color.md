@@ -290,6 +290,14 @@ Users of each row class:
 
 The color button must not move into `_LayerRow`. In the installed napari, `Shapes` and `Points` layers have no `colormap` event, so subscribing to it fails for shapes rows, and point-radius shapes are rendered as `Points`. `Labels` layers do have the event, but the colormap helpers detect solid colors in image colormaps and give no meaningful preview for a labels colormap.
 
+As implemented in phase 4:
+
+- **Warning state**: `set_warning(message)` shows a warning icon between the controls and the remove button, with the message as its tooltip and accessible name; `set_warning(None)` hides it. `warning_message` returns the current message. The label is not changed. The icon is painted by `create_warning_icon(...)` in `src/spatiato/widgets/shared_styles.py`, like the eye icon, so it does not depend on a font having a warning glyph.
+- **Extra controls**: `add_control(widget)` inserts a widget after the label and before the warning icon, in the order the controls are added. The owner connects the control's signals; the row only lays it out. `_ImageLayerRow` adds its color button this way, so the image row keeps its layout: eye, label, color button, remove button.
+- **Tab order**: Qt orders Tab focus by when a widget became a child of the row, and a control is added after the remove button. `add_control(...)` therefore also sets the Tab order with `QWidget.setTabOrder(...)`: eye button, controls in the order they were added, remove button. Without it, the image row's Tab order became eye, remove button, color button.
+- **Object names**: the row and its widgets are named from a per-class prefix, `_object_name_prefix`: `layer_row`, `layer_visibility_button`, `layer_label`, `layer_warning_label` and `layer_remove_button` for `_LayerRow`. `_ImageLayerRow` sets `"image_layer"` and keeps its earlier names.
+- **Construction**: `_LayerRow.__init__(...)` connects and renders only the visibility state, and never calls a method a subclass overrides, because the subclass has not built its own widgets yet. `_ImageLayerRow` builds its color button, connects `layer.events.colormap` and renders the colormap after `super().__init__(...)`. `dispose()` stays in `_LayerRow`, idempotent; a subclass extends `_disconnect_layer_events()` to disconnect its own events.
+
 ### Labels card (`src/spatiato/widgets/viewer/labels_widget.py`)
 
 Replace `add_update_requested` with focused intents, following `_ImageCardWidget`:
@@ -516,7 +524,7 @@ Phases 1 to 4 change no card. Phases 2 and 4 still cover the parts shapes need, 
 
    2a comes first because it is mechanical and touches many test files, while 2b adds behavior. Kept apart, the 2b diff holds only new behavior, and its tests are written against specs without `value_kind`.
 3. **Discovery cost** (done): the vectorized `classify_color_values(...)`, with the same rules, and one `LinkedTableColorSources` per linked table per pass, shared by the labels and shapes cards of that pass, instead of one per card (see "Discovery cost"). It changes no card and no result: the existing classification and discovery tests pass unchanged. It is independent of the other phases, and comes before the cards so that the refreshes they add stay cheap.
-4. **Shared row**: add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it. Build and test the extra-control slot here, with a placeholder widget, although only shapes rows use it, so the row API does not change in phase 7.
+4. **Shared row** (done): add `_LayerRow` in `src/spatiato/widgets/layer_row.py` and make `_ImageLayerRow` a subclass of it. Build and test the extra-control slot here, with a placeholder widget, although only shapes rows use it, so the row API does not change in phase 7.
 5. **Labels card**: primary row, completer-driven add, loaded list, reconcile method, and the `ViewerWidget` handlers and membership refresh. Build the loaded list as a reusable widget so the shapes card can use it in phase 7, including its warning mapping and `set_styled_source_warning(...)`. Change the labels status-card builders to take the labels name and spec, and delete `LabelsLoadRequest`.
 6. **Table refresh**: scoped restyle on `table_state_changed` with the spec stored on the binding, and stale-source warnings.
 7. **Shapes card**: reuse the loaded list from phase 5, and add shapes-column sources and per-row Fill, shown only for layers rendered as `Shapes`. Change the shapes status-card builders to take the shapes name and spec, and delete `ShapesLoadRequest`.
