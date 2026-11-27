@@ -1255,6 +1255,33 @@ class ViewerAdapter(QObject):
 
         return matches
 
+    def get_loaded_labels_layers(
+        self,
+        sdata: SpatialData,
+        labels_name: str,
+        coordinate_system: str | None = None,
+    ) -> list[Labels]:
+        """Return every loaded labels layer of one labels element, primary and styled, in viewer order.
+
+        Only layers in the viewer are returned: a binding registered for a
+        layer that is not in the viewer yet is left out.
+        """
+        matches: list[Labels] = []
+        for layer in self._iter_candidate_layers():
+            if not _is_pickable_labels_layer(layer):
+                continue
+
+            binding = self._layer_bindings.get_binding(layer)
+            if _matches_labels_binding(
+                binding,
+                sdata=sdata,
+                element_name=labels_name,
+                coordinate_system=coordinate_system,
+            ):
+                matches.append(layer)
+
+        return matches
+
     def get_loaded_primary_shapes_layer(
         self,
         sdata: SpatialData,
