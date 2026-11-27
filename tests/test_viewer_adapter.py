@@ -2218,6 +2218,42 @@ def test_viewer_adapter_get_loaded_styled_labels_layers_filters_by_style_spec(sd
     ]
 
 
+def test_viewer_adapter_get_loaded_labels_layers_returns_every_layer_of_the_element_in_viewer_order(
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    adapter = ViewerAdapter(viewer)
+    instance_spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+    var_spec = TableColorSourceSpec(table_name="table", source_kind="var", value_key="channel_0_sum")
+    primary_layer = adapter.ensure_labels_loaded(sdata_blobs, "blobs_labels", "global").layer
+    instance_layer = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", instance_spec).layer
+    var_layer = adapter.ensure_styled_labels_loaded(sdata_blobs, "blobs_labels", "global", var_spec).layer
+    other_element_layer = adapter.ensure_labels_loaded(sdata_blobs, "blobs_multiscale_labels", "global").layer
+    local_layer = Labels(np.zeros((8, 8), dtype=np.int32), name="blobs_labels local")
+    viewer.add_layer(local_layer)
+    adapter.register_labels_layer(local_layer, sdata=sdata_blobs, labels_name="blobs_labels", coordinate_system="local")
+    # Registered, but not added to the viewer.
+    adapter.register_labels_layer(
+        Labels(np.zeros((8, 8), dtype=np.int32), name="not in viewer"),
+        sdata=sdata_blobs,
+        labels_name="blobs_labels",
+        coordinate_system="global",
+    )
+    viewer.layers[:] = [var_layer, other_element_layer, primary_layer, local_layer, instance_layer]
+
+    assert adapter.get_loaded_labels_layers(sdata_blobs, "blobs_labels", "global") == [
+        var_layer,
+        primary_layer,
+        instance_layer,
+    ]
+    assert adapter.get_loaded_labels_layers(sdata_blobs, "blobs_labels") == [
+        var_layer,
+        primary_layer,
+        local_layer,
+        instance_layer,
+    ]
+
+
 def test_viewer_adapter_remove_styled_labels_layer_removes_only_the_matching_variant(sdata_blobs) -> None:
     viewer = DummyViewer()
     adapter = ViewerAdapter(viewer)

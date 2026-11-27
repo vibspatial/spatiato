@@ -133,6 +133,27 @@ def test_layer_row_refreshes_its_presentation_from_the_layer(qtbot) -> None:
     assert row.visibility_button.isChecked()
 
 
+def test_layer_row_changes_its_label_and_accessible_names(qtbot) -> None:
+    binding = _labels_binding()
+    row = _make_row(binding)
+    qtbot.addWidget(row)
+
+    row.set_display_label("nuclei", accessibility_label="layer nuclei")
+
+    assert row.display_label == "nuclei"
+    assert row.accessibility_label == "layer nuclei"
+    assert row.layer_label.text() == "nuclei"
+    assert row.layer_label.accessibleName() == "layer nuclei"
+    assert row.remove_button.accessibleName() == "Remove layer nuclei from viewer"
+    assert "Remove layer nuclei from viewer" in row.remove_button.toolTip()
+    assert row.visibility_button.accessibleName() == "Hide layer nuclei"
+    assert "Hide layer nuclei" in row.visibility_button.toolTip()
+
+    binding.layer.visible = False
+
+    assert row.visibility_button.accessibleName() == "Show layer nuclei"
+
+
 def test_layer_row_shows_and_clears_a_warning(qtbot) -> None:
     row = _make_row(_labels_binding())
     qtbot.addWidget(row)

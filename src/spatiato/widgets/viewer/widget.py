@@ -280,6 +280,7 @@ class ViewerWidget(QWidget):
         self.points_group.content_layout.addWidget(self.points_widget)
         self.points_section_toggle = self.points_group.toggle_button
         self.points_section_title = self.points_section_toggle
+        self.points_section_toggle.toggled.connect(self._on_points_section_toggled)
 
         self.content_layout.addWidget(header_logo)
         self.content_layout.addWidget(self.open_sdata_button)
@@ -772,10 +773,21 @@ class ViewerWidget(QWidget):
         if changed:
             self._last_points_load_request = None
             self._last_points_load_result = None
-        if changed and self._points_controller.can_load_values:
+        # Only the Points section uses the values, so they load while it is
+        # open. Loading them for every SpatialData object would run Dask over
+        # all points in the background, and slow down other loads meanwhile.
+        if changed and self._points_controller.can_load_values and self.points_group.is_expanded():
             self._points_controller.load_value_source()
         else:
             self.points_widget.render_controller_state(self._points_controller)
+
+    def _on_points_section_toggled(self, expanded: bool) -> None:
+        """Load the values of the bound points source when the Points section opens, unless they are loaded."""
+        if not expanded or self._experimental_tiled_points:
+            return
+        controller = self._points_controller
+        if controller.current_value_source is None and controller.can_load_values:
+            controller.load_value_source()
 
     def _add_or_update_points_selection(self, values: Sequence[str] | Literal["all"], render_point_budget: int) -> None:
         if self._experimental_tiled_points:
