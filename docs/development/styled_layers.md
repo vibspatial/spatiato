@@ -153,9 +153,11 @@ binding's `fill`, so the layer keeps it.
 `ViewerAdapter.labels_layers_changed` and `ViewerAdapter.shapes_layers_changed`
 report that the set or order of loaded labels or shapes layers changed,
 primary or styled. They carry no data. A listener re-queries the registry and
-the viewer, for example with `get_loaded_styled_labels_layers`: after a
+the viewer, for example with `get_loaded_labels_layers`, which returns every
+labels layer of an element, primary and styled, in viewer order: after a
 removal the binding is already gone when the signal fires, so a payload would
-be out of date.
+be out of date. The Viewer widget's labels cards are such listeners (see "The
+labels card").
 
 They are emitted:
 
@@ -194,9 +196,43 @@ so the membership signal fires.
 remove styled layers together with every other layer of a SpatialData object
 or of the other coordinate systems.
 
+## The labels card
+
+The labels card of the Viewer widget (`_LabelsCardWidget`) is where a user
+loads, hides and removes the layers of one labels element. It follows the
+image card's pattern:
+
+- **Loading on pick.** Accepting a source in the card's search field, by
+  picking a completion or pressing Enter on an exact name, loads its styled
+  layer at once through `ensure_styled_labels_loaded`. There is no apply
+  button. The search field offers only sources that are not loaded, so the
+  card never restyles a loaded layer. A failed first load leaves no layer
+  (see "Loading and restyling"), so no row appears and the source stays
+  offered.
+- **The primary layer has its own row.** It is loaded only with the card's
+  **Load in viewer** button, never as a side effect of picking a source, and
+  is kept out of the list of styled layers and out of "Remove all".
+- **Rows come from live state.** The card keeps no list of loaded layers of
+  its own. On every `labels_layers_changed`, the Viewer widget reads the
+  element's layers with `get_loaded_labels_layers`, splits them into the
+  primary binding and the styled bindings, and passes both to
+  `set_loaded_labels_bindings`. A row is kept while its binding object is
+  unchanged, and built again when it changes. A kept row is relabelled with
+  `set_display_label` when its table-name prefix is switched on or off. The styled rows are in napari
+  layer order, in a `_StyledLayerList` that the shapes card is meant to reuse.
+- **Rows only emit intent.** A row's eye and × buttons emit intent with the
+  binding the row was built for. The Viewer widget resolves the live binding
+  and then sets `layer.visible`, or calls `remove_labels_layer` or
+  `remove_styled_labels_layer`. The rows follow visibility through napari's
+  own `visible` event.
+- **Rows are disposed.** Before the labels cards are rebuilt or cleared, the
+  Viewer widget disposes them, so no deleted row stays connected to a layer
+  event.
+
 ## Where to find it
 
 - Adapter: `ensure_styled_labels_loaded`, `ensure_styled_shapes_loaded`,
+  `get_loaded_labels_layers`,
   `get_loaded_styled_labels_layer(s)`, `get_loaded_styled_shapes_layer(s)`,
   `remove_styled_labels_layer`, `remove_styled_shapes_layer`,
   `_build_labels_layer`, `_build_shapes_layer`,
@@ -220,9 +256,21 @@ or of the other coordinate systems.
   `apply_shape_column_color_source_to_shapes_layer`,
   `build_styled_shapes_layer_name` and `_styled_shapes_face_alpha` in
   [`src/spatiato/viewer/shapes_styling.py`](../../src/spatiato/viewer/shapes_styling.py).
-- Viewer widget: `_add_or_update_styled_labels_layer` and
-  `_add_or_update_styled_shapes_layer` in
-  [`src/spatiato/widgets/viewer/widget.py`](../../src/spatiato/widgets/viewer/widget.py).
+- Viewer widget: for labels, `_add_styled_labels_source`,
+  `_remove_styled_labels_source`, `_remove_all_styled_labels_sources`,
+  `_change_styled_labels_visibility`, `_load_primary_labels_layer`,
+  `_remove_primary_labels_layer`, `_change_primary_labels_visibility`,
+  `_on_labels_layers_changed`, `_refresh_labels_card_membership` and
+  `_get_live_labels_bindings`; for shapes, `_add_or_update_styled_shapes_layer`;
+  in [`src/spatiato/widgets/viewer/widget.py`](../../src/spatiato/widgets/viewer/widget.py).
+- Cards: `_LabelsCardWidget` in
+  [`src/spatiato/widgets/viewer/labels_widget.py`](../../src/spatiato/widgets/viewer/labels_widget.py),
+  `_StyledLayerList` in
+  [`src/spatiato/widgets/viewer/styled_layer_list.py`](../../src/spatiato/widgets/viewer/styled_layer_list.py),
+  and the row `_LayerRow` in
+  [`src/spatiato/widgets/layer_row.py`](../../src/spatiato/widgets/layer_row.py).
 - Tests: [`tests/test_viewer_adapter.py`](../../tests/test_viewer_adapter.py),
-  [`tests/test_labels_styling.py`](../../tests/test_labels_styling.py) and
-  [`tests/test_shapes_styling.py`](../../tests/test_shapes_styling.py).
+  [`tests/test_labels_styling.py`](../../tests/test_labels_styling.py),
+  [`tests/test_shapes_styling.py`](../../tests/test_shapes_styling.py),
+  [`tests/test_styled_layer_list.py`](../../tests/test_styled_layer_list.py) and
+  [`tests/test_viewer_widget.py`](../../tests/test_viewer_widget.py).

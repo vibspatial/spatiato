@@ -20,8 +20,9 @@ and hover/feature lookup on the layer.
 - **Primary layer:** the main napari layer of a labels element, which the
   annotation widgets (Object Classification, Spatial Query) color and
   annotate. **Styled layer:** an extra layer for the same element, colored
-  by one table column (`labels[source]`), created by the Viewer widget's
-  "Add / Update in viewer".
+  by one `obs` column or var of a linked table (`labels[source]`), loaded by
+  the Viewer widget's labels card as soon as the source is picked in its
+  search field.
 - **High-bit / low-bit labels:** labels data with an integer dtype wider than
   16 bits (int32, uint32, int64, ...) or of at most 16 bits (uint8, int8,
   uint16, int16). napari draws the two differently (see "How napari draws a
