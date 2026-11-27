@@ -28,3 +28,8 @@ CARD_TITLE_STYLESHEET = (
 )
 SUMMARY_LABEL_STYLESHEET = f"color: {WIDGET_TEXT_SECONDARY_COLOR}; font-weight: 500;"
 EMPTY_STATE_STYLESHEET = f"color: {WIDGET_TEXT_MUTED_COLOR}; font-weight: 500;"
+# A container that lets the card background show through, such as a list of
+# loaded layers.
+TRANSPARENT_PANEL_STYLESHEET = "QWidget { background: transparent; }"
+# A small heading inside a card, such as the count of loaded layers.
+SUBSECTION_LABEL_STYLESHEET = f"color: {WIDGET_TEXT_MUTED_COLOR}; font-size: 11px; font-weight: 600;"

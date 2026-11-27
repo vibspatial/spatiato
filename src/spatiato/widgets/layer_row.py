@@ -42,6 +42,7 @@ class _LayerRow(QWidget):
 
     A row keeps its construction-time binding for its entire lifetime. Its owner
     must dispose this row and construct another one when the binding changes.
+    Its label can change, with `set_display_label(...)`.
 
     User actions never mutate the layer directly. Identity-free visibility and
     removal intent returns to the owning widget, which binds its own identity
@@ -101,7 +102,6 @@ class _LayerRow(QWidget):
 
         self.layer_label = _ElidedLabel(display_label, self)
         self.layer_label.setObjectName(f"{prefix}_label")
-        self.layer_label.setAccessibleName(accessibility_label)
 
         self.warning_label = QLabel(self)
         self.warning_label.setObjectName(f"{prefix}_warning_label")
@@ -110,12 +110,10 @@ class _LayerRow(QWidget):
 
         self.remove_button = QPushButton("×")
         self.remove_button.setObjectName(f"{prefix}_remove_button")
-        remove_message = f"Remove {accessibility_label} from viewer"
-        self.remove_button.setAccessibleName(remove_message)
-        self.remove_button.setToolTip(format_tooltip(remove_message))
         self.remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.remove_button.setFixedWidth(28)
         self.remove_button.clicked.connect(lambda _checked=False: self.remove_requested.emit())
+        self._apply_accessibility_label()
 
         self.visibility_button.toggled.connect(self._on_visibility_toggled)
 
@@ -160,6 +158,19 @@ class _LayerRow(QWidget):
         self.warning_label.setAccessibleName(f"Warning: {message}")
         self.warning_label.show()
 
+    def set_display_label(self, display_label: str, *, accessibility_label: str) -> None:
+        """Show `display_label`, and name the row's widgets for assistive technology with `accessibility_label`.
+
+        The owner calls this when the label of a row it keeps changes. The row
+        updates the label text, the label's accessible name, and the accessible
+        names and tooltips of the eye and remove buttons.
+        """
+        self.display_label = display_label
+        self.accessibility_label = accessibility_label
+        self.layer_label.set_full_text(display_label)
+        self._apply_accessibility_label()
+        self._apply_visibility(self.binding.layer.visible)
+
     def refresh_presentation(self) -> None:
         """Render the row from the authoritative live layer."""
         self._apply_visibility(self.binding.layer.visible)
@@ -170,6 +181,13 @@ class _LayerRow(QWidget):
             return
         self._disposed = True
         self._disconnect_layer_events()
+
+    def _apply_accessibility_label(self) -> None:
+        # The eye button's texts also name the row; `_apply_visibility(...)` sets them.
+        self.layer_label.setAccessibleName(self.accessibility_label)
+        remove_message = f"Remove {self.accessibility_label} from viewer"
+        self.remove_button.setAccessibleName(remove_message)
+        self.remove_button.setToolTip(format_tooltip(remove_message))
 
     def _disconnect_layer_events(self) -> None:
         """Disconnect the napari layer events the row listens to; a subclass extends it."""

@@ -7,11 +7,11 @@ from typing import TYPE_CHECKING
 from spatiato.widgets.shared_styles import StatusCardKind, format_feedback_identifier, validate_status_card_kind
 
 if TYPE_CHECKING:
+    from spatiato.core._color_source import TableColorSourceSpec
     from spatiato.viewer.image_styling import ImageLoadResult
     from spatiato.viewer.labels_styling import LabelsLoadResult
     from spatiato.viewer.points_styling import PointsLoadResult
     from spatiato.viewer.shapes_styling import ShapesLoadResult
-    from spatiato.widgets.viewer.labels_widget import LabelsLoadRequest
     from spatiato.widgets.viewer.points_controller import PointsLoadRequest
     from spatiato.widgets.viewer.shapes_widget import ShapesLoadRequest
 
@@ -104,11 +104,10 @@ def build_points_layer_card_spec(
 
 
 def build_primary_labels_loaded_card_spec(
-    request: LabelsLoadRequest,
+    labels_name: str,
     result: LabelsLoadResult,
 ) -> _ViewerStatusCardSpec:
     action = _created_updated_action(result.created)
-    labels_name = request.labels_name
     display_name, was_shortened = format_feedback_identifier(labels_name)
     return _ViewerStatusCardSpec(
         title=f"Labels Layer {action}",
@@ -119,16 +118,12 @@ def build_primary_labels_loaded_card_spec(
 
 
 def build_styled_labels_card_spec(
-    request: LabelsLoadRequest,
+    labels_name: str,
+    style_spec: TableColorSourceSpec,
     result: LabelsLoadResult,
 ) -> _ViewerStatusCardSpec:
-    selected_color_source = request.selected_color_source
-    if selected_color_source is None:
-        raise ValueError("Styled labels status requires a selected color source.")
-
     action = _created_updated_action(result.created)
-    source_text = selected_color_source.source_label
-    labels_name = request.labels_name
+    source_text = style_spec.source_label
     display_name, was_shortened = format_feedback_identifier(labels_name)
     lines = [(f'{action} colored overlay "{source_text}" on labels element "{display_name}".')]
     tooltip_message = (
