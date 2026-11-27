@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from matplotlib.colors import to_rgba
-from napari.layers import Image, Shapes
+from napari.layers import Image, Labels, Shapes
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import QCheckBox, QComboBox, QCompleter, QLabel
@@ -139,7 +139,7 @@ def _combo_texts(combo: QComboBox) -> list[str]:
 
 
 def _color_source_kinds(card: object) -> list[str | None]:
-    """Return the source kind of each "Color source" entry; `None` for "No color source"."""
+    """Return the source kind of each "Color source" entry; `None` for a placeholder such as "No color sources"."""
     combo = card.color_source_kind_combo
     source_kinds: list[str | None] = []
     for index in range(combo.count()):
@@ -253,6 +253,26 @@ def _make_colorable_shapes_sdata(
 def _select_shape_column(card: object, value_key: str) -> None:
     _select_color_source_kind(card, "shape_column")
     card.color_source_value_input.setText(value_key)
+
+
+def _add_labels_source(card: object, source_kind: str, value_text: str) -> None:
+    """Type `value_text` in a labels card's search field for `source_kind` and press Enter."""
+    _select_color_source_kind(card, source_kind)
+    card.color_source_value_input.setText(value_text)
+    card.color_source_value_input.returnPressed.emit()
+
+
+def _row_labels(rows: list[object]) -> list[str]:
+    """Return the full labels of layer rows; the shown text is elided in a narrow widget."""
+    return [row.display_label for row in rows]
+
+
+def _add_cell_type_column(sdata: SpatialData, *, colors: list[str] | None = None) -> None:
+    table = sdata["table"]
+    table.obs["cell_type"] = ["odd" if instance_id % 2 else "even" for instance_id in table.obs["instance_id"]]
+    table.obs["cell_type"] = table.obs["cell_type"].astype("category")
+    if colors is not None:
+        table.uns["cell_type_colors"] = colors
 
 
 def _make_points_load_request(sdata: object) -> PointsLoadRequest:
@@ -671,6 +691,49 @@ def test_image_card_reconciles_membership_atomically_and_tracks_appearances(qtbo
     assert card.stack_toggle.isChecked()
 
 
+def test_image_card_rejects_bindings_of_another_image_before_changing_rows(qtbot) -> None:
+    overlay_binding = ImageLayerBinding(
+        layer=Image(np.zeros((8, 8))),
+        element_name="image",
+        coordinate_system="global",
+        sdata_id=1,
+        image_display_mode="overlay",
+        channel_index=0,
+        channel_name="DAPI",
+    )
+    other_overlay_binding = ImageLayerBinding(
+        layer=Image(np.zeros((8, 8))),
+        element_name="other_image",
+        coordinate_system="global",
+        sdata_id=1,
+        image_display_mode="overlay",
+        channel_index=1,
+        channel_name="CD3",
+    )
+    other_stack_binding = ImageLayerBinding(
+        layer=Image(np.zeros((2, 8, 8))),
+        element_name="other_image",
+        coordinate_system="global",
+        sdata_id=1,
+        image_display_mode="stack",
+    )
+    card = _ImageCardWidget(image_name="image", channel_names=["DAPI", "CD3"])
+    qtbot.addWidget(card)
+    card.set_loaded_image_bindings(stack_binding=None, overlay_bindings=[overlay_binding])
+    overlay_row = card.overlay_rows[0]
+
+    with pytest.raises(ValueError, match="An overlay binding is not for image `image`"):
+        card.set_loaded_image_bindings(
+            stack_binding=None,
+            overlay_bindings=[overlay_binding, other_overlay_binding],
+        )
+    with pytest.raises(ValueError, match="The stack binding is not for image `image`"):
+        card.set_loaded_image_bindings(stack_binding=other_stack_binding, overlay_bindings=())
+
+    assert card.loaded_stack_binding is None
+    assert card.overlay_rows == [overlay_row]
+
+
 def test_viewer_widget_refreshes_cards_when_shared_sdata_changes(qtbot, sdata_blobs) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
@@ -758,14 +821,8 @@ def test_viewer_widget_summary_card_shortens_long_coordinate_system(
     assert 'In coordinate system "' in tooltip
 
 
-def test_viewer_widget_points_section_populates_and_starts_value_loading(qtbot, monkeypatch) -> None:
-    viewer = DummyViewer()
-    widget = ViewerWidget(viewer)
-    fake_sdata = _make_points_sdata()
-    load_value_calls = 0
-
-    qtbot.addWidget(widget)
-
+def _patch_points_only_sdata(monkeypatch) -> None:
+    """Make the Viewer widget see one points element, `transcripts`, and no other element."""
     _patch_coordinate_system_names(monkeypatch, ["global"])
     monkeypatch.setattr(viewer_widget_module, "_get_images_in_coordinate_system", lambda sdata, coordinate_system: [])
     monkeypatch.setattr(viewer_widget_module, "_get_labels_in_coordinate_system", lambda sdata, coordinate_system: [])
@@ -774,12 +831,33 @@ def test_viewer_widget_points_section_populates_and_starts_value_loading(qtbot, 
         viewer_widget_module, "_get_points_in_coordinate_system", lambda sdata, coordinate_system: ["transcripts"]
     )
 
+
+def _record_points_value_loading(monkeypatch, widget: ViewerWidget) -> list[str]:
+    """Record each points value load of `widget`; a recorded load leaves the values ready."""
+    loads: list[str] = []
+    value_source = object()
+
     def record_value_loading() -> bool:
-        nonlocal load_value_calls
-        load_value_calls += 1
+        loads.append(widget.points_widget.selected_points_name())
         return True
 
     monkeypatch.setattr(widget._points_controller, "load_value_source", record_value_loading)
+    monkeypatch.setattr(
+        PointsController,
+        "current_value_source",
+        property(lambda controller: value_source if loads else None),
+    )
+    return loads
+
+
+def test_viewer_widget_points_section_loads_values_only_when_opened(qtbot, monkeypatch) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    fake_sdata = _make_points_sdata()
+
+    qtbot.addWidget(widget)
+    _patch_points_only_sdata(monkeypatch)
+    loads = _record_points_value_loading(monkeypatch, widget)
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
         widget.app_state.set_sdata(fake_sdata)
@@ -793,7 +871,35 @@ def test_viewer_widget_points_section_populates_and_starts_value_loading(qtbot, 
         widget.points_widget.index_column_combo.itemText(index)
         for index in range(widget.points_widget.index_column_combo.count())
     ] == ["gene", "target"]
-    assert load_value_calls == 1
+    assert not widget.points_group.is_expanded()
+    assert loads == []
+
+    widget.points_section_toggle.click()
+
+    assert loads == ["transcripts"]
+
+    widget.points_section_toggle.click()
+    widget.points_section_toggle.click()
+
+    assert loads == ["transcripts"]
+
+
+def test_viewer_widget_open_points_section_loads_values_with_the_spatialdata_object(qtbot, monkeypatch) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    fake_sdata = _make_points_sdata()
+
+    qtbot.addWidget(widget)
+    _patch_points_only_sdata(monkeypatch)
+    loads = _record_points_value_loading(monkeypatch, widget)
+    widget.points_section_toggle.click()
+
+    assert loads == []
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(fake_sdata)
+
+    assert loads == ["transcripts"]
 
 
 def test_viewer_widget_opt_in_tiled_points_starts_cache_descriptor_loading(qtbot, monkeypatch) -> None:
@@ -1047,7 +1153,7 @@ def test_viewer_widget_progressive_disclosure_actions_still_load_layers(qtbot, s
 
     widget.labels_section_toggle.click()
     widget.labels_rows[0].toggle_button.click()
-    widget.labels_cards[0].add_update_button.click()
+    widget.labels_cards[0].primary_load_button.click()
 
     assert len(viewer.layers) == 2
     assert viewer.layers[1].name == "blobs_labels"
@@ -1116,31 +1222,33 @@ def test_viewer_widget_labels_cards_expose_table_driven_coloring_controls(qtbot,
     first_card = widget.labels_cards[0]
     second_card = widget.labels_cards[1]
 
-    assert first_card.color_source_kind_combo.count() == 3
-    assert [first_card.color_source_kind_combo.itemText(index) for index in range(3)] == [
-        "No color source",
-        "Observations",
-        "Vars (X)",
-    ]
-    assert first_card.color_source_kind_combo.isEnabled()
-    assert first_card.color_source_value_input.completer() is not None
-    assert not first_card.color_source_value_input.isEnabled()
-    assert first_card.action_hint_label.text() == "Action: add/update primary labels layer"
+    assert not hasattr(first_card, "add_update_button")
+    assert not hasattr(first_card, "action_hint_label")
+    assert not first_card.primary_load_button.isHidden()
+    assert first_card.primary_row is None
+    assert first_card.styled_layer_list.count_label.text() == "0 colored layers"
+    assert not first_card.styled_layer_list.empty_label.isHidden()
+    assert first_card.styled_layer_list.empty_label.text() == "No colored layers in viewer"
+    assert first_card.styled_layer_list.remove_all_button.isHidden()
 
-    _select_color_source_kind(first_card, "obs_column")
+    # "Observations" is selected first; there is no "No color source" entry.
+    assert _combo_texts(first_card.color_source_kind_combo) == ["Observations", "Vars (X)"]
+    assert first_card.color_source_kind_combo.isEnabled()
+    assert first_card.selected_source_kind == "obs_column"
+    assert first_card.color_source_value_label.text() == "Observation"
     assert first_card.color_source_value_input.isEnabled()
     assert first_card.color_source_value_input.text() == ""
-    assert first_card.color_source_value_input.placeholderText() == "Select obs column"
+    assert first_card.color_source_value_input.placeholderText() == "Search and add obs columns"
     assert first_card.color_source_value_input.completer().model().stringList() == ["instance_id"]
     assert first_card.color_source_value_input.completer().completionMode() == QCompleter.CompletionMode.PopupCompletion
     assert first_card.color_source_value_input.completer().maxVisibleItems() == 10
     assert first_card.selected_color_source is None
-    assert first_card.action_hint_label.text() == "Action: select an observation column for a colored overlay"
 
     _select_color_source_kind(first_card, "var")
+    assert first_card.color_source_value_label.text() == "Var"
     assert first_card.color_source_value_input.isEnabled()
     assert first_card.color_source_value_input.text() == ""
-    assert first_card.color_source_value_input.placeholderText() == "Select var"
+    assert first_card.color_source_value_input.placeholderText() == "Search and add vars"
     assert first_card.color_source_value_input.completer().model().stringList() == [
         "channel_0_sum",
         "channel_1_sum",
@@ -1151,17 +1259,21 @@ def test_viewer_widget_labels_cards_expose_table_driven_coloring_controls(qtbot,
     assert first_card.color_source_value_input.completer().completionModel().rowCount() == 3
     first_card.color_source_value_input.completer().popup().hide()
     assert first_card.selected_color_source is None
-    assert first_card.action_hint_label.text() == "Action: select a var for a colored overlay"
 
     first_card.color_source_value_input.setText("channel_1_sum")
-    assert first_card.action_hint_label.text() == 'Action: add/update colored overlay "vars (X): channel_1_sum"'
+    assert first_card.selected_color_source == TableColorSourceSpec(
+        table_name="table", source_kind="var", value_key="channel_1_sum"
+    )
+    # Typing a value loads nothing until it is accepted.
+    assert len(viewer.layers) == 0
 
-    assert _combo_texts(second_card.color_source_kind_combo) == ["No color source"]
+    assert _combo_texts(second_card.color_source_kind_combo) == ["No color sources"]
     assert not second_card.color_source_kind_combo.isEnabled()
     assert "var" not in _color_source_kinds(second_card)
     assert second_card.selected_source_kind is None
     assert second_card.selected_color_source is None
-    assert second_card.action_hint_label.text() == "Action: add/update primary labels layer"
+    assert not second_card.color_source_value_input.isEnabled()
+    assert not second_card.primary_load_button.isHidden()
 
 
 def test_viewer_widget_labels_card_offers_the_vars_of_every_matrix(qtbot, sdata_blobs) -> None:
@@ -1177,14 +1289,13 @@ def test_viewer_widget_labels_card_offers_the_vars_of_every_matrix(qtbot, sdata_
 
     card = widget.labels_cards[0]
     assert _combo_texts(card.color_source_kind_combo) == [
-        "No color source",
         "Observations",
         "Vars (X)",
         "Vars (counts)",
         "Vars (raw)",
     ]
 
-    card.color_source_kind_combo.setCurrentIndex(3)
+    card.color_source_kind_combo.setCurrentIndex(2)
     assert card.selected_source_kind == "var"
     assert card.selected_kind_entry.var_layer == "counts"
     # Every matrix has the same vars.
@@ -1200,18 +1311,16 @@ def test_viewer_widget_labels_card_offers_the_vars_of_every_matrix(qtbot, sdata_
         value_key="channel_1_sum",
         var_layer="counts",
     )
-    assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (counts): channel_1_sum"'
 
-    # Choosing another matrix keeps the selected var.
-    card.color_source_kind_combo.setCurrentIndex(2)
+    # Choosing another matrix keeps the typed var.
+    card.color_source_kind_combo.setCurrentIndex(1)
     assert card.selected_kind_entry.label == "Vars (X)"
     assert card.selected_kind_entry.var_layer is None
     assert card.color_source_value_input.text() == "channel_1_sum"
     assert card.selected_color_source.var_layer is None
-    assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (X): channel_1_sum"'
 
     # A refresh of the linked tables keeps the matrix and the var.
-    card.color_source_kind_combo.setCurrentIndex(4)
+    card.color_source_kind_combo.setCurrentIndex(3)
     widget._refresh_labels_card_linked_tables({})
     assert card.selected_kind_entry.var_layer == "raw"
     assert card.color_source_value_input.text() == "channel_1_sum"
@@ -1230,7 +1339,7 @@ def test_viewer_widget_labels_card_offers_only_the_layers_of_a_table_without_x(q
         widget.app_state.set_sdata(sdata_blobs)
 
     card = widget.labels_cards[0]
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Observations", "Vars (counts)"]
+    assert _combo_texts(card.color_source_kind_combo) == ["Observations", "Vars (counts)"]
 
     _select_color_source_kind(card, "var")
     card.color_source_value_input.setText("channel_0_sum")
@@ -1266,34 +1375,29 @@ def test_viewer_widget_labels_card_repopulates_color_sources_when_linked_table_c
 
     card = widget.labels_cards[0]
 
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Observations"]
+    assert _combo_texts(card.color_source_kind_combo) == ["Observations"]
     assert "var" not in _color_source_kinds(card)
-
-    _select_color_source_kind(card, "obs_column")
+    assert card.selected_source_kind == "obs_column"
     assert card.color_source_value_input.isEnabled()
     assert card.color_source_value_input.completer().model().stringList() == ["cell_type"]
     assert card.color_source_value_input.text() == ""
-    assert card.color_source_value_input.placeholderText() == "Select obs column"
+    assert card.color_source_value_input.placeholderText() == "Search and add obs columns"
     assert card.selected_color_source is None
-    assert card.action_hint_label.text() == "Action: select an observation column for a colored overlay"
 
     card.linked_table_combo.setCurrentIndex(1)
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Vars (X)"]
+    assert _combo_texts(card.color_source_kind_combo) == ["Vars (X)"]
     assert "obs_column" not in _color_source_kinds(card)
-    assert card.selected_source_kind is None
-    assert not card.color_source_value_input.isEnabled()
-    assert card.action_hint_label.text() == "Action: add/update primary labels layer"
-
-    _select_color_source_kind(card, "var")
+    assert card.selected_source_kind == "var"
     assert card.color_source_value_input.isEnabled()
     assert card.color_source_value_input.completer().model().stringList() == ["GeneA"]
     assert card.color_source_value_input.text() == ""
-    assert card.color_source_value_input.placeholderText() == "Select var"
+    assert card.color_source_value_input.placeholderText() == "Search and add vars"
     assert card.selected_color_source is None
-    assert card.action_hint_label.text() == "Action: select a var for a colored overlay"
 
     card.color_source_value_input.setText("GeneA")
-    assert card.action_hint_label.text() == 'Action: add/update colored overlay "vars (X): GeneA"'
+    assert card.selected_color_source == TableColorSourceSpec(
+        table_name="table_b", source_kind="var", value_key="GeneA"
+    )
 
 
 def test_viewer_widget_ignores_non_feature_matrix_write_events(qtbot, monkeypatch) -> None:
@@ -1420,7 +1524,7 @@ def test_viewer_widget_selects_first_linked_table_when_event_creates_first_table
     assert _combo_texts(card.linked_table_combo) == ["No linked tables"]
     assert card.selected_table_name is None
     assert not card.linked_table_combo.isEnabled()
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source"]
+    assert _combo_texts(card.color_source_kind_combo) == ["No color sources"]
     assert not card.color_source_kind_combo.isEnabled()
     assert card.selected_source_kind is None
 
@@ -1444,9 +1548,9 @@ def test_viewer_widget_selects_first_linked_table_when_event_creates_first_table
     assert _combo_texts(card.linked_table_combo) == ["new_table"]
     assert card.linked_table_combo.isEnabled()
     assert card.selected_table_name == "new_table"
-    assert _combo_texts(card.color_source_kind_combo) == ["No color source", "Observations"]
+    assert _combo_texts(card.color_source_kind_combo) == ["Observations"]
     assert card.color_source_kind_combo.isEnabled()
-    assert card.selected_source_kind is None
+    assert card.selected_source_kind == "obs_column"
     assert len(viewer.layers) == 0
 
 
@@ -1503,7 +1607,7 @@ def test_viewer_widget_preserves_labels_card_color_source_selection_after_event(
     assert card.selected_table_name == "table"
     assert card.selected_source_kind == "obs_column"
     assert card.selected_color_source == color_sources_by_table["table"][0]
-    assert card.action_hint_label.text() == 'Action: add/update colored overlay "obs: cell_type"'
+    assert card.color_source_value_input.text() == "cell_type"
 
 
 def test_viewer_widget_refreshes_table_color_sources_when_user_class_is_created(qtbot, monkeypatch) -> None:
@@ -2388,7 +2492,10 @@ def test_viewer_widget_open_spatialdata_shows_error_when_loading_fails(
     assert not widget.global_action_feedback_label.isHidden()
 
 
-def test_viewer_widget_add_update_labels_loads_and_activates_layer(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_primary_labels_load_button_loads_and_activates_layer(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
 
@@ -2399,46 +2506,80 @@ def test_viewer_widget_add_update_labels_loads_and_activates_layer(qtbot, sdata_
 
     first_card = widget.labels_cards[0]
 
-    first_card.add_update_button.click()
+    first_card.primary_load_button.click()
 
     assert len(viewer.layers) == 1
+    assert viewer.layers.selection.active is viewer.layers[0]
     _assert_action_feedback_card(widget, title="Labels Layer Created", kind="success")
     assert 'Created labels layer for "blobs_labels"' in widget.global_action_feedback_label.text()
+    assert first_card.primary_row is not None
+    assert first_card.primary_row.binding.layer is viewer.layers[0]
+    assert first_card.primary_load_button.isHidden()
+    # Loading the primary layer adds no colored layer.
+    assert first_card.styled_rows == []
 
 
-def test_viewer_widget_add_update_labels_dispatches_to_styled_overlay_path(qtbot, monkeypatch, sdata_blobs) -> None:
+def test_viewer_widget_labels_completer_requests_one_styled_source(qtbot, monkeypatch, sdata_blobs) -> None:
+    """Accepting a completion loads the source at once, without any button click."""
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
-    recorded_requests: list[object] = []
+    fake_layer = object()
+    recorded_calls: list[tuple[object, str, str, TableColorSourceSpec]] = []
+    activated_layers: list[object] = []
 
     qtbot.addWidget(widget)
 
     with qtbot.waitSignal(widget.app_state.sdata_changed):
         widget.app_state.set_sdata(sdata_blobs)
 
-    monkeypatch.setattr(widget, "_add_or_update_styled_labels_layer", lambda request: recorded_requests.append(request))
+    monkeypatch.setattr(
+        widget.app_state.viewer_adapter,
+        "ensure_styled_labels_loaded",
+        lambda sdata, labels_name, coordinate_system, style_spec: (
+            recorded_calls.append((sdata, labels_name, coordinate_system, style_spec))
+            or SimpleNamespace(
+                layer=fake_layer,
+                created=True,
+                value_kind="continuous",
+                palette_source=None,
+                coercion_applied=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        widget.app_state.viewer_adapter,
+        "activate_layer",
+        lambda layer: activated_layers.append(layer) or True,
+    )
 
     first_card = widget.labels_cards[0]
     _select_color_source_kind(first_card, "var")
+    first_card.color_source_value_input.setText("channel_1")
+    first_card.color_source_value_input.completer().activated[str].emit("channel_1_sum")
+    # Match Cocoa Qt's final write after activated callbacks return.
     first_card.color_source_value_input.setText("channel_1_sum")
-    first_card.add_update_button.click()
+    first_card.color_source_value_input._completion_clear_timer.timeout.emit()
 
-    assert len(recorded_requests) == 1
-    request = recorded_requests[0]
-    assert request.labels_name == "blobs_labels"
-    assert request.table_name == "table"
-    assert request.selected_source_kind == "var"
-    assert request.selected_color_source is not None
-    assert request.selected_color_source.value_key == "channel_1_sum"
+    assert recorded_calls == [
+        (
+            sdata_blobs,
+            "blobs_labels",
+            "global",
+            TableColorSourceSpec(table_name="table", source_kind="var", value_key="channel_1_sum"),
+        )
+    ]
+    assert activated_layers == [fake_layer]
+    assert first_card.color_source_value_input.text() == ""
+    _assert_action_feedback_card(widget, title="Colored Overlay Created", kind="success")
 
 
-def test_viewer_widget_add_update_labels_creates_and_updates_styled_overlay(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_labels_accepted_source_loads_its_layer_and_row(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
-    table = sdata_blobs["table"]
-    table.obs["cell_type"] = ["odd" if instance_id % 2 else "even" for instance_id in table.obs["instance_id"]]
-    table.obs["cell_type"] = table.obs["cell_type"].astype("category")
-    table.uns["cell_type_colors"] = ["#ff0000", "#00ff00"]
+    _add_cell_type_column(sdata_blobs, colors=["#ff0000", "#00ff00"])
 
     qtbot.addWidget(widget)
 
@@ -2446,29 +2587,41 @@ def test_viewer_widget_add_update_labels_creates_and_updates_styled_overlay(qtbo
         widget.app_state.set_sdata(sdata_blobs)
 
     first_card = widget.labels_cards[0]
-    _select_color_source_kind(first_card, "obs_column")
-    first_card.color_source_value_input.setText("cell_type")
+    assert first_card.available_source_names == ("instance_id", "cell_type")
 
-    first_card.add_update_button.click()
+    _add_labels_source(first_card, "obs_column", "cell_type")
 
     assert len(viewer.layers) == 1
     layer = viewer.layers[0]
+    assert layer.name == "blobs_labels[obs: cell_type]"
+    assert viewer.layers.selection.active is layer
     binding = widget.app_state.viewer_adapter.layer_bindings.get_binding(layer)
     assert binding is not None
     assert binding.labels_role == "styled"
     _assert_action_feedback_card(widget, title="Colored Overlay Created", kind="success")
     assert 'Created colored overlay "obs: cell_type"' in widget.global_action_feedback_label.text()
     assert "stored categorical palette" in widget.global_action_feedback_label.text()
+    assert first_card.color_source_value_input.text() == ""
+    assert _row_labels(first_card.styled_rows) == ["obs: cell_type"]
+    assert first_card.styled_rows[0].binding is binding
+    assert first_card.styled_layer_list.count_label.text() == "1 colored layer"
+    assert first_card.styled_layer_list.empty_label.isHidden()
+    assert not first_card.styled_layer_list.remove_all_button.isHidden()
+    # The primary layer is not loaded as a side effect.
+    assert first_card.primary_row is None
+    # A loaded source is no longer offered, so it cannot be accepted again.
+    assert first_card.available_source_names == ("instance_id",)
 
-    first_card.add_update_button.click()
+    _add_labels_source(first_card, "obs_column", "cell_type")
 
-    assert len(viewer.layers) == 1
-    assert viewer.layers[0] is layer
-    _assert_action_feedback_card(widget, title="Colored Overlay Updated", kind="success")
-    assert 'Updated colored overlay "obs: cell_type"' in widget.global_action_feedback_label.text()
+    assert list(viewer.layers) == [layer]
+    assert first_card.color_source_value_input.text() == "cell_type"
 
 
-def test_viewer_widget_styled_overlay_missing_palette_uses_info_card(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_styled_overlay_missing_palette_uses_info_card(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
     table = sdata_blobs["table"]
@@ -2484,13 +2637,16 @@ def test_viewer_widget_styled_overlay_missing_palette_uses_info_card(qtbot, sdat
     _select_color_source_kind(first_card, "obs_column")
     first_card.color_source_value_input.setText("cell_type")
 
-    first_card.add_update_button.click()
+    first_card.color_source_value_input.returnPressed.emit()
 
     _assert_action_feedback_card(widget, title="Colored Overlay Created", kind="info")
     assert "no stored palette was present" in widget.global_action_feedback_label.text()
 
 
-def test_viewer_widget_styled_overlay_instance_key_uses_success_card(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_styled_overlay_instance_key_uses_success_card(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
 
@@ -2503,7 +2659,7 @@ def test_viewer_widget_styled_overlay_instance_key_uses_success_card(qtbot, sdat
     _select_color_source_kind(first_card, "obs_column")
     first_card.color_source_value_input.setText("instance_id")
 
-    first_card.add_update_button.click()
+    first_card.color_source_value_input.returnPressed.emit()
 
     _assert_action_feedback_card(widget, title="Colored Overlay Created", kind="success")
     assert 'Created colored overlay "obs: instance_id"' in widget.global_action_feedback_label.text()
@@ -2517,7 +2673,10 @@ def test_viewer_widget_styled_overlay_instance_key_uses_success_card(qtbot, sdat
     )
 
 
-def test_viewer_widget_styled_overlay_invalid_palette_uses_warning_card(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_styled_overlay_invalid_palette_uses_warning_card(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
     table = sdata_blobs["table"]
@@ -2534,13 +2693,16 @@ def test_viewer_widget_styled_overlay_invalid_palette_uses_warning_card(qtbot, s
     _select_color_source_kind(first_card, "obs_column")
     first_card.color_source_value_input.setText("cell_type")
 
-    first_card.add_update_button.click()
+    first_card.color_source_value_input.returnPressed.emit()
 
     _assert_action_feedback_card(widget, title="Colored Overlay Created With Warning", kind="warning")
     assert "stored categorical palette was invalid" in widget.global_action_feedback_label.text()
 
 
-def test_viewer_widget_styled_overlay_string_coercion_uses_warning_card(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_styled_overlay_string_coercion_uses_warning_card(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
     table = sdata_blobs["table"]
@@ -2555,13 +2717,16 @@ def test_viewer_widget_styled_overlay_string_coercion_uses_warning_card(qtbot, s
     _select_color_source_kind(first_card, "obs_column")
     first_card.color_source_value_input.setText("sample_type")
 
-    first_card.add_update_button.click()
+    first_card.color_source_value_input.returnPressed.emit()
 
     _assert_action_feedback_card(widget, title="Colored Overlay Created With Warning", kind="warning")
     assert "Coerced string values to categorical" in widget.global_action_feedback_label.text()
 
 
-def test_viewer_widget_styled_overlay_precondition_error_uses_error_card(qtbot, sdata_blobs) -> None:
+def test_viewer_widget_labels_search_ignores_text_that_names_no_offered_source(
+    qtbot,
+    sdata_blobs,
+) -> None:
     viewer = DummyViewer()
     widget = ViewerWidget(viewer)
 
@@ -2571,13 +2736,318 @@ def test_viewer_widget_styled_overlay_precondition_error_uses_error_card(qtbot, 
         widget.app_state.set_sdata(sdata_blobs)
 
     first_card = widget.labels_cards[0]
-    _select_color_source_kind(first_card, "obs_column")
-    first_card.color_source_value_input.setText("not_a_column")
+    _add_labels_source(first_card, "obs_column", "not_a_column")
 
-    first_card.add_update_button.click()
+    assert len(viewer.layers) == 0
+    assert first_card.color_source_value_input.text() == "not_a_column"
+    assert widget.global_action_feedback_label.isHidden()
 
+    # A unique case-insensitive match is accepted.
+    _add_labels_source(first_card, "obs_column", "INSTANCE_ID")
+
+    assert [layer.name for layer in viewer.layers] == ["blobs_labels[obs: instance_id]"]
+
+
+def test_viewer_widget_failed_first_styled_labels_load_shows_error_and_no_row(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    """A source whose first coloring fails leaves no layer and no row, and stays offered."""
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    table = sdata_blobs["table"]
+    table.obs["score"] = np.linspace(0.0, 1.0, table.n_obs)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    first_card = widget.labels_cards[0]
+    assert "score" in first_card.available_source_names
+    # The column changes after it was discovered, and can no longer color a layer.
+    table.obs["score"] = np.nan
+
+    _add_labels_source(first_card, "obs_column", "score")
+
+    assert len(viewer.layers) == 0
+    assert first_card.styled_rows == []
+    assert "score" in first_card.available_source_names
+    assert first_card.color_source_value_input.text() == "score"
     _assert_action_feedback_card(widget, title="Styled Labels Error", kind="error")
-    assert "The selected observation column is not available" in widget.global_action_feedback_label.text()
+
+
+def test_viewer_widget_labels_loaded_source_returns_to_the_completer_after_removal(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    _add_cell_type_column(sdata_blobs)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    _add_labels_source(card, "obs_column", "cell_type")
+    _add_labels_source(card, "var", "channel_0_sum")
+
+    assert _row_labels(card.styled_rows) == ["obs: cell_type", "vars (X): channel_0_sum"]
+    assert card.available_source_names == ("channel_1_sum", "channel_2_sum")
+    _select_color_source_kind(card, "obs_column")
+    assert card.available_source_names == ("instance_id",)
+
+    card.styled_rows[0].remove_button.click()
+
+    assert [layer.name for layer in viewer.layers] == ["blobs_labels[vars (X): channel_0_sum]"]
+    assert _row_labels(card.styled_rows) == ["vars (X): channel_0_sum"]
+    assert card.available_source_names == ("instance_id", "cell_type")
+    _assert_action_feedback_card(widget, title="Colored Overlay Removed", kind="success")
+    assert 'Removed colored overlay "obs: cell_type"' in widget.global_action_feedback_label.text()
+
+
+def test_viewer_widget_labels_rows_follow_napari_removal_and_reorder(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    _add_cell_type_column(sdata_blobs)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    _add_labels_source(card, "obs_column", "cell_type")
+    _add_labels_source(card, "obs_column", "instance_id")
+    cell_type_layer, instance_layer = viewer.layers
+    cell_type_row, instance_row = card.styled_rows
+
+    viewer.layers[:] = [instance_layer, cell_type_layer]
+    viewer.layers.events.reordered.emit()
+
+    assert _row_labels(card.styled_rows) == ["obs: instance_id", "obs: cell_type"]
+    # Rows whose binding is unchanged are kept.
+    assert card.styled_rows == [instance_row, cell_type_row]
+
+    viewer.layers.remove(instance_layer)
+    viewer.layers.events.removed.emit(instance_layer)
+
+    assert card.styled_rows == [cell_type_row]
+    assert "instance_id" in card.available_source_names
+
+
+def test_viewer_widget_labels_remove_all_removes_only_styled_layers(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+    _add_cell_type_column(sdata_blobs)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    card.primary_load_button.click()
+    primary_layer = viewer.layers[0]
+    _add_labels_source(card, "obs_column", "cell_type")
+    _add_labels_source(card, "var", "channel_0_sum")
+    primary_row = card.primary_row
+
+    card.styled_layer_list.remove_all_button.click()
+
+    assert list(viewer.layers) == [primary_layer]
+    assert card.styled_rows == []
+    assert card.primary_row is primary_row
+    assert card.styled_layer_list.count_label.text() == "0 colored layers"
+    assert not card.styled_layer_list.empty_label.isHidden()
+    _assert_action_feedback_card(widget, title="Colored Overlays Removed", kind="success")
+
+
+def test_viewer_widget_labels_primary_row_follows_load_visibility_and_removal(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    card.primary_load_button.click()
+    layer = viewer.layers[0]
+    row = card.primary_row
+
+    # The row shows the element name, not the layer name.
+    layer.name = "renamed in napari"
+    assert row.display_label == "blobs_labels"
+    assert row.remove_button.accessibleName() == "Remove labels layer blobs_labels from viewer"
+
+    row.visibility_button.click()
+    assert layer.visible is False
+    assert not row.visibility_button.isChecked()
+
+    layer.visible = True
+    assert row.visibility_button.isChecked()
+
+    row.remove_button.click()
+
+    assert len(viewer.layers) == 0
+    assert card.primary_row is None
+    assert not card.primary_load_button.isHidden()
+    _assert_action_feedback_card(widget, title="Labels Layer Removed", kind="success")
+
+    # A primary layer removed in napari also brings the load button back.
+    card.primary_load_button.click()
+    layer = viewer.layers[0]
+    assert card.primary_row is not None
+    viewer.layers.remove(layer)
+    viewer.layers.events.removed.emit(layer)
+
+    assert card.primary_row is None
+    assert not card.primary_load_button.isHidden()
+
+
+def test_viewer_widget_labels_styled_row_visibility_follows_intent_and_napari(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    _add_labels_source(card, "obs_column", "instance_id")
+    layer = viewer.layers[0]
+    row = card.styled_rows[0]
+
+    row.visibility_button.click()
+
+    assert layer.visible is False
+    assert not row.visibility_button.isChecked()
+    assert "Show colored layer obs: instance_id" in _tooltip_text(row.visibility_button)
+
+    layer.visible = True
+
+    assert row.visibility_button.isChecked()
+
+
+def test_viewer_widget_labels_cards_show_layers_loaded_before_the_widget(qtbot, sdata_blobs) -> None:
+    viewer = DummyViewer()
+    app_state = app_state_module.get_or_create_app_state(viewer)
+    app_state.set_sdata(sdata_blobs)
+    spec = TableColorSourceSpec(table_name="table", source_kind="obs_column", value_key="instance_id")
+    primary_layer = app_state.viewer_adapter.ensure_labels_loaded(sdata_blobs, "blobs_labels", "global").layer
+    styled_layer = app_state.viewer_adapter.ensure_styled_labels_loaded(
+        sdata_blobs, "blobs_labels", "global", spec
+    ).layer
+
+    widget = ViewerWidget(viewer)
+    qtbot.addWidget(widget)
+    card = widget.labels_cards[0]
+
+    assert card.primary_row is not None
+    assert card.primary_row.binding.layer is primary_layer
+    assert card.primary_load_button.isHidden()
+    assert [row.binding.layer for row in card.styled_rows] == [styled_layer]
+    assert card.loaded_styled_specs == (spec,)
+    assert "instance_id" not in card.available_source_names
+
+
+def test_viewer_widget_rebuild_and_clear_dispose_labels_rows(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    card.primary_load_button.click()
+    _add_labels_source(card, "obs_column", "instance_id")
+    primary_layer, styled_layer = viewer.layers
+    stale_primary_row = card.primary_row
+    stale_styled_row = card.styled_rows[0]
+
+    widget._rebuild_labels_cards(sdata_blobs, ["blobs_labels", "blobs_multiscale_labels"], {})
+    current_card = widget.labels_cards[0]
+    primary_layer.visible = False
+    styled_layer.visible = False
+
+    assert stale_primary_row.visibility_button.isChecked()
+    assert stale_styled_row.visibility_button.isChecked()
+    assert not current_card.primary_row.visibility_button.isChecked()
+    assert not current_card.styled_rows[0].visibility_button.isChecked()
+
+    current_primary_row = current_card.primary_row
+    current_styled_row = current_card.styled_rows[0]
+    widget._clear_cards()
+    primary_layer.visible = True
+    styled_layer.visible = True
+
+    assert not current_primary_row.visibility_button.isChecked()
+    assert not current_styled_row.visibility_button.isChecked()
+
+
+def test_viewer_widget_reports_duplicate_styled_labels_membership_without_replacing_rows(
+    qtbot,
+    sdata_blobs,
+) -> None:
+    viewer = DummyViewer()
+    widget = ViewerWidget(viewer)
+
+    qtbot.addWidget(widget)
+
+    with qtbot.waitSignal(widget.app_state.sdata_changed):
+        widget.app_state.set_sdata(sdata_blobs)
+
+    card = widget.labels_cards[0]
+    _add_labels_source(card, "obs_column", "instance_id")
+    first_row = card.styled_rows[0]
+    spec = first_row.binding.style_spec
+
+    duplicate_layer = Labels(np.zeros((8, 8), dtype=np.int32), name="duplicate")
+    viewer.layers.append(duplicate_layer)
+    widget.app_state.viewer_adapter.register_labels_layer(
+        duplicate_layer,
+        sdata=sdata_blobs,
+        labels_name="blobs_labels",
+        coordinate_system="global",
+        labels_role="styled",
+        style_spec=spec,
+    )
+
+    assert card.styled_rows == [first_row]
+    assert not card.membership_warning_label.isHidden()
+    assert "multiple live styled layers" in card.membership_warning_label.text()
+    assert not card.styled_layer_list.isEnabled()
+    assert not card.color_source_value_input.isEnabled()
+    assert "multiple live styled layers" in widget.global_action_feedback_label.text()
+
+    viewer.layers.remove(duplicate_layer)
+    viewer.layers.events.removed.emit(duplicate_layer)
+
+    assert card.membership_warning_label.isHidden()
+    assert card.styled_layer_list.isEnabled()
+    assert card.color_source_value_input.isEnabled()
 
 
 def test_viewer_widget_load_image_stack_creates_layer_and_live_row(qtbot, sdata_blobs) -> None:

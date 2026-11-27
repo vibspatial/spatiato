@@ -107,7 +107,6 @@ def test_build_points_layer_card_spec_uses_tooltip_for_shortened_names() -> None
 
 def test_build_primary_labels_loaded_card_spec_uses_tooltip_for_shortened_names() -> None:
     labels_name = "labels_" + "x" * 80
-    request = SimpleNamespace(labels_name=labels_name)
     result = SimpleNamespace(
         created=True,
         value_kind=None,
@@ -115,7 +114,7 @@ def test_build_primary_labels_loaded_card_spec_uses_tooltip_for_shortened_names(
         coercion_applied=False,
     )
 
-    spec = build_primary_labels_loaded_card_spec(request, result)
+    spec = build_primary_labels_loaded_card_spec(labels_name, result)
 
     assert spec.title == "Labels Layer Created"
     assert spec.kind == "success"
@@ -124,10 +123,6 @@ def test_build_primary_labels_loaded_card_spec_uses_tooltip_for_shortened_names(
 
 
 def test_build_styled_labels_card_spec_reports_stored_palette() -> None:
-    request = SimpleNamespace(
-        labels_name="blobs_labels",
-        selected_color_source=_obs_source("cell_type"),
-    )
     result = SimpleNamespace(
         created=True,
         value_kind="categorical",
@@ -135,7 +130,7 @@ def test_build_styled_labels_card_spec_reports_stored_palette() -> None:
         coercion_applied=False,
     )
 
-    spec = build_styled_labels_card_spec(request, result)
+    spec = build_styled_labels_card_spec("blobs_labels", _obs_source("cell_type"), result)
 
     assert spec.title == "Colored Overlay Created"
     assert spec.kind == "success"
@@ -147,10 +142,6 @@ def test_build_styled_labels_card_spec_reports_stored_palette() -> None:
 
 def test_build_styled_labels_card_spec_uses_tooltip_for_shortened_names() -> None:
     labels_name = "labels_" + "x" * 80
-    request = SimpleNamespace(
-        labels_name=labels_name,
-        selected_color_source=_obs_source("cell_type"),
-    )
     result = SimpleNamespace(
         created=True,
         value_kind="categorical",
@@ -158,17 +149,13 @@ def test_build_styled_labels_card_spec_uses_tooltip_for_shortened_names() -> Non
         coercion_applied=False,
     )
 
-    spec = build_styled_labels_card_spec(request, result)
+    spec = build_styled_labels_card_spec(labels_name, _obs_source("cell_type"), result)
 
     assert labels_name not in spec.lines[0]
     assert spec.tooltip_message == f'Created colored overlay "obs: cell_type" on labels element "{labels_name}".'
 
 
 def test_build_styled_labels_card_spec_reports_instance_coloring() -> None:
-    request = SimpleNamespace(
-        labels_name="blobs_labels",
-        selected_color_source=_obs_source("instance_id"),
-    )
     result = SimpleNamespace(
         created=True,
         value_kind="instance",
@@ -176,27 +163,11 @@ def test_build_styled_labels_card_spec_reports_instance_coloring() -> None:
         coercion_applied=False,
     )
 
-    spec = build_styled_labels_card_spec(request, result)
+    spec = build_styled_labels_card_spec("blobs_labels", _obs_source("instance_id"), result)
 
     assert spec.title == "Colored Overlay Created"
     assert spec.kind == "success"
     assert spec.lines[-1] == "Used instance colors."
-
-
-def test_build_styled_labels_card_spec_rejects_missing_color_source() -> None:
-    request = SimpleNamespace(
-        labels_name="blobs_labels",
-        selected_color_source=None,
-    )
-    result = SimpleNamespace(
-        created=True,
-        value_kind="categorical",
-        palette_source="stored",
-        coercion_applied=False,
-    )
-
-    with pytest.raises(ValueError, match="Styled labels status requires a selected color source"):
-        build_styled_labels_card_spec(request, result)
 
 
 def test_build_primary_shapes_loaded_card_spec_reports_skipped_geometries() -> None:
