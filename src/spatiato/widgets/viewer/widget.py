@@ -29,6 +29,7 @@ from spatiato._app_state import (
     TableStateChangedEvent,
     get_or_create_app_state,
 )
+from spatiato.core._color_source import TableColorSourceSpec
 from spatiato.core.color_source_options import get_shape_column_color_source_options
 from spatiato.core.spatialdata import (
     get_annotating_table_names,
@@ -39,7 +40,7 @@ from spatiato.core.spatialdata import (
     get_spatialdata_points_options_for_coordinate_system_from_sdata,
     get_spatialdata_shapes_options_for_coordinate_system_from_sdata,
 )
-from spatiato.viewer.adapter import ImageLayerBinding
+from spatiato.viewer.adapter import ImageLayerBinding, LabelsLayerBinding
 from spatiato.viewer.points_styling import PointsLoadResult
 from spatiato.widgets.image_layer_row import (
     _normalized_color_or_none,
@@ -61,7 +62,7 @@ from spatiato.widgets.spatialdata_replacement_dialog import confirm_spatialdata_
 from spatiato.widgets.viewer._table_color_sources import LinkedTableColorSources
 from spatiato.widgets.viewer.disclosure import _CollapsibleSectionWidget, _DisclosureElementWidget
 from spatiato.widgets.viewer.image_widget import _ImageCardWidget
-from spatiato.widgets.viewer.labels_widget import LabelsLoadRequest, _LabelsCardWidget
+from spatiato.widgets.viewer.labels_widget import _LabelsCardWidget
 from spatiato.widgets.viewer.points_controller import PointsController, PointsLoadRequest, PointsValueSource
 from spatiato.widgets.viewer.points_widget import PointsValueWidget
 from spatiato.widgets.viewer.shapes_widget import ShapesLoadRequest, _ShapesCardWidget
@@ -307,6 +308,7 @@ class ViewerWidget(QWidget):
         self._app_state.shapes_element_written.connect(self._on_shapes_element_written)
         self._app_state.shapes_element_reloaded.connect(self._on_shapes_element_reloaded)
         self._app_state.viewer_adapter.image_layers_changed.connect(self._on_image_layers_changed)
+        self._app_state.viewer_adapter.labels_layers_changed.connect(self._on_labels_layers_changed)
         self.refresh_from_sdata(self._app_state.sdata)
 
     def closeEvent(self, event: Any) -> None:
@@ -644,6 +646,7 @@ class ViewerWidget(QWidget):
         labels_names: list[str],
         discovered_tables: dict[str, LinkedTableColorSources],
     ) -> None:
+        self._dispose_labels_cards()
         _clear_layout(self.labels_section_layout)
         self._labels_cards = []
         self._labels_rows = []
@@ -655,7 +658,13 @@ class ViewerWidget(QWidget):
                 labels_name=labels_name,
                 linked_tables=_get_linked_tables(sdata, table_names, discovered_tables),
             )
-            card.add_update_requested.connect(self._add_or_update_labels_layer)
+            card.primary_load_requested.connect(self._load_primary_labels_layer)
+            card.primary_remove_requested.connect(self._remove_primary_labels_layer)
+            card.primary_visibility_requested.connect(self._change_primary_labels_visibility)
+            card.styled_source_add_requested.connect(self._add_styled_labels_source)
+            card.styled_source_remove_requested.connect(self._remove_styled_labels_source)
+            card.styled_sources_remove_all_requested.connect(self._remove_all_styled_labels_sources)
+            card.styled_source_visibility_requested.connect(self._change_styled_labels_visibility)
             row = _DisclosureElementWidget(
                 title=labels_name,
                 object_name=f"viewer_widget_labels_row_{labels_name}",
@@ -672,6 +681,7 @@ class ViewerWidget(QWidget):
             self.labels_section_layout.addWidget(row)
             self._labels_cards.append(card)
             self._labels_rows.append(row)
+            self._refresh_labels_card_membership(card)
 
     def _refresh_labels_card_linked_tables(self, discovered_tables: dict[str, LinkedTableColorSources]) -> None:
         sdata = self._app_state.sdata
@@ -856,17 +866,124 @@ class ViewerWidget(QWidget):
 
         self._expanded_shapes_names.discard(shapes_name)
 
-    def _add_or_update_labels_layer(self, request: LabelsLoadRequest) -> None:
-        if request.selected_source_kind is None:
-            self._add_or_update_primary_labels_layer(request)
-            return
+    def _on_labels_layers_changed(self) -> None:
+        """Re-query the live labels layers of every card after the adapter reports a change."""
+        for card in self._labels_cards:
+            self._refresh_labels_card_membership(card)
 
-        self._add_or_update_styled_labels_layer(request)
-
-    def _add_or_update_primary_labels_layer(self, request: LabelsLoadRequest) -> None:
+    def _refresh_labels_card_membership(self, card: _LabelsCardWidget) -> None:
         sdata = self._app_state.sdata
         coordinate_system = self._app_state.coordinate_system
-        labels_name = request.labels_name
+        if sdata is None or not coordinate_system:
+            card.set_loaded_labels_bindings(primary_binding=None, styled_bindings=())
+            return
+
+        try:
+            primary_binding, styled_bindings = self._get_live_labels_bindings(
+                sdata,
+                card.labels_name,
+                coordinate_system,
+            )
+            card.set_loaded_labels_bindings(primary_binding=primary_binding, styled_bindings=styled_bindings)
+        except ValueError as error:
+            message = str(error)
+            card.set_labels_membership_error(message)
+            self._set_action_feedback(title="Labels Membership Error", lines=[message], kind="error")
+
+    def _get_live_labels_bindings(
+        self,
+        sdata: SpatialData,
+        labels_name: str,
+        coordinate_system: str,
+    ) -> tuple[LabelsLayerBinding | None, list[LabelsLayerBinding]]:
+        """Return the live labels bindings of one element: the primary one, and the styled ones in viewer order.
+
+        A binding is live when its layer is in the napari viewer now and its
+        registered binding is for `sdata`, `labels_name` and
+        `coordinate_system`. This leaves out:
+
+        - labels layers that Spatiato has not registered, for example ones
+          loaded directly in napari;
+        - registered bindings whose layer is not in the viewer;
+        - layers of another SpatialData object or coordinate system.
+
+        Neither the labels cards nor this widget keep a list of loaded layers:
+        the viewer and the binding registry are the only record, and the user
+        can change them at any time in napari, by removing or reordering
+        layers. Every caller that needs the element's layers, to render a card
+        or to act on a row's intent, therefore reads them here.
+
+        Raises
+        ------
+        ValueError
+            If more than one primary layer, or more than one styled layer for
+            the same source, is loaded for the element.
+        """
+        adapter = self._app_state.viewer_adapter
+        primary_bindings: list[LabelsLayerBinding] = []
+        styled_bindings: list[LabelsLayerBinding] = []
+        seen_specs: set[TableColorSourceSpec] = set()
+
+        for layer in adapter.get_loaded_labels_layers(sdata, labels_name, coordinate_system):
+            binding = adapter.layer_bindings.get_binding(layer)
+            if not isinstance(binding, LabelsLayerBinding):
+                continue
+            if binding.labels_role == "primary":
+                primary_bindings.append(binding)
+                continue
+
+            style_spec = binding.style_spec
+            if style_spec is None:
+                raise ValueError(f"A styled layer of labels `{labels_name}` has no color source.")
+            if style_spec in seen_specs:
+                raise ValueError(
+                    f"Found multiple live styled layers for labels `{labels_name}`, "
+                    f"coordinate system `{coordinate_system}`, and source `{style_spec.source_label}`."
+                )
+            seen_specs.add(style_spec)
+            styled_bindings.append(binding)
+
+        if len(primary_bindings) > 1:
+            raise ValueError(
+                f"Found multiple live primary layers for labels `{labels_name}` "
+                f"and coordinate system `{coordinate_system}`."
+            )
+        primary_binding = primary_bindings[0] if primary_bindings else None
+        return primary_binding, styled_bindings
+
+    def _find_labels_card(self, labels_name: str) -> _LabelsCardWidget | None:
+        return next(
+            (card for card in self._labels_cards if card.labels_name == labels_name),
+            None,
+        )
+
+    def _resolve_live_primary_labels_binding(self, labels_name: str) -> LabelsLayerBinding | None:
+        """Resolve the primary labels layer of one element against the Viewer's current live context."""
+        sdata = self._app_state.sdata
+        coordinate_system = self._app_state.coordinate_system
+        if sdata is None or not coordinate_system:
+            return None
+
+        primary_binding, _ = self._get_live_labels_bindings(sdata, labels_name, coordinate_system)
+        return primary_binding
+
+    def _resolve_live_styled_labels_binding(
+        self,
+        labels_name: str,
+        style_spec: TableColorSourceSpec,
+    ) -> LabelsLayerBinding | None:
+        """Resolve the styled labels layer of one source against the Viewer's current live context."""
+        sdata = self._app_state.sdata
+        coordinate_system = self._app_state.coordinate_system
+        if sdata is None or not coordinate_system:
+            return None
+
+        _, styled_bindings = self._get_live_labels_bindings(sdata, labels_name, coordinate_system)
+        return next((binding for binding in styled_bindings if binding.style_spec == style_spec), None)
+
+    def _load_primary_labels_layer(self, labels_name: str) -> None:
+        sdata = self._app_state.sdata
+        coordinate_system = self._app_state.coordinate_system
 
         if sdata is None or not coordinate_system:
             self._set_action_feedback(
@@ -885,14 +1002,79 @@ class ViewerWidget(QWidget):
         self._app_state.viewer_adapter.activate_layer(result.layer)
         self._apply_status_card_spec(
             self.global_action_feedback_label,
-            build_primary_labels_loaded_card_spec(request, result),
+            build_primary_labels_loaded_card_spec(labels_name, result),
         )
 
-    def _add_or_update_styled_labels_layer(self, request: LabelsLoadRequest) -> None:
+    def _remove_primary_labels_layer(self, labels_name: str) -> None:
+        """Remove the primary labels layer of one element, leaving its styled layers."""
+        card = self._find_labels_card(labels_name)
         sdata = self._app_state.sdata
         coordinate_system = self._app_state.coordinate_system
+        if card is None or sdata is None or not coordinate_system:
+            self._set_action_feedback(
+                title="Labels Layer Error",
+                lines=["Load a SpatialData object and select a coordinate system first."],
+                kind="error",
+            )
+            return
 
-        if sdata is None or not coordinate_system:
+        try:
+            removed_layer = self._app_state.viewer_adapter.remove_labels_layer(sdata, labels_name, coordinate_system)
+        except (TypeError, RuntimeError, ValueError) as error:
+            self._set_action_feedback(
+                title="Labels Layer Error",
+                lines=[f"Could not remove the labels layer: {error}"],
+                kind="error",
+            )
+            return
+
+        if removed_layer is None:
+            self._refresh_labels_card_membership(card)
+            return
+        display_name, _ = format_feedback_identifier(labels_name)
+        self._set_action_feedback(
+            title="Labels Layer Removed",
+            lines=[f'Removed labels layer for "{display_name}" from the viewer.'],
+            kind="success",
+        )
+
+    def _change_primary_labels_visibility(self, labels_name: str, visible: bool) -> None:
+        """Apply primary-row intent; napari's ``visible`` event renders it."""
+        card = self._find_labels_card(labels_name)
+        if card is None:
+            return
+
+        try:
+            binding = self._resolve_live_primary_labels_binding(labels_name)
+        except ValueError as error:
+            self._set_action_feedback(title="Labels Layer Error", lines=[str(error)], kind="error")
+            return
+        if binding is None:
+            self._refresh_labels_card_membership(card)
+            return
+
+        layer = binding.layer
+        try:
+            if layer.visible == visible:
+                card.refresh_primary_presentation(binding)
+                return
+            layer.visible = visible
+        except (TypeError, RuntimeError, ValueError) as error:
+            card.refresh_primary_presentation(binding)
+            self._set_action_feedback(
+                title="Labels Layer Error",
+                lines=[f"Could not update labels layer visibility: {error}"],
+                kind="error",
+            )
+
+    def _add_styled_labels_source(self, labels_name: str, style_spec: TableColorSourceSpec) -> None:
+        """Load the styled labels layer of one source as soon as the card accepts it."""
+        card = self._find_labels_card(labels_name)
+        sdata = self._app_state.sdata
+        coordinate_system = self._app_state.coordinate_system
+        if card is None or sdata is None or not coordinate_system:
+            if card is not None:
+                card.finish_styled_source_add(style_spec, succeeded=False)
             self._set_action_feedback(
                 title="Styled Labels Error",
                 lines=["Load a SpatialData object and select a coordinate system first."],
@@ -900,48 +1082,145 @@ class ViewerWidget(QWidget):
             )
             return
 
-        if request.table_name is None:
-            self._set_action_feedback(
-                title="Styled Labels Error",
-                lines=[f'Labels element "{request.labels_name}" has no linked table for table-driven coloring.'],
-                kind="error",
+        adapter = self._app_state.viewer_adapter
+        try:
+            primary_binding, styled_bindings = self._get_live_labels_bindings(sdata, labels_name, coordinate_system)
+            existing_binding = next(
+                (binding for binding in styled_bindings if binding.style_spec == style_spec),
+                None,
             )
+            if existing_binding is not None:
+                # The source is already loaded: show its row and select its
+                # layer rather than restyle it. This normally never runs,
+                # because the card's search offers only sources that are not
+                # loaded. It guards against a card whose rows are behind
+                # napari: `ensure_styled_labels_loaded(...)` would restyle the
+                # loaded layer in place, and the card only adds new layers.
+                card.set_loaded_labels_bindings(primary_binding=primary_binding, styled_bindings=styled_bindings)
+                card.finish_styled_source_add(style_spec, succeeded=True)
+                adapter.activate_layer(existing_binding.layer)
+                return
+
+            result = adapter.ensure_styled_labels_loaded(sdata, labels_name, coordinate_system, style_spec)
+        except ValueError as error:
+            card.finish_styled_source_add(style_spec, succeeded=False)
+            self._set_action_feedback(title="Styled Labels Error", lines=[str(error)], kind="error")
             return
 
-        if request.selected_color_source is None:
-            if request.selected_source_kind == "obs_column":
-                line = (
-                    f"The selected observation column is not available in the linked table for "
-                    f'"{request.labels_name}". Pick another observation column.'
-                )
-            else:
-                line = (
-                    f'The selected var is not available in the linked table for "{request.labels_name}". '
-                    "Pick another var."
-                )
+        card.finish_styled_source_add(style_spec, succeeded=True)
+        adapter.activate_layer(result.layer)
+        self._apply_status_card_spec(
+            self.global_action_feedback_label,
+            build_styled_labels_card_spec(labels_name, style_spec, result),
+        )
+
+    def _remove_styled_labels_source(self, labels_name: str, style_spec: TableColorSourceSpec) -> None:
+        """Remove the styled labels layer of one source, leaving the element's other layers."""
+        card = self._find_labels_card(labels_name)
+        sdata = self._app_state.sdata
+        coordinate_system = self._app_state.coordinate_system
+        if card is None or sdata is None or not coordinate_system:
             self._set_action_feedback(
                 title="Styled Labels Error",
-                lines=[line],
+                lines=["Load a SpatialData object and select a coordinate system first."],
                 kind="error",
             )
             return
 
         try:
-            result = self._app_state.viewer_adapter.ensure_styled_labels_loaded(
+            removed_layer = self._app_state.viewer_adapter.remove_styled_labels_layer(
                 sdata,
-                request.labels_name,
+                labels_name,
                 coordinate_system,
-                request.selected_color_source,
+                style_spec=style_spec,
             )
         except ValueError as error:
             self._set_action_feedback(title="Styled Labels Error", lines=[str(error)], kind="error")
             return
 
-        self._app_state.viewer_adapter.activate_layer(result.layer)
-        self._apply_status_card_spec(
-            self.global_action_feedback_label,
-            build_styled_labels_card_spec(request, result),
+        if removed_layer is None:
+            self._refresh_labels_card_membership(card)
+            return
+        display_name, _ = format_feedback_identifier(labels_name)
+        self._set_action_feedback(
+            title="Colored Overlay Removed",
+            lines=[f'Removed colored overlay "{style_spec.source_label}" from labels element "{display_name}".'],
+            kind="success",
         )
+
+    def _remove_all_styled_labels_sources(self, labels_name: str) -> None:
+        """Remove every styled labels layer of one element, leaving its primary layer."""
+        card = self._find_labels_card(labels_name)
+        sdata = self._app_state.sdata
+        coordinate_system = self._app_state.coordinate_system
+        if card is None or sdata is None or not coordinate_system:
+            self._set_action_feedback(
+                title="Styled Labels Error",
+                lines=["Load a SpatialData object and select a coordinate system first."],
+                kind="error",
+            )
+            return
+
+        adapter = self._app_state.viewer_adapter
+        try:
+            _, styled_bindings = self._get_live_labels_bindings(sdata, labels_name, coordinate_system)
+            missing_target = False
+            for binding in tuple(styled_bindings):
+                assert binding.style_spec is not None
+                removed_layer = adapter.remove_styled_labels_layer(
+                    sdata,
+                    labels_name,
+                    coordinate_system,
+                    style_spec=binding.style_spec,
+                )
+                missing_target = missing_target or removed_layer is None
+        except ValueError as error:
+            self._set_action_feedback(title="Styled Labels Error", lines=[str(error)], kind="error")
+            return
+
+        if missing_target:
+            self._refresh_labels_card_membership(card)
+        if styled_bindings:
+            display_name, _ = format_feedback_identifier(labels_name)
+            self._set_action_feedback(
+                title="Colored Overlays Removed",
+                lines=[f'Removed all colored overlays of labels element "{display_name}".'],
+                kind="success",
+            )
+
+    def _change_styled_labels_visibility(
+        self,
+        labels_name: str,
+        style_spec: TableColorSourceSpec,
+        visible: bool,
+    ) -> None:
+        """Apply styled-row intent; napari's ``visible`` event renders it."""
+        card = self._find_labels_card(labels_name)
+        if card is None:
+            return
+
+        try:
+            binding = self._resolve_live_styled_labels_binding(labels_name, style_spec)
+        except ValueError as error:
+            self._set_action_feedback(title="Styled Labels Error", lines=[str(error)], kind="error")
+            return
+        if binding is None:
+            self._refresh_labels_card_membership(card)
+            return
+
+        layer = binding.layer
+        try:
+            if layer.visible == visible:
+                card.refresh_styled_source_presentation(style_spec, binding)
+                return
+            layer.visible = visible
+        except (TypeError, RuntimeError, ValueError) as error:
+            card.refresh_styled_source_presentation(style_spec, binding)
+            self._set_action_feedback(
+                title="Styled Labels Error",
+                lines=[f"Could not update colored overlay visibility: {error}"],
+                kind="error",
+            )
 
     def _add_or_update_shapes_layer(self, request: ShapesLoadRequest) -> None:
         if request.selected_source_kind is None:
@@ -1108,7 +1387,34 @@ class ViewerWidget(QWidget):
         *,
         channel_names: Sequence[str],
     ) -> tuple[ImageLayerBinding | None, list[ImageLayerBinding]]:
-        """Partition valid image bindings in the viewer's current layer order."""
+        """Return the live image bindings of one image: the Stack one, and the Overlay ones in viewer order.
+
+        A binding is live when its layer is in the napari viewer now and its
+        registered binding is for `sdata`, `image_name` and
+        `coordinate_system`, with display mode Stack or Overlay. This leaves
+        out:
+
+        - image layers that Spatiato has not registered, for example ones
+          loaded directly in napari;
+        - registered bindings whose layer is not in the viewer;
+        - layers of another SpatialData object or coordinate system;
+        - bindings with no Stack or Overlay display mode.
+
+        Neither the image cards nor this widget keep a list of loaded layers:
+        the viewer and the binding registry are the only record, and the user
+        can change them at any time in napari, by removing or reordering
+        layers. Every caller that needs the image's layers, to render a card or
+        to act on a row's intent, therefore reads them here.
+
+        Raises
+        ------
+        ValueError
+            If an Overlay binding has no valid channel index, an index that
+            `channel_names` does not have, or a channel name that does not
+            match `channel_names`; if two Overlay bindings have the same
+            channel; if more than one Stack binding is live; or if Stack and
+            Overlay bindings are live together.
+        """
         adapter = self._app_state.viewer_adapter
         stack_bindings: list[ImageLayerBinding] = []
         overlay_bindings: list[ImageLayerBinding] = []
@@ -1625,6 +1931,7 @@ class ViewerWidget(QWidget):
 
     def _clear_cards(self) -> None:
         self._dispose_image_cards()
+        self._dispose_labels_cards()
         _clear_layout(self.images_section_layout)
         _clear_layout(self.labels_section_layout)
         _clear_layout(self.shapes_section_layout)
@@ -1647,6 +1954,11 @@ class ViewerWidget(QWidget):
     def _dispose_image_cards(self) -> None:
         """Disconnect all image-card rows before their widgets are replaced."""
         for card in tuple(self._image_cards):
+            card.dispose()
+
+    def _dispose_labels_cards(self) -> None:
+        """Disconnect all labels-card rows before their widgets are replaced."""
+        for card in tuple(self._labels_cards):
             card.dispose()
 
     def _set_action_feedback(
