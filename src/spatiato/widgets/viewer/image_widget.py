@@ -30,18 +30,21 @@ from spatiato.widgets.shared_styles import (
     ACTION_BUTTON_STYLESHEET,
     CHECKBOX_STYLESHEET,
     COMPLETER_POPUP_STYLESHEET,
-    WIDGET_TEXT_MUTED_COLOR,
     WIDGET_WARNING_TEXT_COLOR,
     CompleterPopupLineEdit,
     _ElidedLabel,
     build_input_control_stylesheet,
     format_tooltip,
 )
-from spatiato.widgets.viewer.styles import CARD_TITLE_STYLESHEET, DETAIL_PANEL_STYLESHEET, EMPTY_STATE_STYLESHEET
+from spatiato.widgets.viewer.styles import (
+    CARD_TITLE_STYLESHEET,
+    DETAIL_PANEL_STYLESHEET,
+    EMPTY_STATE_STYLESHEET,
+    SUBSECTION_LABEL_STYLESHEET,
+    TRANSPARENT_PANEL_STYLESHEET,
+)
 
 _CHANNEL_WARNING_STYLESHEET = f"color: {WIDGET_WARNING_TEXT_COLOR}; font-weight: 600;"
-_CHANNEL_PANEL_STYLESHEET = "QWidget { background: transparent; }"
-_SUBSECTION_LABEL_STYLESHEET = f"color: {WIDGET_TEXT_MUTED_COLOR}; font-size: 11px; font-weight: 600;"
 _MAX_VISIBLE_OVERLAY_CHANNELS = 10
 
 
@@ -157,7 +160,7 @@ class _ImageCardWidget(QFrame):
 
         self.channel_panel = QWidget()
         self.channel_panel.setObjectName(f"viewer_widget_channel_panel_{image_name}")
-        self.channel_panel.setStyleSheet(_CHANNEL_PANEL_STYLESHEET)
+        self.channel_panel.setStyleSheet(TRANSPARENT_PANEL_STYLESHEET)
         self.channel_panel.setVisible(False)
         channel_layout = QVBoxLayout(self.channel_panel)
         channel_layout.setContentsMargins(24, 10, 0, 0)
@@ -165,7 +168,7 @@ class _ImageCardWidget(QFrame):
 
         self.channel_section_label = QLabel("Channels")
         self.channel_section_label.setObjectName(f"viewer_widget_channel_section_label_{image_name}")
-        self.channel_section_label.setStyleSheet(_SUBSECTION_LABEL_STYLESHEET)
+        self.channel_section_label.setStyleSheet(SUBSECTION_LABEL_STYLESHEET)
         channel_layout.addWidget(self.channel_section_label)
 
         self.channel_search_input = CompleterPopupLineEdit()
@@ -192,7 +195,7 @@ class _ImageCardWidget(QFrame):
 
         self.selected_count_label = QLabel("0 channels")
         self.selected_count_label.setObjectName(f"viewer_widget_selected_channel_count_{image_name}")
-        self.selected_count_label.setStyleSheet(_SUBSECTION_LABEL_STYLESHEET)
+        self.selected_count_label.setStyleSheet(SUBSECTION_LABEL_STYLESHEET)
 
         self.remove_all_channels_button = QPushButton("Remove all")
         self.remove_all_channels_button.setObjectName(f"viewer_widget_remove_all_channels_button_{image_name}")
@@ -221,7 +224,7 @@ class _ImageCardWidget(QFrame):
 
         self.channel_list_widget = QWidget()
         self.channel_list_widget.setObjectName(f"viewer_widget_channel_list_{image_name}")
-        self.channel_list_widget.setStyleSheet(_CHANNEL_PANEL_STYLESHEET)
+        self.channel_list_widget.setStyleSheet(TRANSPARENT_PANEL_STYLESHEET)
         self.channel_list_layout = QVBoxLayout(self.channel_list_widget)
         self.channel_list_layout.setContentsMargins(0, 0, 0, 0)
         self.channel_list_layout.setSpacing(6)
@@ -230,7 +233,7 @@ class _ImageCardWidget(QFrame):
 
         self.stack_row_container = QWidget()
         self.stack_row_container.setObjectName(f"viewer_widget_stack_row_container_{image_name}")
-        self.stack_row_container.setStyleSheet(_CHANNEL_PANEL_STYLESHEET)
+        self.stack_row_container.setStyleSheet(TRANSPARENT_PANEL_STYLESHEET)
         self.stack_row_layout = QVBoxLayout(self.stack_row_container)
         self.stack_row_layout.setContentsMargins(24, 10, 0, 0)
         self.stack_row_layout.setSpacing(0)
@@ -300,9 +303,9 @@ class _ImageCardWidget(QFrame):
 
         ``stack_binding`` and ``overlay_bindings`` describe the entire current
         membership, not an incremental addition or removal. Before changing
-        any rows, this method validates display modes, Overlay channel
-        identity, duplicate channels, and mutual exclusion between Stack and
-        Overlay membership.
+        any rows, this method validates display modes, that every binding is
+        for this image, Overlay channel identity, duplicate channels, and
+        mutual exclusion between Stack and Overlay membership.
 
         A valid snapshot updates presentation only: existing rows are retained
         when their binding identity is unchanged, replaced bindings receive
@@ -312,6 +315,8 @@ class _ImageCardWidget(QFrame):
         ordered_bindings = tuple(overlay_bindings)
         if stack_binding is not None and stack_binding.image_display_mode != "stack":
             raise ValueError("The stack binding must have image display mode `stack`.")
+        if stack_binding is not None and stack_binding.element_name != self.image_name:
+            raise ValueError(f"The stack binding is not for image `{self.image_name}`.")
         if stack_binding is not None and ordered_bindings:
             raise ValueError(f"Image `{self.image_name}` cannot have both stack and overlay bindings.")
 
@@ -319,6 +324,8 @@ class _ImageCardWidget(QFrame):
         for binding in ordered_bindings:
             if binding.image_display_mode != "overlay":
                 raise ValueError("Every overlay binding must have image display mode `overlay`.")
+            if binding.element_name != self.image_name:
+                raise ValueError(f"An overlay binding is not for image `{self.image_name}`.")
             channel_index = _binding_channel_index(binding)
             _binding_channel_name(binding)
             if channel_index in seen_channel_indices:
